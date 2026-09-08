@@ -71,11 +71,12 @@
 //!
 //! # Members not ported
 //!
-//! - `Add( LINE& )`, `AssembleLine`, `followLine`, `NearestObstacle`,
-//!   `FindLinesBetweenJoints`, the `LINE` overloads of `Remove`,
-//!   `Replace`, `QueryColliding` and `CheckColliding`, and
-//!   `CheckColliding( const ITEM_SET& )`. All of them need `Line`, which
-//!   is the next work item.
+//! - `NearestObstacle`, the `LINE` overloads of `QueryColliding` and
+//!   `CheckColliding`, `CheckColliding( const ITEM_SET& )` and
+//!   `LINE::ClipToNearestObstacle`. They are the second half of the line
+//!   work item; the line itself, `Add( LINE& )`, `Remove( LINE& )`,
+//!   `Replace( LINE&, LINE& )`, `AssembleLine`, `followLine` and
+//!   `FindLinesBetweenJoints` are here, in the Lines section.
 //! - `FindItemByParent` / `FindItemsByParent`
 //!   (`pcbnew/router/pns_node.cpp:1815`, `:1836`), which resolve a host
 //!   object back to an item. That is host bookkeeping: the commit diff
@@ -95,13 +96,17 @@
 //!   state: every query takes `&dyn RuleResolver` as a parameter, so that
 //!   there is no global and no hidden context (`DESIGN.md` section 8).
 //!
+//! - `FindLineEnds`'s use inside `FindLinesBetweenJoints`
+//!   (`pcbnew/router/pns_node.cpp:1237`), whose two outputs are never
+//!   read. The public [`World::find_line_ends`] is here.
+//!
 //! `AddEdgeExclusion` and `QueryEdgeExclusions`
 //! (`pcbnew/router/pns_node.cpp:795`, `:801`) **are** here, small as they
 //! are, because `crate::collide` cannot finish the castellation test
 //! without them; see [`World::query_edge_exclusions`] for how the
 //! collision ladder is meant to reach them.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::rc::Rc;
 
 use crate::arena::{Arena, ArenaId};
@@ -117,6 +122,7 @@ use crate::item::{
   UidCounter,
 };
 use crate::joint::{Joint, JointId, JointMap};
+use crate::line::Line;
 use crate::rules::{ItemRef, RuleResolver};
 
 // ---------------------------------------------------------------------
@@ -1728,6 +1734,478 @@ impl World {
     Some((start, end))
   }
 
+  // -----------------------------------------------------------------
+  // Lines
+  // -----------------------------------------------------------------
+
+  /// Store a line's geometry as segments and link them back into it.
+  ///
+  /// Port of `NODE::Add( LINE&, bool )`,
+  /// `pcbnew/router/pns_node.cpp:683`. Every segment of the chain either
+  /// reuses an identical segment already at those coordinates, on that
+  /// layer and on that net, or becomes a fresh stored segment; either way
+  /// the handle is registered as a link of `line`, so that
+  /// [`World::remove_line`] can undo the whole thing. A zero length
+  /// segment is skipped (`:714`).
+  ///
+  /// The new segments are added with `allow_redundant` forced to true
+  /// (`:729`), because the redundancy question was already answered by
+  /// the lookup above; only the caller's `allow_redundant` decides
+  /// whether that lookup happens at all.
+  ///
+  /// The via is **not** added. That asymmetry is KiCad's and it is load
+  /// bearing for the placer: placing a via is a separate
+  /// [`World::add_via`] plus [`Line::link_via`]
+  /// (`pcbnew/router/pns_shove.cpp:2503`), while
+  /// [`World::remove_line`] does take a linked via out (note 02 section
+  /// 2.3).
+  ///
+  /// Returns the handles that were linked, in chain order.
+  ///
+  /// # The shared segment
+  ///
+  /// The comment at `:721`, "another line could be referencing this
+  /// segment too :(", guards the reuse path: the segment found by the
+  /// lookup may already be a link of some **other** live line. KiCad only
+  /// protects against linking it twice into *this* line; nothing stops
+  /// two lines from sharing it.
+  ///
+  /// What that means for [`Line::links_valid_in`]: it stays honest,
+  /// because both lines name the same node and the handle really is
+  /// valid there. What it does not do is tell either line that the other
+  /// exists. Remove one of them and the shared segment leaves the node,
+  /// so the other line keeps a handle whose generation check now fails.
+  /// That is the stale link the module documentation of `src/line.rs`
+  /// describes, and it is why every consumer skips a link it cannot
+  /// resolve instead of trusting the count.
+  ///
+  /// # Panics
+  ///
+  /// In a debug build when the line is already linked, which is KiCad's
+  /// `assert( !aLine.IsLinked() )` at `:685`.
+  pub fn add_line(
+    &mut self,
+    node: NodeId,
+    line: &mut Line,
+    allow_redundant: bool,
+  ) -> Vec<ItemId> {
+    debug_assert!(
+      !line.is_linked(),
+      "add_line needs a line that is not linked yet"
+    );
+
+    let mut added = Vec::new();
+    let layers = line.layers();
+    let net = line.net();
+
+    for index in 0..line.shape().segment_count() {
+      let seg = line.shape().segment(index);
+
+      // :714
+      if seg.a == seg.b {
+        continue;
+      }
+
+      let reused = if allow_redundant {
+        None
+      } else {
+        self.find_redundant_segment(node, seg.a, seg.b, layers, net)
+      };
+
+      if let Some(existing) = reused {
+        // :721, "another line could be referencing this segment too :("
+        if !line.contains_link(existing) {
+          line.link(existing);
+          added.push(existing);
+        }
+
+        continue;
+      }
+
+      let uid = self.next_uid();
+      let item = line.segment_item(self, index, uid);
+
+      if let Some(stored) = self.add_segment(node, item, true) {
+        line.link(stored);
+        added.push(stored);
+      }
+    }
+
+    if !added.is_empty() {
+      line.set_links_valid_in(Some(node));
+    }
+
+    added
+  }
+
+  /// Take a line's stored segments, and its linked via, out of a node.
+  ///
+  /// Port of `NODE::Remove( LINE& )`,
+  /// `pcbnew/router/pns_node.cpp:1054`, whose own comment says why it is
+  /// not a typed remover: "LINE does not have a separate remover, as
+  /// LINEs are never truly a member of the tree" (`:1056`). It removes
+  /// every link that is a segment, an arc or a via, then detaches the
+  /// line.
+  ///
+  /// A link of any other kind is ignored, because KiCad's dispatch is a
+  /// chain of three `OfKind` tests with no `else`. A link the arena no
+  /// longer knows is ignored too, which C++ cannot do.
+  ///
+  /// # Deviation: the line is mutated
+  ///
+  /// KiCad ends with `aLine.SetOwner( nullptr ); aLine.ClearLinks()`
+  /// (`:1069`), which is the only signal a caller gets that the line's
+  /// handles are gone. Keeping it means the line has to be taken by
+  /// `&mut`, which is what `LINE&` is in C++ anyway.
+  ///
+  /// # Why there is no `is_linked_checked` assertion here
+  ///
+  /// Note 02 section 10.3 suggests asserting `IsLinkedChecked` on every
+  /// function that consumes links. It does not hold at this one: a via
+  /// attached with [`Line::link_via`] is a link with no shape behind it,
+  /// so a head that carries one has `link_count == shape_count + 1`
+  /// (`pcbnew/router/pns_shove.cpp:2508` builds exactly that and then
+  /// removes the line). [`Line::is_linked_checked`] stays available for
+  /// the callers where it does hold.
+  pub fn remove_line(&mut self, node: NodeId, line: &mut Line) {
+    let links: Vec<ItemId> = line.links().to_vec();
+
+    for link in links {
+      let Some(item) = self.items.get(link) else {
+        continue;
+      };
+
+      if item.of_kind(Kind::SEGMENT | Kind::ARC | Kind::VIA) {
+        self.remove(node, link);
+      }
+    }
+
+    line.clear_links();
+  }
+
+  /// Swap one line's geometry for another's.
+  ///
+  /// Port of `NODE::Replace( LINE&, LINE&, bool )`,
+  /// `pcbnew/router/pns_node.cpp:958`, which is literally
+  /// [`World::remove_line`] followed by [`World::add_line`]. Both lines
+  /// are mutated: the old one loses its links, the new one gains them.
+  ///
+  /// Returns what [`World::add_line`] returned.
+  pub fn replace_line(
+    &mut self,
+    node: NodeId,
+    old: &mut Line,
+    new_line: &mut Line,
+    allow_redundant: bool,
+  ) -> Vec<ItemId> {
+    self.remove_line(node, old);
+
+    self.add_line(node, new_line, allow_redundant)
+  }
+
+  /// Walk the joint graph both ways from one segment and build a line.
+  ///
+  /// Port of `NODE::AssembleLine`,
+  /// `pcbnew/router/pns_node.cpp:1132`. The line runs from one non
+  /// trivial joint to the next: [`Joint::next_segment`] decides what
+  /// counts as a continuation, so a pad, a via, a fan out or a width
+  /// change ends it.
+  ///
+  /// - `origin_segment_index` receives the **point** index at which
+  ///   `segment` was appended (`:1195`), clamped to the last segment
+  ///   index afterwards (`:1207`). KiCad's own TODO there admits the
+  ///   index is not maintained under simplification, and the clamp is the
+  ///   patch. The value is left untouched when the seed was never
+  ///   appended, which is KiCad's behaviour for an `int*` it does not
+  ///   write.
+  /// - `stop_at_locked_joints` ends the line at a joint the shove has
+  ///   pinned (`:1116`).
+  /// - `follow_locked_segments` is handed to [`Joint::next_segment`],
+  ///   where it means "a locked segment still continues the line, and a
+  ///   virtual via here does not end it".
+  /// - `allow_segment_size_mismatch` lets the line cross a width change
+  ///   (`:1123`). KiCad defaults it to true
+  ///   (`pcbnew/router/pns_node.h:441`); the topology and the placer pass
+  ///   false (`pcbnew/router/pns_topology.cpp:55`,
+  ///   `pcbnew/router/pns_line_placer.cpp:1976`), so it is a parameter
+  ///   here rather than a constant.
+  ///
+  /// A via at the end of the run is **not** picked up: `followLine` stops
+  /// at it and nothing attaches it afterwards, so an assembled line never
+  /// has [`Line::ends_with_via`] set. The placer and the shove attach one
+  /// themselves when they need it.
+  ///
+  /// # Deviations
+  ///
+  /// KiCad allocates three `std::array`s of `1024 * 16 + 1` entries on
+  /// the stack, 128 KiB per call, and grows into them from the middle
+  /// (`:1135` to `:1145`). This uses one [`VecDeque`], with the backward
+  /// walk pushing to the front and the forward walk to the back, which
+  /// produces the same order with no fixed limit; the `aLimit` checks at
+  /// `:1118` therefore have no counterpart. The parallel `arcReversed`
+  /// array is gone with the arcs.
+  ///
+  /// The `aSegments[aPos] = nullptr` a guard hit writes (`:1110`) is not
+  /// reproduced: `aPos` has just been stepped past the range the
+  /// assembly loop reads, in both directions, so the write can never be
+  /// seen.
+  ///
+  /// The final `wxASSERT_MSG( pl.SegmentCount() != 0 )` (`:1210`) is a
+  /// `debug_assert!`. An empty line comes back for a stale handle, where
+  /// KiCad would have dereferenced it.
+  pub fn assemble_line(
+    &self,
+    node: NodeId,
+    segment: ItemId,
+    origin_segment_index: Option<&mut usize>,
+    stop_at_locked_joints: bool,
+    follow_locked_segments: bool,
+    allow_segment_size_mismatch: bool,
+  ) -> Line {
+    let mut line = Line::new();
+
+    let Some(seed) = self.items.get(segment) else {
+      return line;
+    };
+
+    let ItemBody::Segment(body) = seed.body() else {
+      return line;
+    };
+
+    // :1147 to :1152
+    line.set_width(body.width());
+    line.set_layers(seed.layers());
+    line.set_net(seed.net());
+    line.set_source(seed.source());
+
+    let mut corners: VecDeque<(Vec2, ItemId)> = VecDeque::new();
+    let options = FollowOptions {
+      stop_at_locked_joints,
+      follow_locked_segments,
+      allow_segment_size_mismatch,
+    };
+
+    // :1154, backwards from the seed, pushing to the front so that the
+    // deque ends up in chain order.
+    let guard_hit =
+      self.follow_line(node, segment, false, &mut corners, options);
+
+    // :1157
+    if !guard_hit {
+      self.follow_line(node, segment, true, &mut corners, options);
+    }
+
+    let mut previous: Option<ItemId> = None;
+    let mut origin_point: Option<usize> = None;
+
+    for (corner, link) in &corners {
+      // :1175. Without arcs every link contributes its corner.
+      line.chain_mut().append(*corner);
+
+      if previous != Some(*link) {
+        line.link(*link);
+
+        // :1191, "latter condition to avoid loops".
+        if *link == segment && origin_point.is_none() {
+          origin_point = Some(line.point_count().saturating_sub(1));
+        }
+      }
+
+      previous = Some(*link);
+    }
+
+    if line.is_linked() {
+      line.set_links_valid_in(Some(node));
+    }
+
+    // :1203, "do NOT remove colinear segments here!"
+    line.chain_mut().remove_duplicate_points();
+
+    if let Some(slot) = origin_segment_index {
+      if let Some(point) = origin_point {
+        *slot = point;
+      }
+
+      // :1207
+      if *slot >= line.segment_count() {
+        *slot = line.segment_count().saturating_sub(1);
+      }
+    }
+
+    debug_assert!(
+      line.segment_count() != 0,
+      "assembled line should never be empty"
+    );
+
+    line
+  }
+
+  /// Walk the joint graph in one direction, collecting corners.
+  ///
+  /// Port of `NODE::followLine`, `pcbnew/router/pns_node.cpp:1074`.
+  /// `scan_forward` is KiCad's `aScanDirection`: the anchor index the
+  /// walk advances towards, and the direction the corners are written
+  /// in. Returns `aGuardHit`, which says the walk came back to where it
+  /// started and the line is a closed loop, so the caller must not walk
+  /// the other way as well.
+  ///
+  /// The `prevReversed` flip (`:1127`) is what keeps the walk going when
+  /// a segment is stored back to front: the next anchor to look at is
+  /// `aScanDirection ^ prevReversed`, not `aScanDirection`.
+  fn follow_line(
+    &self,
+    node: NodeId,
+    start: ItemId,
+    scan_forward: bool,
+    corners: &mut VecDeque<(Vec2, ItemId)>,
+    options: FollowOptions,
+  ) -> bool {
+    let anchor_index = usize::from(scan_forward);
+
+    let Some(seed) = self.items.get(start) else {
+      return false;
+    };
+
+    // :1081 and :1082
+    let guard = seed.anchor(anchor_index);
+    let start_width = width_of(seed);
+
+    let mut current = start;
+    let mut previous_reversed = false;
+    let mut count: u32 = 0;
+
+    loop {
+      let Some(item) = self.items.get(current) else {
+        break;
+      };
+
+      // :1086
+      let position =
+        item.anchor(usize::from(scan_forward != previous_reversed));
+      let Some(joint) =
+        self.find_joint(node, position, item.layers().start(), item.net())
+      else {
+        break;
+      };
+
+      let Some(joint) = self.joint(joint) else {
+        break;
+      };
+
+      // :1092. The arc reversal flag at :1096 has no counterpart.
+      if scan_forward {
+        corners.push_back((joint.pos(), current));
+      } else {
+        corners.push_front((joint.pos(), current));
+      }
+
+      // :1107, the loop detector.
+      if count > 0 && guard == position {
+        return true;
+      }
+
+      // :1116
+      if options.stop_at_locked_joints && joint.is_locked() {
+        break;
+      }
+
+      // :1121
+      let Some(next) = joint.next_segment(
+        &self.items,
+        current,
+        options.follow_locked_segments,
+      ) else {
+        break;
+      };
+
+      // :1123
+      if !options.allow_segment_size_mismatch
+        && self.items.get(next).and_then(width_of) != start_width
+      {
+        break;
+      }
+
+      // :1127
+      previous_reversed = self
+        .items
+        .get(next)
+        .is_some_and(|item| joint.pos() == item.anchor(anchor_index));
+      current = next;
+      count = count.saturating_add(1);
+    }
+
+    false
+  }
+
+  /// Every line that runs from one joint to another, clipped to it.
+  ///
+  /// Port of `NODE::FindLinesBetweenJoints`,
+  /// `pcbnew/router/pns_node.cpp:1223`. It assembles a line from each
+  /// track linked to `first`, drops the ones whose layers do not overlap
+  /// `second`, and clips what is left to the vertex range between the two
+  /// joint positions. The placer uses it to find and remove loops
+  /// (`pcbnew/router/pns_line_placer.cpp:1852`).
+  ///
+  /// KiCad's `FindLineEnds( line, j_start, j_end )` call at `:1237` is
+  /// not reproduced: neither output is ever read, and the routine
+  /// dereferences `FindJoint` without a null check.
+  ///
+  /// The `-1` that `Find` answers with survives as a signed comparison,
+  /// because KiCad swaps the two indices **before** it tests them
+  /// (`:1242` against `:1245`), so a line that contains only one of the
+  /// two positions is discarded whichever end it was.
+  ///
+  /// The `int` return value is dropped: it is always zero (`:1253`).
+  pub fn find_lines_between_joints(
+    &self,
+    node: NodeId,
+    first: JointRef,
+    second: JointRef,
+  ) -> Vec<Line> {
+    let (Some(first_joint), Some(second_joint)) =
+      (self.joint(first), self.joint(second))
+    else {
+      return Vec::new();
+    };
+
+    let mut lines = Vec::new();
+
+    for link in first_joint.links() {
+      if !self.is_of_kind(*link, Kind::SEGMENT | Kind::ARC) {
+        continue;
+      }
+
+      let mut line = self.assemble_line(node, *link, None, false, false, true);
+
+      if !line.layers().overlaps(second_joint.layers()) {
+        continue;
+      }
+
+      let mut start = index_or_missing(line.shape().find(first_joint.pos(), 0));
+      let mut end = index_or_missing(line.shape().find(second_joint.pos(), 0));
+
+      if end < start {
+        std::mem::swap(&mut start, &mut end);
+      }
+
+      if start >= 0 && end >= 0 {
+        line.clip_vertex_range(start as usize, end as usize);
+        lines.push(line);
+      }
+    }
+
+    lines
+  }
+
+  /// Whether a stored item is of one of the given kinds.
+  ///
+  /// The `item->Kind() == ITEM::SEGMENT_T || item->Kind() == ITEM::ARC_T`
+  /// test of `FindLinesBetweenJoints`, `pcbnew/router/pns_node.cpp:1227`,
+  /// with a stale handle answering no.
+  fn is_of_kind(&self, id: ItemId, mask: Kind) -> bool {
+    self.items.get(id).is_some_and(|item| item.of_kind(mask))
+  }
+
   /// Every joint in a box, over a layer range, with a link of a kind.
   ///
   /// Port of `NODE::QueryJoints`,
@@ -2044,6 +2522,58 @@ impl World {
     self.clearances.retain(|key, _| key.0 != id && key.1 != id);
     self.hulls.retain(|key, _| key.0 != id);
   }
+}
+
+// ---------------------------------------------------------------------
+// Line assembly helpers
+// ---------------------------------------------------------------------
+
+/// The three option flags `followLine` forwards to the joint graph.
+///
+/// The tail of `NODE::followLine`'s parameter list,
+/// `pcbnew/router/pns_node.cpp:1076`. They travel together because they
+/// are decided once per [`World::assemble_line`] call and never change
+/// between the backward and the forward walk.
+#[derive(Copy, Clone, Debug)]
+struct FollowOptions {
+  /// Stop at a joint the shove has pinned (`:1116`).
+  stop_at_locked_joints: bool,
+  /// Treat a locked segment as a continuation, and ignore a virtual via
+  /// (`pcbnew/router/pns_joint.h:261`).
+  follow_locked_segments: bool,
+  /// Let the line cross a width change (`:1123`).
+  allow_segment_size_mismatch: bool,
+}
+
+/// The width of a linked item.
+///
+/// Port of `LINKED_ITEM::Width`,
+/// `pcbnew/router/pns_linked_item.h:53`, which is pure virtual and
+/// implemented by `SEGMENT`, `ARC` and `VIA`. `followLine` compares two
+/// of these to decide whether a width change ends the line
+/// (`pcbnew/router/pns_node.cpp:1123`).
+///
+/// `None` for a body that has no width, which in this crate is a solid or
+/// a hole. Neither can be a link, so the comparison never sees one.
+fn width_of(item: &Item) -> Option<i32> {
+  match item.body() {
+    ItemBody::Segment(segment) => Some(segment.width()),
+    ItemBody::Via(via) => {
+      Some(via.diameter(item.layers(), item.layers().start()))
+    }
+    _ => None,
+  }
+}
+
+/// A found point index as KiCad's signed one, with `-1` for not found.
+///
+/// `SHAPE_LINE_CHAIN::Find` answers `-1`
+/// (`libs/kimath/src/geometry/shape_line_chain.cpp:1237`), and
+/// `FindLinesBetweenJoints` swaps its two results before it tests them
+/// for `>= 0` (`pcbnew/router/pns_node.cpp:1242`), so the sentinel has to
+/// survive the swap for the port to answer the same way.
+fn index_or_missing(index: Option<usize>) -> isize {
+  index.map_or(-1, |value| value as isize)
 }
 
 #[cfg(test)]
@@ -3051,6 +3581,410 @@ mod tests {
         net: world.all_items_in_net(branch, NET, Kind::ANY),
         updated: world.get_updated_items(branch),
         joints,
+      }
+    }
+
+    assert_eq!(run(), run());
+  }
+
+  // -----------------------------------------------------------------
+  // Lines
+  // -----------------------------------------------------------------
+
+  /// Where the run of three segments starts, and its three corners.
+  const TRACK_POINTS: [Vec2; 4] = [
+    Vec2::new(0, 0),
+    Vec2::new(100000, 0),
+    Vec2::new(200000, 0),
+    Vec2::new(300000, 0),
+  ];
+
+  /// The handles of the line fixture.
+  ///
+  /// Three segments in a row on layer 0, `a` then `b` then `c`, with line
+  /// corners between them, plus two more tracks leaving the far end so
+  /// that the joint there is a fan out and ends the line.
+  struct LineFixture {
+    /// The first segment, from the origin.
+    a: ItemId,
+    /// The middle segment.
+    b: ItemId,
+    /// The last segment of the run.
+    c: ItemId,
+    /// One of the two branches at the far end.
+    branch_up: ItemId,
+  }
+
+  /// Add a width 1000 track on layer 0 to a node.
+  fn add_track(
+    world: &mut World,
+    node: NodeId,
+    from: Vec2,
+    to: Vec2,
+  ) -> ItemId {
+    let item = track(world, from, to, 0, NET);
+
+    world
+      .add_segment(node, item, false)
+      .expect("the track is neither degenerate nor redundant")
+  }
+
+  /// The line fixture, built into a fresh world.
+  fn line_fixture() -> (World, LineFixture) {
+    let mut world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let root = world.root();
+
+    let a = add_track(&mut world, root, TRACK_POINTS[0], TRACK_POINTS[1]);
+    let b = add_track(&mut world, root, TRACK_POINTS[1], TRACK_POINTS[2]);
+    let c = add_track(&mut world, root, TRACK_POINTS[2], TRACK_POINTS[3]);
+    let branch_up =
+      add_track(&mut world, root, TRACK_POINTS[3], Vec2::new(300000, 100000));
+    add_track(
+      &mut world,
+      root,
+      TRACK_POINTS[3],
+      Vec2::new(300000, -100000),
+    );
+
+    (world, LineFixture { a, b, c, branch_up })
+  }
+
+  /// A loose line over a chain, with the fixture's width, layer and net.
+  fn loose_line(points: &[Vec2]) -> Line {
+    let mut line = Line::new();
+
+    line.set_width(1000);
+    line.set_layer(0);
+    line.set_net(NET);
+    line.set_shape(LineChain::from_slice(points, false));
+
+    line
+  }
+
+  /// The points of a line, for comparing against a literal.
+  fn points_of(line: &Line) -> Vec<Vec2> {
+    line.shape().points().to_vec()
+  }
+
+  #[test]
+  fn assemble_line_runs_between_the_two_non_trivial_joints() {
+    let (world, ids) = line_fixture();
+    let root = world.root();
+
+    let line = world.assemble_line(root, ids.b, None, false, false, true);
+
+    assert_eq!(points_of(&line), TRACK_POINTS);
+    assert_eq!(line.links(), [ids.a, ids.b, ids.c]);
+    assert_eq!(line.links_valid_in(), Some(root));
+    assert!(line.is_linked_checked());
+    assert_eq!(line.width(), 1000);
+    assert_eq!(line.net(), NET);
+    assert_eq!(line.layers(), LayerRange::single(0));
+    // `AssembleLine` never attaches the via or the fan out it stopped at.
+    assert!(!line.ends_with_via());
+  }
+
+  #[test]
+  fn assemble_line_stops_at_a_locked_joint_when_asked() {
+    let (mut world, ids) = line_fixture();
+    let root = world.root();
+
+    world.lock_joint(root, TRACK_POINTS[2], ids.c, true);
+
+    let stopped = world.assemble_line(root, ids.a, None, true, false, true);
+
+    assert_eq!(points_of(&stopped), TRACK_POINTS[..3]);
+    assert_eq!(stopped.links(), [ids.a, ids.b]);
+
+    // The flag is what stops it; without it the lock is invisible here.
+    let full = world.assemble_line(root, ids.a, None, false, false, true);
+
+    assert_eq!(points_of(&full), TRACK_POINTS);
+    assert_eq!(full.links(), [ids.a, ids.b, ids.c]);
+  }
+
+  #[test]
+  fn assemble_line_stops_at_a_via_and_does_not_pick_it_up() {
+    let (mut world, ids) = line_fixture();
+    let root = world.root();
+
+    let body =
+      ItemBody::Via(Via::new(TRACK_POINTS[2], 3000, 1000, ViaType::Through));
+    let mut item = world.make_item(body);
+    item.set_layers_and_flash_all(LayerRange::new(0, 1));
+    item.set_net(NET);
+    let via = world.add_via(root, item);
+
+    let line = world.assemble_line(root, ids.a, None, false, false, true);
+
+    assert_eq!(points_of(&line), TRACK_POINTS[..3]);
+    assert_eq!(line.links(), [ids.a, ids.b]);
+    assert!(!line.ends_with_via());
+    assert!(!line.contains_link(via));
+  }
+
+  #[test]
+  fn assemble_line_stops_at_a_width_change_only_when_asked() {
+    let (mut world, ids) = line_fixture();
+    let root = world.root();
+
+    if let Some(item) = world.item_mut(ids.c)
+      && let ItemBody::Segment(segment) = item.body_mut()
+    {
+      segment.set_width(2000);
+    }
+
+    let crossing = world.assemble_line(root, ids.a, None, false, false, true);
+    assert_eq!(crossing.links(), [ids.a, ids.b, ids.c]);
+
+    let stopped = world.assemble_line(root, ids.a, None, false, false, false);
+    assert_eq!(stopped.links(), [ids.a, ids.b]);
+  }
+
+  #[test]
+  fn the_origin_segment_index_names_the_seed_segment() {
+    let (world, ids) = line_fixture();
+    let root = world.root();
+
+    for (seed, expected) in [(ids.a, 0), (ids.b, 1), (ids.c, 2)] {
+      let mut origin = usize::MAX;
+      let line =
+        world.assemble_line(root, seed, Some(&mut origin), false, false, true);
+
+      assert_eq!(origin, expected);
+      assert_eq!(line.segment(origin), line.shape().segment(expected));
+    }
+
+    // A handle the arena does not know leaves the caller's value alone
+    // and answers with an empty line, where KiCad would dereference it.
+    let mut world = world;
+    world.remove(root, ids.branch_up);
+
+    let mut origin = 7;
+    let empty = world.assemble_line(
+      root,
+      ids.branch_up,
+      Some(&mut origin),
+      false,
+      false,
+      true,
+    );
+
+    assert_eq!(origin, 7);
+    assert_eq!(empty.point_count(), 0);
+  }
+
+  #[test]
+  fn add_line_stores_every_segment_and_links_it() {
+    let mut world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let root = world.root();
+    let mut line = loose_line(&TRACK_POINTS[..3]);
+
+    let added = world.add_line(root, &mut line, false);
+
+    assert_eq!(added.len(), 2);
+    assert_eq!(line.links(), added);
+    assert_eq!(line.links_valid_in(), Some(root));
+    assert!(line.is_linked_checked());
+
+    for id in &added {
+      let item = world.item(*id).expect("the segment was stored");
+
+      assert_eq!(item.net(), NET);
+      assert_eq!(item.layers(), LayerRange::single(0));
+      assert!(matches!(item.body(), ItemBody::Segment(_)));
+    }
+
+    // Both endpoints and the corner carry a joint now.
+    for point in &TRACK_POINTS[..3] {
+      assert!(world.find_joint(root, *point, 0, NET).is_some());
+    }
+  }
+
+  #[test]
+  fn add_line_reuses_a_segment_that_is_already_there() {
+    let (mut world, ids) = line_fixture();
+    let root = world.root();
+
+    let mut reusing = loose_line(&[TRACK_POINTS[0], TRACK_POINTS[1]]);
+    let added = world.add_line(root, &mut reusing, false);
+
+    assert_eq!(added, [ids.a]);
+    assert_eq!(reusing.links(), [ids.a]);
+
+    // With `allow_redundant` the lookup never happens and a second,
+    // geometrically identical segment goes in.
+    let mut duplicating = loose_line(&[TRACK_POINTS[0], TRACK_POINTS[1]]);
+    let added = world.add_line(root, &mut duplicating, true);
+
+    assert_eq!(added.len(), 1);
+    assert_ne!(added[0], ids.a);
+    assert!(world.item(added[0]).is_some());
+  }
+
+  #[test]
+  fn add_line_skips_a_zero_length_segment() {
+    let mut world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let root = world.root();
+
+    let mut chain = LineChain::new();
+    chain.append(TRACK_POINTS[0]);
+    chain.append_allow_duplicate(TRACK_POINTS[0]);
+    chain.append(TRACK_POINTS[1]);
+
+    let mut line = loose_line(&[]);
+    line.set_shape(chain);
+
+    let added = world.add_line(root, &mut line, false);
+
+    assert_eq!(added.len(), 1);
+    assert_eq!(line.link_count(), 1);
+    // Two shapes, one link: the invariant cannot hold for this input.
+    assert!(!line.is_linked_checked());
+  }
+
+  #[test]
+  fn remove_line_takes_the_segments_and_a_linked_via_out() {
+    let (mut world, ids) = line_fixture();
+    let root = world.root();
+
+    let body =
+      ItemBody::Via(Via::new(TRACK_POINTS[0], 3000, 1000, ViaType::Through));
+    let mut item = world.make_item(body);
+    item.set_layers_and_flash_all(LayerRange::new(0, 1));
+    item.set_net(NET);
+    let via = world.add_via(root, item);
+
+    let mut line = world.assemble_line(root, ids.b, None, false, false, true);
+    line.link_via(via, TRACK_POINTS[0]);
+
+    // The via sits at point 0, so linking it reversed the line.
+    assert_eq!(line.last_point(), Some(TRACK_POINTS[0]));
+
+    world.remove_line(root, &mut line);
+
+    assert!(!line.is_linked());
+    assert_eq!(line.links_valid_in(), None);
+
+    for id in [ids.a, ids.b, ids.c, via] {
+      assert!(world.item(id).is_none(), "the item left the arena");
+    }
+
+    // The fan out at the far end is untouched.
+    assert!(world.item(ids.branch_up).is_some());
+    assert!(world.find_joint(root, TRACK_POINTS[1], 0, NET).is_none());
+  }
+
+  #[test]
+  fn replace_line_swaps_the_geometry_and_moves_the_links() {
+    let (mut world, ids) = line_fixture();
+    let root = world.root();
+
+    let mut old = world.assemble_line(root, ids.a, None, false, false, true);
+    let mut new_line = loose_line(&[
+      TRACK_POINTS[0],
+      Vec2::new(150000, 150000),
+      TRACK_POINTS[3],
+    ]);
+
+    let added = world.replace_line(root, &mut old, &mut new_line, false);
+
+    assert!(!old.is_linked());
+    assert_eq!(added.len(), 2);
+    assert_eq!(new_line.links(), added);
+
+    for id in [ids.a, ids.b, ids.c] {
+      assert!(world.item(id).is_none());
+    }
+
+    assert!(
+      world
+        .find_joint(root, Vec2::new(150000, 150000), 0, NET)
+        .is_some()
+    );
+    // The fan out still holds the joint at the far end.
+    assert!(world.find_joint(root, TRACK_POINTS[3], 0, NET).is_some());
+  }
+
+  #[test]
+  fn find_lines_between_joints_clips_to_the_vertex_range() {
+    let (world, ids) = line_fixture();
+    let root = world.root();
+
+    let first = world
+      .find_joint(root, TRACK_POINTS[0], 0, NET)
+      .expect("the run starts at a joint");
+    let second = world
+      .find_joint(root, TRACK_POINTS[2], 0, NET)
+      .expect("the middle corner is a joint");
+
+    let lines = world.find_lines_between_joints(root, first, second);
+
+    assert_eq!(lines.len(), 1);
+    assert_eq!(points_of(&lines[0]), TRACK_POINTS[..3]);
+    assert_eq!(lines[0].links(), [ids.a, ids.b]);
+
+    // A joint the line does not reach is discarded, whichever end it is.
+    let elsewhere = world
+      .find_joint(root, Vec2::new(300000, 100000), 0, NET)
+      .expect("the branch ends at a joint");
+
+    assert!(
+      world
+        .find_lines_between_joints(root, first, elsewhere)
+        .is_empty()
+    );
+  }
+
+  #[test]
+  fn every_line_answer_is_the_same_across_two_identical_runs() {
+    /// What one run of the line operations produces.
+    #[derive(PartialEq, Debug)]
+    struct Answers {
+      /// The points of the assembled line.
+      assembled: Vec<Vec2>,
+      /// Its links.
+      links: Vec<ItemId>,
+      /// The origin index of the seed segment.
+      origin: usize,
+      /// What `add_line` stored for a fresh line.
+      added: Vec<ItemId>,
+      /// The clipped lines between the two joints.
+      between: Vec<Vec<Vec2>>,
+    }
+
+    fn run() -> Answers {
+      let (mut world, ids) = line_fixture();
+      let root = world.root();
+      let mut origin = usize::MAX;
+      let assembled =
+        world.assemble_line(root, ids.b, Some(&mut origin), false, false, true);
+
+      let first = world
+        .find_joint(root, TRACK_POINTS[0], 0, NET)
+        .expect("the run starts at a joint");
+      let second = world
+        .find_joint(root, TRACK_POINTS[2], 0, NET)
+        .expect("the middle corner is a joint");
+      let between = world
+        .find_lines_between_joints(root, first, second)
+        .iter()
+        .map(points_of)
+        .collect();
+
+      let mut fresh = loose_line(&[
+        Vec2::new(0, 400000),
+        Vec2::new(100000, 400000),
+        Vec2::new(200000, 300000),
+      ]);
+      let added = world.add_line(root, &mut fresh, false);
+
+      Answers {
+        assembled: points_of(&assembled),
+        links: assembled.links().to_vec(),
+        origin,
+        added,
+        between,
       }
     }
 
