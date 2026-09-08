@@ -1,6 +1,6 @@
 # 001 Geometry foundation
 
-Status: todo
+Status: in progress (started 2026-09-08)
 
 ## Goal
 
