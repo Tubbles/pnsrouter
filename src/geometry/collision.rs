@@ -288,9 +288,17 @@ pub fn collide(a: &Shape, b: &Shape, clearance: i32) -> Option<ShapeCollision> {
 ///
 /// # The sign
 ///
-/// The vector displaces **`b`**. Applying it to `b` and asking again gives
-/// no collision, in every cell that produces a non zero vector. Calling
-/// with the operands mirrored gives the negated vector.
+/// The vector displaces **`b`**. Calling with the operands mirrored gives
+/// the negated vector. Applying it to `b` and asking again gives no
+/// collision in the closed form cells (circle against circle and circle
+/// against rectangle). In the cells that go through [`pushout_force`] it
+/// can leave `b` exactly at the clearance or, on a multi segment chain,
+/// still overlapping: the pushout search stops on `Seg::distance_to_point`
+/// while the collision predicate measures to the rounded nearest point,
+/// and the single ordered relaxation pass has no convergence check. That
+/// is KiCad's behaviour (`shape_collisions.cpp:168` against
+/// `shape_circle.h:78`), and `tests/geometry_props.rs` records a minimal
+/// input.
 ///
 /// KiCad's own result had to be negated in two cells to get there, the
 /// ones where its circle versus polyline routine writes the pushout for

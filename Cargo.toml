@@ -20,3 +20,6 @@ fail-on-warnings = []
 rstar = "0.13"
 
 [dev-dependencies]
+# Property based tests for the geometry layer, see
+# tests/geometry_props.rs.
+proptest = "1"
