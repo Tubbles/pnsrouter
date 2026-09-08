@@ -37,20 +37,33 @@
 //! nanometre (`DESIGN.md` section 2), so the `- 1` is transplanted rather
 //! than tidied.
 //!
+//! # The two shapes of the head
+//!
+//! KiCad's `LINE` is an `ITEM`, so `collideSimple` reaches it through the
+//! same pointer as everything else and recovers it with two `dyn_cast`s
+//! (`pcbnew/router/pns_item.cpp:133`, `:139`). A [`Line`] is a value here
+//! and not an [`Item`] (`DESIGN.md` section 4.2), so the head side is a
+//! private `Head` enum instead: either an ordinary [`ItemRef`] or a
+//! [`LineHead`], which carries the three things the test reads off a
+//! `LINE`. Both go through one ladder, and a line head adds exactly what
+//! KiCad's two `LINE` branches add:
+//!
+//! - **The via pass** (`:139`). A line that ends with a via collides
+//!   through that via as well, as a separate call with the via in the
+//!   obstacle position and this item in the head position, which is the
+//!   argument order `line->Via().collideSimple( this, ... )` produces.
+//! - **Half the line width** (`:159`), folded into the clearance the
+//!   shape test is asked for, because the shape routines ignore the width
+//!   a chain carries. The truncation of `Width() / 2` is KiCad's.
+//!
+//! The obstacle side is never a line: lines are never stored, so nothing
+//! a spatial index hands back can be one. KiCad's `:133` branch, the
+//! mirror image, therefore has no counterpart here; its callers are the
+//! shove, the optimizer and the multi dragger, which pass a `LINE` as the
+//! **receiver** of `ITEM::Collide` and arrive with milestone 3.
+//!
 //! # What is deliberately not here
 //!
-//! - **Line widths.** KiCad folds half of each `LINE`'s width into the
-//!   clearance because the polygon collision routines ignore the width a
-//!   chain carries (`pcbnew/router/pns_item.cpp:159`). A `LINE` is not an
-//!   [`Item`] in this port (`DESIGN.md` section 4.2) and no other kind
-//!   carries a width the shape does not already have, so both terms are
-//!   zero. The line collision path will add them back when `Line`
-//!   arrives.
-//! - **The line via recursion** (`pcbnew/router/pns_item.cpp:133` to
-//!   `:143`), which lets a line with a via at its end collide through
-//!   that via. Same reason: a line is not an item here. The future path
-//!   is `Line::collide`, which tests the assembled chain and then calls
-//!   this function once more with the via.
 //! - **The castellation exclusion** (`pcbnew/router/pns_item.cpp:251`).
 //!   Its two halves are a host question, "is this item on the board
 //!   edge", and a node query, `NODE::QueryEdgeExclusions`
@@ -71,36 +84,37 @@
 //! it takes one layer, appends every obstacle it finds and answers only
 //! whether it found any, which is what `NODE::QueryColliding` needs.
 //!
-//! # What remains of the geometric self collision heuristic
+//! # The geometric self collision heuristic, and why it is gone
 //!
-//! `shouldWeConsiderHoleCollisions` prunes a via's hole against a
+//! `shouldWeConsiderHoleCollisions` used to prune a via's hole against a
 //! geometrically identical copy of itself (`pcbnew/router/pns_item.cpp:65`
 //! to `:69`): same position, same padstack, same net, same drill. The
 //! comment above it says why it is a heuristic and not an identity test:
-//! a `LINE` carries a **copy** of its via, so checking a line against a
-//! node that already holds that via would otherwise report the via's hole
-//! colliding with itself.
+//! a `LINE` carries a **copy** of its via (`VIA::Clone`,
+//! `pcbnew/router/pns_via.cpp:278`, gives the copy a hole of its own), so
+//! checking a line against a node that already holds that via would
+//! otherwise report the via's hole colliding with itself.
 //!
-//! Note 02 section 10.3 and `DESIGN.md` sections 4.2 and 11 remove the
-//! reason for it: a `Line` will hold `LineVia::Owned(Via) |
-//! Linked(ItemId)`, and the linked form makes the two sides literally the
-//! same arena item, which the `parentI != parentH` test at `:71` already
-//! catches. The heuristic is nonetheless kept here, for two reasons.
-//! It is reachable without any line at all, between two distinct stored
-//! vias that happen to be identical, so removing it would change what
-//! this function answers for input KiCad's answer is known for. And
-//! `Line` does not exist yet, so nothing can demonstrate that the linked
-//! form covers every case the heuristic covers. The decision to drop it
-//! belongs to the work item that adds `Line`, together with the fixture
-//! that shows the two agree.
+//! That reason does not exist here, which is what `DESIGN.md` sections
+//! 4.2 and 11 predicted and what the fixtures in this module and in
+//! `src/node.rs` now show:
 //!
-//! Until then, what the line collision path must pass: for
-//! `LineVia::Linked(id)`, the stored via's [`ItemId`] and the stored hole
-//! it owns, so identity does the pruning; for `LineVia::Owned(via)`, an
-//! unstored [`ItemRef`], whose hole has no parent handle and which the
-//! heuristic therefore cannot prune. An owned via that duplicates one
-//! already in the node would report a self collision here where KiCad
-//! reports none.
+//! - a [`crate::line::LineVia::Linked`] via is literally the same arena
+//!   item as the node's, so the self test at `:119` prunes the via pass
+//!   and the parent test at `:77` prunes the hole pass;
+//! - a [`crate::line::LineVia::Owned`] via owns no hole, because a hole
+//!   is a separate arena item and an unstored via has nothing in the
+//!   arena. `World::add_via` drills one when the via is stored, and not
+//!   before. So the hole to hole branch is never even entered for a line,
+//!   and the copper pass is exempted by the same net rung of the ladder,
+//!   exactly as KiCad's is.
+//!
+//! Retiring it changes one answer, and only one: two **distinct stored**
+//! vias at the same position, with the same padstack, net and drill, now
+//! report the hole to hole collision that KiCad suppresses. That is not a
+//! self collision at all, it is two real objects sharing one hole, and
+//! KiCad only suppresses it because an address cannot tell it apart from
+//! the line copy case. The deviation is recorded here and in the log.
 //!
 //! # Which layers are tested
 //!
@@ -127,9 +141,13 @@
 //! item's own copper does not share a layer with the head. Reproduced as
 //! is, and marked at each of the three sites.
 
+use std::borrow::Cow;
+
 use crate::arena::Arena;
 use crate::geometry::collision::{self, ShapeCollision};
-use crate::item::{Item, ItemBody, ItemId, Kind, NetId};
+use crate::geometry::shape::Shape;
+use crate::item::{Item, ItemId, Kind, NetId};
+use crate::line::Line;
 use crate::rules::{ItemRef, Keepout, RuleResolver};
 
 // ---------------------------------------------------------------------
@@ -245,6 +263,125 @@ pub struct Obstacle {
 }
 
 // ---------------------------------------------------------------------
+// The head side
+// ---------------------------------------------------------------------
+
+/// A [`Line`] as the item level collision test sees it.
+///
+/// C++ reaches the two `LINE` branches of `ITEM::collideSimple`
+/// (`pcbnew/router/pns_item.cpp:133`, `:139`, `:159`) through the `ITEM`
+/// base class a `LINE` inherits. A [`Line`] is a value here and not an
+/// [`Item`], so the three things the test reads off a `LINE` are gathered
+/// into this view instead: its shape (`pcbnew/router/pns_line.h:138`,
+/// the bare chain), its width (`:141`) and its via (`:203`).
+///
+/// Everything else the ladder reads, the net, the layers, the flashing,
+/// the marks and the rank, comes from `item`, because every
+/// [`RuleResolver`] method takes an [`ItemRef`] and a line has no
+/// [`Item`] of its own. [`Line::rule_item`] builds the stand in, so the
+/// two never disagree:
+///
+/// ```
+/// use pnsrouter::collide::LineHead;
+/// use pnsrouter::line::Line;
+/// use pnsrouter::node::World;
+/// use pnsrouter::rules::ItemRef;
+///
+/// fn head_of<'a>(
+///   world: &'a World,
+///   line: &'a Line,
+///   probe: &'a pnsrouter::item::Item,
+/// ) -> LineHead<'a> {
+///   LineHead::new(ItemRef::unstored(probe), line, line.via_item(world))
+/// }
+/// ```
+#[derive(Clone, Debug)]
+pub struct LineHead<'a> {
+  /// The item every rule query and every identity test sees.
+  item: ItemRef<'a>,
+  /// `LINE::Shape( aLayer )` (`pcbnew/router/pns_line.h:138`), which
+  /// answers the chain whatever the layer.
+  shape: Shape,
+  /// `LINE::Width` (`pcbnew/router/pns_line.h:141`), half of which is
+  /// folded into the clearance at `pcbnew/router/pns_item.cpp:163`.
+  width: i32,
+  /// `LINE::Via` (`pcbnew/router/pns_line.h:203`), already resolved
+  /// through [`Line::via_item`], so a linked via arrives as the stored
+  /// reference the identity tests need.
+  via: Option<ItemRef<'a>>,
+}
+
+impl<'a> LineHead<'a> {
+  /// The head view of a line.
+  ///
+  /// `item` stands for the line in the rule queries and is normally
+  /// [`Line::rule_item`]; `via` is [`Line::via_item`]. The shape and the
+  /// width are taken from `line` itself, so a caller cannot pair one
+  /// line's chain with another's width. The chain is copied once here,
+  /// which is what lets the ladder borrow it across every layer of the
+  /// search and both hole recursions.
+  pub fn new(item: ItemRef<'a>, line: &Line, via: Option<ItemRef<'a>>) -> Self {
+    Self {
+      item,
+      shape: Shape::LineChain(line.shape().clone()),
+      width: line.width(),
+      via,
+    }
+  }
+}
+
+/// What the collision test is being asked about.
+///
+/// The head is KiCad's `const ITEM* aHead`, which may be a `LINE`. This
+/// enum is that pointer with the `dyn_cast` at
+/// `pcbnew/router/pns_item.cpp:139` turned into a tag, so that one ladder
+/// serves both forms.
+#[derive(Copy, Clone, Debug)]
+enum Head<'a> {
+  /// An ordinary item, stored or not.
+  Item(ItemRef<'a>),
+  /// A line.
+  Line(&'a LineHead<'a>),
+}
+
+impl<'a> Head<'a> {
+  /// The item the rule queries and the identity tests see.
+  fn item_ref(self) -> ItemRef<'a> {
+    match self {
+      Self::Item(item) => item,
+      Self::Line(line) => line.item,
+    }
+  }
+
+  /// The geometry the shape test uses, `ITEM::Shape( aLayer )`
+  /// (`pcbnew/router/pns_item.cpp:235`).
+  fn shape(self, layer: i32) -> Option<Cow<'a, Shape>> {
+    match self {
+      Self::Item(item) => item.item().shape(layer),
+      Self::Line(line) => Some(Cow::Borrowed(&line.shape)),
+    }
+  }
+
+  /// `lineWidthH`, the half width folded into the clearance
+  /// (`pcbnew/router/pns_item.cpp:163`). Zero for anything but a line,
+  /// because every other body carries its width in its shape.
+  fn half_width(self) -> i32 {
+    match self {
+      Self::Item(_) => 0,
+      Self::Line(line) => line.width / 2,
+    }
+  }
+
+  /// The via at a line's last point (`pcbnew/router/pns_item.cpp:140`).
+  fn via(self) -> Option<ItemRef<'a>> {
+    match self {
+      Self::Item(_) => None,
+      Self::Line(line) => line.via,
+    }
+  }
+}
+
+// ---------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------
 
@@ -272,7 +409,39 @@ pub fn collide_items(
   resolver: &dyn RuleResolver,
   options: &CollisionSearchOptions,
 ) -> Option<Obstacle> {
-  for layer in item.item().relevant_shape_layers(head.item()) {
+  collide_over_layers(arena, item, Head::Item(head), resolver, options)
+}
+
+/// Whether an item and a line collide, and how.
+///
+/// [`collide_items`] with a [`Line`] on the head side; see [`LineHead`]
+/// and the module documentation for what that adds. The obstacle side
+/// stays an [`Item`], because a line is never stored and therefore never
+/// a candidate.
+pub fn collide_line_items(
+  arena: &Arena<Item>,
+  item: ItemRef<'_>,
+  head: &LineHead<'_>,
+  resolver: &dyn RuleResolver,
+  options: &CollisionSearchOptions,
+) -> Option<Obstacle> {
+  collide_over_layers(arena, item, Head::Line(head), resolver, options)
+}
+
+/// The layer loop both early returning entry points share.
+///
+/// `ITEM::Collide` (`pcbnew/router/pns_item.cpp:305`) plus the loop
+/// KiCad's caller performs through the spatial index; see the module
+/// documentation for why the loop is over [`Item::relevant_shape_layers`]
+/// here.
+fn collide_over_layers(
+  arena: &Arena<Item>,
+  item: ItemRef<'_>,
+  head: Head<'_>,
+  resolver: &dyn RuleResolver,
+  options: &CollisionSearchOptions,
+) -> Option<Obstacle> {
+  for layer in item.item().relevant_shape_layers(head.item_ref().item()) {
     let found =
       collide_simple(arena, item, head, layer, resolver, options, None);
 
@@ -324,8 +493,42 @@ pub fn collide_into(
   options: &CollisionSearchOptions,
   found: &mut Vec<Obstacle>,
 ) -> bool {
-  collide_simple(arena, item, head, layer, resolver, options, Some(found))
-    .is_some()
+  collide_simple(
+    arena,
+    item,
+    Head::Item(head),
+    layer,
+    resolver,
+    options,
+    Some(found),
+  )
+  .is_some()
+}
+
+/// Every collision between an item and a line on one layer, appended to
+/// `found`.
+///
+/// [`collide_into`] with a [`Line`] on the head side; see [`LineHead`]
+/// and the module documentation for what that adds.
+pub fn collide_line_into(
+  arena: &Arena<Item>,
+  item: ItemRef<'_>,
+  head: &LineHead<'_>,
+  layer: i32,
+  resolver: &dyn RuleResolver,
+  options: &CollisionSearchOptions,
+  found: &mut Vec<Obstacle>,
+) -> bool {
+  collide_simple(
+    arena,
+    item,
+    Head::Line(head),
+    layer,
+    resolver,
+    options,
+    Some(found),
+  )
+  .is_some()
 }
 
 // ---------------------------------------------------------------------
@@ -345,22 +548,28 @@ pub fn collide_into(
 /// `None` in either form, which throws away the **answer** and never what
 /// was already appended, exactly as KiCad's `return false` throws away
 /// `collisionsFound` and never the set.
+///
+/// `head` is KiCad's `aHead` with its `LINE` case made explicit; the
+/// module documentation says what a line adds. The obstacle side stays an
+/// [`ItemRef`], because a line is never stored.
 fn collide_simple(
   arena: &Arena<Item>,
   item: ItemRef<'_>,
-  head: ItemRef<'_>,
+  head: Head<'_>,
   layer: i32,
   resolver: &dyn RuleResolver,
   options: &CollisionSearchOptions,
   mut sink: Option<&mut Vec<Obstacle>>,
 ) -> Option<Obstacle> {
+  let head_ref = head.item_ref();
+
   // :119. Nothing collides with itself.
-  if item.is_same_as(head) {
+  if item.is_same_as(head_ref) {
     return None;
   }
 
   // :122
-  if !should_consider_hole_collisions(arena, item, head) {
+  if !should_consider_hole_collisions(item, head_ref) {
     return None;
   }
 
@@ -368,10 +577,28 @@ fn collide_simple(
   // ladder past its same net and free pad short circuits.
   let run_physical_only = resolver.has_user_defined_physical_constraint();
 
-  // :133 to :143, the line via recursion, is not portable; see the
-  // module documentation.
+  // :133, the obstacle side of the `dyn_cast`, cannot fire: a line is
+  // never stored and therefore never a candidate.
 
-  let found = collide_holes(
+  // :139. A head line's via collides in its own right. KiCad writes it
+  // as `line->Via().collideSimple( this, ... )`, so the via takes the
+  // obstacle position and this item takes the head position; the
+  // obstacle that comes back names them in that order.
+  let mut found = match head.via() {
+    Some(via) => collide_simple(
+      arena,
+      via,
+      Head::Item(item),
+      layer,
+      resolver,
+      options,
+      sink.as_deref_mut(),
+    ),
+    None => None,
+  };
+
+  // :146, :154
+  let holes = collide_holes(
     arena,
     item,
     head,
@@ -381,16 +608,24 @@ fn collide_simple(
     sink.as_deref_mut(),
   );
 
-  // :161 to :165, the line widths, are both zero here.
+  found = found.or(holes);
 
-  // :168. This throws away a hole collision the recursion just found.
-  if !item.item().layers_overlap(head.item()) {
+  // :161. `lineWidthI` is always zero: the obstacle side is never a
+  // line.
+
+  // :168. This throws away a hole or via collision just found.
+  if !item.item().layers_overlap(head_ref.item()) {
     return None;
   }
 
-  let Some(clearance) =
-    resolve_clearance(arena, item, head, resolver, options, run_physical_only)
-  else {
+  let Some(clearance) = resolve_clearance(
+    arena,
+    item,
+    head_ref,
+    resolver,
+    options,
+    run_physical_only,
+  ) else {
     // A negative clearance skips the whole block at :224 and falls
     // through to :301.
     return found;
@@ -404,14 +639,15 @@ fn collide_simple(
 
   // :234, :235
   let (Some(shape_item), Some(shape_head)) =
-    (item.item().shape(layer), head.item().shape(layer))
+    (item.item().shape(layer), head.shape(layer))
   else {
     // :238, which throws away a hole collision as well.
     return None;
   };
 
-  // :246 to :249. The extra nanometre; see the module documentation.
-  let distance = clearance - 1;
+  // :246 to :249. Half the head line's width, and the extra nanometre;
+  // see the module documentation for both.
+  let distance = clearance + head.half_width() - 1;
 
   if check_castellation || check_net_tie {
     // The slow path, which needs the position.
@@ -424,7 +660,7 @@ fn collide_simple(
 
     // :254
     if check_net_tie
-      && resolver.is_net_tie_exclusion(head, detail.location, item)
+      && resolver.is_net_tie_exclusion(head_ref, detail.location, item)
     {
       return None;
     }
@@ -432,7 +668,7 @@ fn collide_simple(
     // :270
     return Some(report(
       Obstacle {
-        head: head.id(),
+        head: head_ref.id(),
         item: item.id(),
         clearance,
         detail: Some(detail),
@@ -446,7 +682,7 @@ fn collide_simple(
     // :295
     return Some(report(
       Obstacle {
-        head: head.id(),
+        head: head_ref.id(),
         item: item.id(),
         clearance,
         detail: None,
@@ -495,7 +731,7 @@ fn report(obstacle: Obstacle, sink: Option<&mut Vec<Obstacle>>) -> Obstacle {
 fn collide_holes(
   arena: &Arena<Item>,
   item: ItemRef<'_>,
-  head: ItemRef<'_>,
+  head: Head<'_>,
   layer: i32,
   resolver: &dyn RuleResolver,
   options: &CollisionSearchOptions,
@@ -505,11 +741,14 @@ fn collide_holes(
   // stays at seven.
   let run_physical_only = resolver.has_user_defined_physical_constraint();
   let accumulating = sink.is_some();
+  let head_ref = head.item_ref();
   let mut found = None;
 
-  // :146. The head's hole against this item.
-  if let Some(hole) = hole_of(arena, head)
-    && should_consider_hole_collisions(arena, item, hole)
+  // :146. The head's hole against this item. A line has no hole, and the
+  // stand in item that speaks for it has none either, so this branch
+  // never fires for a line head, exactly as `LINE::Hole()` answers null.
+  if let Some(hole) = hole_of(arena, head_ref)
+    && should_consider_hole_collisions(item, hole)
     // :150. Skip the net test for hole to hole pairs, and for every pair
     // when a net blind physical rule exists.
     && (item.item().kind() == Kind::HOLE
@@ -519,7 +758,7 @@ fn collide_holes(
     found = collide_simple(
       arena,
       item,
-      hole,
+      Head::Item(hole),
       layer,
       resolver,
       options,
@@ -527,10 +766,11 @@ fn collide_holes(
     );
   }
 
-  // :154. This item's hole against the head.
+  // :154. This item's hole against the head, which stays whatever the
+  // head was, a line included.
   if (found.is_none() || accumulating)
     && let Some(hole) = hole_of(arena, item)
-    && should_consider_hole_collisions(arena, hole, head)
+    && should_consider_hole_collisions(hole, head_ref)
   {
     let second =
       collide_simple(arena, hole, head, layer, resolver, options, sink);
@@ -674,13 +914,12 @@ fn clearance_from_resolver(
 ///
 /// Three cases, in KiCad's order:
 ///
-/// - two holes: the geometric heuristic at `:65`, then the parent
-///   identity test at `:71`. See the module documentation for why the
-///   heuristic survives the port;
+/// - two holes: the parent identity test at `:71`. The geometric
+///   heuristic that sits above it at `:65` is **not** ported; see the
+///   module documentation for the fixture that retired it;
 /// - one hole: it does not collide with its own parent (`:75`, `:77`);
 /// - no hole: always worth testing (`:79`).
 fn should_consider_hole_collisions(
-  arena: &Arena<Item>,
   item: ItemRef<'_>,
   head: ItemRef<'_>,
 ) -> bool {
@@ -688,7 +927,7 @@ fn should_consider_hole_collisions(
   let head_is_hole = head.item().kind() == Kind::HOLE;
 
   if item_is_hole && head_is_hole {
-    return consider_hole_to_hole(arena, item, head);
+    return consider_hole_to_hole(item, head);
   }
 
   if item_is_hole {
@@ -707,12 +946,20 @@ fn should_consider_hole_collisions(
 
 /// Whether two holes are worth testing against each other.
 ///
-/// Port of `pcbnew/router/pns_item.cpp:43` to `:72`.
-fn consider_hole_to_hole(
-  arena: &Arena<Item>,
-  item: ItemRef<'_>,
-  head: ItemRef<'_>,
-) -> bool {
+/// Port of `pcbnew/router/pns_item.cpp:43` to `:72`, minus the geometric
+/// heuristic at `:65` to `:69`.
+///
+/// # The retired heuristic
+///
+/// KiCad asks, above the identity test, whether the two parents are vias
+/// that cannot be told apart: same position, matching padstacks, same net,
+/// same drill (`VIA::PadstackMatches`, `pcbnew/router/pns_via.cpp:108`).
+/// It exists for one input, a `LINE` holding a clone of a via that is also
+/// in the node, and this port cannot produce that input; the module
+/// documentation has the argument and `src/node.rs` has the fixture. What
+/// is left of the answer it changes is two distinct stored vias sharing a
+/// position, which now collide hole to hole.
+fn consider_hole_to_hole(item: ItemRef<'_>, head: ItemRef<'_>) -> bool {
   // :48. A hole with no parent is a mechanical hole, and two of those
   // are always worth testing.
   let (Some(parent_item), Some(parent_head)) =
@@ -721,43 +968,8 @@ fn consider_hole_to_hole(
     return true;
   };
 
-  // :65 to :69
-  if vias_are_indistinguishable(arena, parent_item, parent_head) {
-    return false;
-  }
-
   // :71
   parent_item != parent_head
-}
-
-/// Whether two vias are the same via as far as their holes are
-/// concerned.
-///
-/// Port of the heuristic at `pcbnew/router/pns_item.cpp:65`: both parents
-/// have to be vias, at the same position, with matching padstacks, on the
-/// same net and with the same drill. A parent that is a pad, or a handle
-/// the arena no longer knows, answers false, which is KiCad's null
-/// `dyn_cast`.
-fn vias_are_indistinguishable(
-  arena: &Arena<Item>,
-  first: ItemId,
-  second: ItemId,
-) -> bool {
-  let (Some(first), Some(second)) = (arena.get(first), arena.get(second))
-  else {
-    return false;
-  };
-
-  let (ItemBody::Via(first_via), ItemBody::Via(second_via)) =
-    (first.body(), second.body())
-  else {
-    return false;
-  };
-
-  first_via.pos() == second_via.pos()
-    && first_via.padstack_matches(first.layers(), second_via, second.layers())
-    && first.net() == second.net()
-    && first_via.drill() == second_via.drill()
 }
 
 /// Whether a hole was drilled by a given item.
@@ -840,7 +1052,7 @@ mod tests {
   use crate::geometry::shape::Shape;
   use crate::geometry::vec2::Vec2;
   use crate::item::{
-    Hole, LayerMask, LayerRange, Segment, Solid, Via, ViaType,
+    Hole, ItemBody, LayerMask, LayerRange, Segment, Solid, Via, ViaType,
   };
   use crate::rules::{Constraint, ConstraintType, FixedClearance};
 
@@ -1444,23 +1656,33 @@ mod tests {
     assert_eq!(collide_stored(&arena, &rules, pad_id, hole_id), None);
   }
 
+  /// The one answer retiring the geometric heuristic changes.
+  ///
+  /// Two **distinct stored** vias at one position, with the same
+  /// padstack, net and drill. KiCad prunes their hole pair at
+  /// `pcbnew/router/pns_item.cpp:65`; here they collide, because the
+  /// pruning existed for a `LINE`'s clone of a via and this port cannot
+  /// build that input. See the module documentation.
   #[test]
-  fn two_indistinguishable_via_holes_are_pruned() {
+  fn two_stored_vias_at_one_position_collide_hole_to_hole() {
     let mut arena = Arena::new();
     let rules = TestRules::uniform(CLEARANCE);
-    let (first, _) =
+    let (first, first_hole) =
       store_with_hole(&mut arena, via(0, 0, 800, 400, 1), hole(1, 0, 200));
-    let (second, _) =
+    let (second, second_hole) =
       store_with_hole(&mut arena, via(2, 0, 800, 400, 1), hole(3, 0, 200));
 
-    // Same position, same padstack, same net, same drill: every copper
-    // pair is same net and exempt, and the hole pair is pruned by the
-    // heuristic, so nothing is left to collide.
-    assert_eq!(collide_stored(&arena, &rules, first, second), None);
+    // Every copper pair is same net and exempt, so what is left is the
+    // hole pair, which a hole to hole rule tests whatever the nets.
+    let found = collide_stored(&arena, &rules, first, second)
+      .expect("two vias sharing a position share a hole");
+
+    assert_eq!(found.item, Some(first_hole));
+    assert_eq!(found.head, Some(second_hole));
   }
 
   #[test]
-  fn two_via_holes_with_different_padstacks_are_not_pruned() {
+  fn two_via_holes_with_different_padstacks_collide() {
     let mut arena = Arena::new();
     let rules = TestRules::uniform(CLEARANCE);
     let (first, _) =
@@ -1469,7 +1691,7 @@ mod tests {
       store_with_hole(&mut arena, via(2, 0, 900, 400, 1), hole(3, 0, 200));
 
     let found = collide_stored(&arena, &rules, first, second)
-      .expect("the two holes must collide once the padstacks differ");
+      .expect("the two holes must collide");
 
     assert_eq!(found.head, Some(second_hole));
   }

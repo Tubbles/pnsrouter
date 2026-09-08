@@ -20,3 +20,13 @@ Deferred during milestone 1 (geometry foundation), each with the place it surfac
 - `RotatePoint` from `trigo.h` (note 01 section 1.4) has callers in the router core; find them when the item model or the dragger needs rotation.
 - The polygon union in `SOLID::Hull` and `HOLE::Hull` (`pns_solid.cpp:55`, `pns_hole.cpp:84`) is replaced by a convex hull of the per primitive hulls per DESIGN.md section 3. Measure against a KiCad fixture with a complex pad once fixtures exist; a tighter union may matter for dense pad rows.
 - Exact `isqrt` replaces KiCad's truncated `f64` square root in distances; the two agree below about 95 mm. If a fixture disagrees above that, the distances in `seg.rs`, `line_chain.rs` and `collision.rs` are the place to look.
+
+Deferred during milestone 2 (world model):
+
+- `INDEX::SetDeferred` / `BuildSpatialIndex`, KiCad's bulk load for the initial board sync (`pns_index.cpp:55`, `pns_node.cpp:1257`), is not ported. Measure the root index build on a large board before adding a second insertion path.
+- The parallel obstacle scan of `NODE::NearestObstacle` (`pns_node.cpp:437`) is not ported; the sequential scan is deterministic by construction. Profile before adding threads.
+- `NODE::FixupVirtualVias` (`pns_node.cpp:1282`) is not ported; note 02 records two errata in it (a dead `n_seg >= 3` branch, a `locked_seg` that leaks across joints). Decide with the shove work item.
+- Line versus line collisions (`pns_item.cpp:133`) are not supported since lines are never stored; the shove (`pns_shove.cpp:318`, `:481`), optimizer (`pns_optimizer.cpp:1356`) and multi dragger (`pns_multi_dragger.cpp:321`) call sites must decompose one side into segments when they are ported.
+- `check_colliding_items` (`src/node.rs`) takes items only, not lines, for the same reason.
+- The via self collision heuristic was retired (log entry of 2026-09-08). Two distinct stored vias at one position with equal padstack, net and drill now collide hole to hole; revert `consider_hole_to_hole` in `src/collide.rs` if a shove fixture disagrees.
+- The 90 degree corner mode hull simplification in `NearestObstacle` (`pns_node.cpp:330`) needs the routing settings and lands with the walkaround.

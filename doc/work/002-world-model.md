@@ -1,6 +1,6 @@
 # 002 World model
 
-Status: in progress (started 2026-09-08)
+Status: implemented (2026-09-08)
 
 ## Goal
 
@@ -14,10 +14,10 @@ Items, layers, nets, spatial index, joints, the branching node, line assembly, n
 - [x] `JointMap` with joint arena and `JointId`, touch, link, unlink, rebuild, lock.
 - [x] `Node` with add, remove, branch, commit, kill children, max clearance, and the single `visit_candidates` helper that visits branch and root only.
 - [x] `collide_simple` with the clearance ladder and the `- 1` at `pns_item.cpp:249`.
-- [ ] `Line` with links valid in a node, `LineVia::Owned | Linked`, assemble line, follow line, clip to nearest obstacle.
-- [ ] `nearest_obstacle` with deterministic `(distance, uid)` ordering, `Line::walkaround` around one hull.
+- [x] `Line` with links valid in a node, `LineVia::Owned | Linked`, assemble line, follow line, clip to nearest obstacle.
+- [x] `nearest_obstacle` with deterministic `(distance, uid)` ordering, `Line::walkaround` around one hull.
 - [x] `RuleResolver` trait and a fixed clearance implementation for tests.
-- [ ] Scenario tests: build a world from plain data, branch, add, remove, commit, assemble lines across joints, query colliding items.
+- [x] Scenario tests: build a world from plain data, branch, add, remove, commit, assemble lines across joints, query colliding items.
 
 ## Acceptance
 

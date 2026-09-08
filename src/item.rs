@@ -1220,9 +1220,12 @@ impl Via {
 
   /// Whether two vias have the same padstack.
   ///
-  /// Port of `PadstackMatches`, `pcbnew/router/pns_via.cpp:108`, which the
-  /// hole to hole collision pruning uses to recognise a line's copy of a
-  /// via already in the node (`pcbnew/router/pns_item.cpp:66`).
+  /// Port of `PadstackMatches`, `pcbnew/router/pns_via.cpp:108`. Its only
+  /// caller in KiCad is the hole to hole pruning heuristic
+  /// (`pcbnew/router/pns_item.cpp:66`), which recognises a line's copy of
+  /// a via already in the node and which `src/collide.rs` retired, so
+  /// nothing in this crate calls it either. It stays because it is a
+  /// member of `VIA` and costs nothing.
   ///
   /// Deviation: KiCad's `std::equal( myLayers.begin(), myLayers.end(),
   /// otherLayers.begin() )` (`:113`) walks the other vector to the first

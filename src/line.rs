@@ -30,9 +30,12 @@
 //! exact counterpart of `SEGMENT( const LINE&, const SEG& )`
 //! (`pcbnew/router/pns_segment.h:59`), the throwaway segment KiCad builds
 //! per chain segment whenever it wants to ask the node a question about a
-//! line (`pcbnew/router/pns_node.cpp:310`, `:518`). Part 2's
-//! `query_colliding` and `check_colliding` overloads for a line are that
-//! loop, plus one query for the via; see [`Line::via_item`].
+//! line (`pcbnew/router/pns_node.cpp:310`, `:518`).
+//! [`World::query_colliding_line`] and [`World::check_colliding_line`]
+//! are that loop, plus one query for the via; see [`Line::via_item`].
+//! Where the whole line has to answer at once, as the head of one
+//! collision test, [`Line::rule_item`] and
+//! [`crate::collide::LineHead`] take over.
 //!
 //! # Links, and what `links_valid_in` guarantees
 //!
@@ -79,16 +82,14 @@
 //! arena item and `parent_item != parent_head` catches it, so the
 //! heuristic has nothing left to do for lines.
 //!
-//! It is deliberately **not** removed yet. The 2026-09-08 log entry
-//! records why: it is also reachable between two distinct stored vias
-//! with no line involved, so dropping it changes an answer KiCad's is
-//! known for. Retiring it is part 2's call, once the line collision path
-//! exists and a fixture can show that [`LineVia::Linked`] plus the
-//! identity test cover every case the heuristic covered. Until then the
-//! contract for part 2 is the one `src/collide.rs` states: hand
-//! [`LineVia::Linked`] through as a **stored** [`crate::rules::ItemRef`]
-//! so identity does the pruning, and [`LineVia::Owned`] as an unstored
-//! one, where the heuristic still applies. [`Line::via_item`] does both.
+//! It is gone. [`Line::via_item`] hands [`LineVia::Linked`] through as a
+//! **stored** [`crate::rules::ItemRef`], so the identity tests prune both
+//! the via pass and the hole pass, and [`LineVia::Owned`] as an unstored
+//! one that owns no hole at all, because a hole is a separate arena item
+//! and nothing drills one until [`World::add_via`] stores the via. So a
+//! line never reaches the hole to hole branch the heuristic guarded. The
+//! fixtures are in `src/node.rs`; `src/collide.rs` documents the one
+//! answer that changed.
 //!
 //! # What is not ported
 //!
@@ -104,7 +105,9 @@
 //!   are `DRAGGER` and `MULTI_DRAGGER`, which are milestone 8. The
 //!   `snap_threshold` field they read is here, because every copy path
 //!   propagates it.
-//! - `ClipToNearestObstacle` (`:679`), which needs `nearest_obstacle`.
+//! - `ClipToNearestObstacle` (`:679`). It has no caller anywhere in
+//!   `pcbnew/router`, only its definition and its declaration, so it is
+//!   left out even now that [`World::nearest_obstacle`] exists.
 //! - `FindSegment( const SEGMENT* )` (`:1668`), which has no caller in
 //!   the tree.
 //! - `restoreUntouchedArcs` (`:255`), the arc splice at the end of the
@@ -1374,7 +1377,47 @@ impl Line {
   ///
   /// When `index` is not a segment of the chain.
   pub fn segment_item(&self, world: &World, index: usize, uid: u64) -> Item {
-    let body = Segment::new(self.chain.segment(index), self.width);
+    self.item_over(world, self.chain.segment(index), uid)
+  }
+
+  /// The whole line as one throwaway item for the rule queries.
+  ///
+  /// `ITEM::collideSimple` hands the `LINE*` it was given straight to
+  /// `IsKeepout`, `IsNetTieExclusion` and `NODE::GetClearance`
+  /// (`pcbnew/router/pns_item.cpp:198`, `:220`, `:254`), and
+  /// `NODE::NearestObstacle` does the same when it asks for the clearance
+  /// that sizes a hull (`pcbnew/router/pns_node.cpp:360`). A `LINE` is an
+  /// `ITEM` there and a [`Line`] is not one here, so the resolver is
+  /// handed this stand in instead.
+  ///
+  /// It carries every property a rule can read, which is what
+  /// [`Line::segment_item`] copies as well: the width, the net, the
+  /// layers, the marks, the rank and the source host object. Its
+  /// **geometry is a placeholder**, the straight segment from the first
+  /// point to the last, and no caller may use it: the shape the collision
+  /// test uses for a line is the chain, which
+  /// [`crate::collide::LineHead`] carries separately.
+  ///
+  /// See [`Line::segment_item`] for what `uid` is for.
+  pub fn rule_item(&self, world: &World, uid: u64) -> Item {
+    let first = if self.chain.point_count() > 0 {
+      self.chain.point(0)
+    } else {
+      Vec2::new(0, 0)
+    };
+    let last = self.last_point().unwrap_or(first);
+
+    self.item_over(world, Seg::new(first, last), uid)
+  }
+
+  /// The body of both throwaway item builders.
+  ///
+  /// The constructor `SEGMENT( const LINE& aParentLine, const SEG& aSeg )`
+  /// (`pcbnew/router/pns_segment.h:59`) with the segment as a parameter,
+  /// so that [`Line::segment_item`] can pass one of the chain's and
+  /// [`Line::rule_item`] a placeholder.
+  fn item_over(&self, world: &World, seg: Seg, uid: u64) -> Item {
+    let body = Segment::new(seg, self.width);
     let mut item = Item::new(uid, ItemBody::Segment(body));
 
     item.set_layers_and_flash_all(self.layers);
@@ -2568,5 +2611,50 @@ mod tests {
         assert_eq!(first, second);
       }
     }
+  }
+
+  #[test]
+  fn the_rule_item_speaks_for_the_whole_line() {
+    let (world, first, _) = two_segments();
+    let root = world.root();
+    let line = world.assemble_line(root, first, None, false, false, true);
+    let stand_in = line.rule_item(&world, 11);
+    let segment = line.segment_item(&world, 0, 12);
+
+    // Everything a rule can read matches the line, and matches what one
+    // of its segments would have said.
+    assert_eq!(stand_in.uid(), 11);
+    assert_eq!(stand_in.net(), line.net());
+    assert_eq!(stand_in.layers(), line.layers());
+    assert_eq!(stand_in.net(), segment.net());
+    assert_eq!(stand_in.layers(), segment.layers());
+    assert_eq!(stand_in.rank(), segment.rank());
+    assert_eq!(stand_in.marker(), segment.marker());
+    // It owns nothing, so it can never prune a hole by parentage.
+    assert_eq!(stand_in.hole(), None);
+    assert_eq!(stand_in.parent_pad_via(), None);
+
+    // Its geometry is the placeholder the documentation warns about: the
+    // straight segment from the first point to the last, which is not
+    // the chain.
+    let ItemBody::Segment(body) = stand_in.body() else {
+      panic!("the stand in is a segment");
+    };
+
+    assert_eq!(body.seg(), Seg::new(line.point(0), Vec2::new(200000, 0)));
+    assert_eq!(body.width(), line.width());
+  }
+
+  #[test]
+  fn the_rule_item_of_an_empty_line_is_degenerate() {
+    let world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let line = Line::new();
+    let stand_in = line.rule_item(&world, 0);
+
+    let ItemBody::Segment(body) = stand_in.body() else {
+      panic!("the stand in is a segment");
+    };
+
+    assert_eq!(body.seg(), Seg::new(Vec2::new(0, 0), Vec2::new(0, 0)));
   }
 }

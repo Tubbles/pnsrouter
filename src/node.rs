@@ -65,18 +65,18 @@
 //! `std::set<OBSTACLE>` keyed on addresses (`DESIGN.md` section 8,
 //! `doc/reference/kicad/02-item-model-and-node.md` section 11 entries 2, 3
 //! and 15). Obstacles come back sorted by `(item uid, head uid)` and
-//! deduplicated by item; item lists come back sorted by uid. The
-//! `(distance, uid)` order KiCad's `NearestObstacle` needs is a different
-//! order and belongs to that function, which arrives with `Line`.
+//! deduplicated by item; item lists come back sorted by uid.
+//! [`World::nearest_obstacle`] scans that same order and breaks a
+//! distance tie on it, which is the `(distance, uid)` key `DESIGN.md`
+//! section 8 asks for.
 //!
 //! # Members not ported
 //!
-//! - `NearestObstacle`, the `LINE` overloads of `QueryColliding` and
-//!   `CheckColliding`, `CheckColliding( const ITEM_SET& )` and
-//!   `LINE::ClipToNearestObstacle`. They are the second half of the line
-//!   work item; the line itself, `Add( LINE& )`, `Remove( LINE& )`,
-//!   `Replace( LINE&, LINE& )`, `AssembleLine`, `followLine` and
-//!   `FindLinesBetweenJoints` are here, in the Lines section.
+//! - `LINE::ClipToNearestObstacle` (`pcbnew/router/pns_line.cpp:679`).
+//!   It is the one consumer of [`World::nearest_obstacle`] with no caller
+//!   at all in this KiCad revision: a grep of `pcbnew/router` finds its
+//!   definition and its declaration and nothing else. Port it when
+//!   something needs it.
 //! - `FindItemByParent` / `FindItemsByParent`
 //!   (`pcbnew/router/pns_node.cpp:1815`, `:1836`), which resolve a host
 //!   object back to an item. That is host bookkeeping: the commit diff
@@ -113,6 +113,7 @@ use crate::arena::{Arena, ArenaId};
 use crate::collide::{CollisionSearchOptions, Obstacle, collide_into};
 use crate::geometry::box2::Box2;
 use crate::geometry::collision;
+use crate::geometry::hull::hull_intersection;
 use crate::geometry::line_chain::LineChain;
 use crate::geometry::shape::Shape;
 use crate::geometry::vec2::Vec2;
@@ -1489,14 +1490,40 @@ impl World {
     resolver: &dyn RuleResolver,
     options: &CollisionSearchOptions,
   ) -> Vec<Obstacle> {
+    let mut obstacles = BTreeMap::new();
+
+    self.query_colliding_into(node, head, resolver, options, &mut obstacles);
+
+    self.sort_obstacles(obstacles)
+  }
+
+  /// One query's worth of obstacles, merged into a set the caller owns.
+  ///
+  /// `NODE::QueryColliding` writes into the `OBSTACLES&` it is handed
+  /// (`pcbnew/router/pns_node.cpp:267`), which is what lets the line
+  /// paths run one query per segment against **one** set: the limit at
+  /// `:259` counts what every earlier segment already found, and a query
+  /// that starts with a full set stops at once. Keeping that shape is why
+  /// the set is a parameter here and the sort is the caller's.
+  ///
+  /// The key is the obstacle's item, which is KiCad's deduplication once
+  /// the dangling head pointer is taken into account (note 02 section 11
+  /// entry 4), and the first obstacle found for an item wins.
+  fn query_colliding_into(
+    &self,
+    node: NodeId,
+    head: ItemRef<'_>,
+    resolver: &dyn RuleResolver,
+    options: &CollisionSearchOptions,
+    obstacles: &mut BTreeMap<Option<ItemId>, Obstacle>,
+  ) {
     // :272
     if head.item().is_virtual() {
-      return Vec::new();
+      return;
     }
 
     let items = &self.items;
     let limit = options.limit_count.filter(|count| *count > 0);
-    let mut obstacles: BTreeMap<Option<ItemId>, Obstacle> = BTreeMap::new();
     let mut scratch: Vec<Obstacle> = Vec::new();
 
     self.visit_candidates(node, &Candidates::Item(head.item()), |id, layer| {
@@ -1546,8 +1573,20 @@ impl World {
       // :259
       limit.is_none_or(|limit| obstacles.len() < limit)
     });
+  }
 
+  /// A merged obstacle set in this crate's deterministic order.
+  ///
+  /// The `(item uid, head uid)` order [`World::query_colliding`]
+  /// documents, replacing the address order of KiCad's
+  /// `std::set<OBSTACLE>` (`pcbnew/router/pns_node.h:103`). An unstored
+  /// or stale handle sorts last.
+  fn sort_obstacles(
+    &self,
+    obstacles: BTreeMap<Option<ItemId>, Obstacle>,
+  ) -> Vec<Obstacle> {
     let mut found: Vec<Obstacle> = obstacles.into_values().collect();
+
     found.sort_by_key(|obstacle| {
       (self.uid_of(obstacle.item), self.uid_of(obstacle.head))
     });
@@ -1577,6 +1616,331 @@ impl World {
       .query_colliding(node, head, resolver, options)
       .into_iter()
       .next()
+  }
+
+  // -----------------------------------------------------------------
+  // The line queries
+  // -----------------------------------------------------------------
+
+  /// Every obstacle a line meets in this node.
+  ///
+  /// The query loop of `NODE::NearestObstacle`,
+  /// `pcbnew/router/pns_node.cpp:302` to `:316`: one
+  /// [`World::query_colliding`] per segment of the chain, with the
+  /// segment turned into an unstored `SEGMENT` by [`Line::segment_item`]
+  /// (KiCad's stack temporary at `:310`), then one more for the via when
+  /// the line ends with one (`:315`). Every query writes into the same
+  /// set, so [`CollisionSearchOptions::limit_count`] counts the whole
+  /// line and not each segment, and the result is deduplicated by item
+  /// and ordered like [`World::query_colliding`]'s.
+  ///
+  /// KiCad has no `QueryColliding( const LINE& )` overload; this is the
+  /// loop its two line callers open code, factored out so that
+  /// [`World::check_colliding_line`] and [`World::nearest_obstacle`]
+  /// cannot drift apart.
+  ///
+  /// A line's own stored segments are candidates like any other, because
+  /// the identity test at `pcbnew/router/pns_item.cpp:119` compares the
+  /// probe with the candidate and a probe is never a stored item (note 02
+  /// section 11 entry 12). They are exempt through the same net rung of
+  /// the ladder instead.
+  pub fn query_colliding_line(
+    &self,
+    node: NodeId,
+    line: &Line,
+    resolver: &dyn RuleResolver,
+    options: &CollisionSearchOptions,
+  ) -> Vec<Obstacle> {
+    let mut obstacles = BTreeMap::new();
+
+    self.collect_line_obstacles(
+      node,
+      line,
+      resolver,
+      options,
+      &mut obstacles,
+      false,
+    );
+
+    self.sort_obstacles(obstacles)
+  }
+
+  /// The first obstacle a line meets, or `None`.
+  ///
+  /// Port of the `LINE_T` branch of `NODE::CheckColliding( const ITEM*,
+  /// const COLLISION_SEARCH_OPTIONS& )`,
+  /// `pcbnew/router/pns_node.cpp:507` to `:531`, which answers as soon as
+  /// one segment's query has put anything in the set rather than
+  /// finishing the line.
+  ///
+  /// KiCad then returns `*obs.begin()`, the address smallest member of
+  /// what has accumulated so far; this returns the first in the
+  /// deterministic order [`World::query_colliding`] establishes, over the
+  /// same accumulated set.
+  pub fn check_colliding_line(
+    &self,
+    node: NodeId,
+    line: &Line,
+    resolver: &dyn RuleResolver,
+    options: &CollisionSearchOptions,
+  ) -> Option<Obstacle> {
+    let mut obstacles = BTreeMap::new();
+
+    self.collect_line_obstacles(
+      node,
+      line,
+      resolver,
+      options,
+      &mut obstacles,
+      true,
+    );
+
+    self.sort_obstacles(obstacles).into_iter().next()
+  }
+
+  /// The first obstacle any of a set of items meets, or `None`.
+  ///
+  /// Port of `NODE::CheckColliding( const ITEM_SET&, int )`,
+  /// `pcbnew/router/pns_node.cpp:478`, a plain loop that stops at the
+  /// first item with an obstacle. The order of `items` decides which one
+  /// that is, and it is the caller's `Vec`, where KiCad's `ITEM_SET`
+  /// keeps insertion order too.
+  ///
+  /// KiCad's overload builds the options itself, `m_kindMask` from its
+  /// argument and `m_limitCount = 1` (`:494`); both are the caller's here,
+  /// so that the whole set can be queried under one policy.
+  ///
+  /// An `ITEM_SET` can also hold `LINE`s, which KiCad's overload
+  /// decomposes through the same `CheckColliding`. A [`Line`] is not an
+  /// item here, so a caller with lines in its set loops over
+  /// [`World::check_colliding_line`] itself; the dragger, the one caller
+  /// that mixes the two (`pcbnew/router/pns_dragger.cpp:446`), arrives
+  /// with milestone 8.
+  pub fn check_colliding_items(
+    &self,
+    node: NodeId,
+    items: &[ItemRef<'_>],
+    resolver: &dyn RuleResolver,
+    options: &CollisionSearchOptions,
+  ) -> Option<Obstacle> {
+    items
+      .iter()
+      .find_map(|item| self.check_colliding(node, *item, resolver, options))
+  }
+
+  /// The query loop [`World::query_colliding_line`] and
+  /// [`World::check_colliding_line`] share.
+  ///
+  /// `stop_when_found` is the difference between the two KiCad call
+  /// sites: `NearestObstacle` runs every segment (`:302`), `CheckColliding`
+  /// returns at the first non empty set (`:521`).
+  fn collect_line_obstacles(
+    &self,
+    node: NodeId,
+    line: &Line,
+    resolver: &dyn RuleResolver,
+    options: &CollisionSearchOptions,
+    obstacles: &mut BTreeMap<Option<ItemId>, Obstacle>,
+    stop_when_found: bool,
+  ) {
+    for index in 0..line.shape().segment_count() {
+      let probe = line.segment_item(self, index, PROBE_UID);
+
+      self.query_colliding_into(
+        node,
+        ItemRef::unstored(&probe),
+        resolver,
+        options,
+        obstacles,
+      );
+
+      if stop_when_found && !obstacles.is_empty() {
+        return;
+      }
+    }
+
+    // :314. A via at the end is part of the line's footprint.
+    if let Some(via) = line.via_item(self) {
+      self.query_colliding_into(node, via, resolver, options, obstacles);
+    }
+  }
+
+  /// The obstacle a line runs into first, with the geometry that says
+  /// where.
+  ///
+  /// Port of `NODE::NearestObstacle`, `pcbnew/router/pns_node.cpp:298`.
+  /// [`World::query_colliding_line`] answers *what* collides; this answers
+  /// *which comes first along the line*, by building each obstacle's hull
+  /// at the clearance the line needs from it, intersecting that hull with
+  /// the line's chain, and measuring the path length from the line's start
+  /// to each intersection.
+  ///
+  /// # Why it takes `&mut self`
+  ///
+  /// [`World::hull_of`] memoises. KiCad has the same constraint and spells
+  /// it as an explicit sequential phase before it goes parallel, because
+  /// neither its clearance cache nor its hull cache is thread safe
+  /// (`:346`). Note 02 section 10.7 predicted that `&mut` would force the
+  /// same split; it does.
+  ///
+  /// # Deterministic order
+  ///
+  /// Three of KiCad's pointer order dependencies live in this function
+  /// (note 04 section 9 items 2, 3 and 4). All three are answered by
+  /// scanning the candidates in `(item uid)` order, which
+  /// [`World::query_colliding_line`] already returns them in:
+  ///
+  /// - the winner scan uses a strict `<` on the distance, so a tie goes
+  ///   to the smaller item uid where KiCad's goes to the lower address;
+  /// - the zero distance early break (`:466`) stops at the smallest uid
+  ///   among the obstacles the line touches. It is an optimisation and
+  ///   nothing else: no later candidate can beat a distance of zero under
+  ///   a strict `<`;
+  /// - the no intersection fallback (`:471`) picks the smallest item uid
+  ///   rather than the lowest address. See
+  ///   [`NearestObstacle::found_intersection`] for what that result means.
+  ///
+  /// # Not ported
+  ///
+  /// The thread pool (`:437`) and, with it, the sequential hull copy that
+  /// only exists to feed it (`:346` to `:376`); [`Rc`] hulls are shared
+  /// instead. The `makeHull` lambda (`:330`), which replaces a hull by its
+  /// bounding box in the two 90 degree corner modes, needs the routing
+  /// settings this crate does not have yet; the walkaround and the placer
+  /// carry the same simplification, so it lands with them.
+  pub fn nearest_obstacle(
+    &mut self,
+    node: NodeId,
+    line: &Line,
+    resolver: &dyn RuleResolver,
+    options: &CollisionSearchOptions,
+  ) -> Option<NearestObstacle> {
+    // :302 to :318
+    let obstacles = self.query_colliding_line(node, line, resolver, options);
+
+    // :319
+    if obstacles.is_empty() {
+      return None;
+    }
+
+    let layer = line.layer();
+    let use_epsilon = options.use_clearance_epsilon;
+    let probe = line.rule_item(self, PROBE_UID);
+    let mut clearances: Vec<(i32, Option<i32>)> =
+      Vec::with_capacity(obstacles.len());
+
+    {
+      let head = ItemRef::unstored(&probe);
+      let via = line.via_item(self);
+      // :369. `VIA::Diameter( aLine->Layer() ) / 2`.
+      let via_radius = via.and_then(|via| via_radius_on(via.item(), layer));
+
+      for obstacle in &obstacles {
+        let Some(item) = obstacle
+          .item
+          .and_then(|id| Some(ItemRef::stored(id, self.items.get(id)?)))
+        else {
+          clearances.push((0, None));
+          continue;
+        };
+
+        // :360. Half the line's width folded into the clearance, with a
+        // walkaround thickness of zero, which is the other half of the
+        // same sum inside the hull builders.
+        let line_clearance =
+          clearance_of(resolver, item, head, use_epsilon) + line.width() / 2;
+        // :366
+        let via_clearance = match (via, via_radius) {
+          (Some(via), Some(radius)) => {
+            Some(clearance_of(resolver, item, via, use_epsilon) + radius)
+          }
+          _ => None,
+        };
+
+        clearances.push((line_clearance, via_clearance));
+      }
+    }
+
+    // :361, :371. The hulls, which is the phase that needs `&mut self`.
+    let mut hulls: Vec<ObstacleHulls> = Vec::with_capacity(obstacles.len());
+
+    for (obstacle, (line_clearance, via_clearance)) in
+      obstacles.iter().zip(&clearances)
+    {
+      let Some(id) = obstacle.item else {
+        hulls.push(ObstacleHulls::default());
+        continue;
+      };
+
+      hulls.push(ObstacleHulls {
+        line: self.hull_of(id, *line_clearance, 0, layer),
+        via: via_clearance
+          .and_then(|clearance| self.hull_of(id, clearance, 0, layer)),
+      });
+    }
+
+    // :385 to :425, the per obstacle intersection scan, and :456 to
+    // :468, the winner scan, run together: `results[i]` depends on
+    // nothing but `i`, so computing it just before it is compared is the
+    // same answer and lets the early break skip the work it discards.
+    let path = line.shape();
+    let mut best: Option<(i64, Vec2, usize)> = None;
+
+    for (index, candidate) in hulls.iter().enumerate() {
+      let mut nearest: Option<(i64, Vec2)> = None;
+
+      for hull in [&candidate.line, &candidate.via].into_iter().flatten() {
+        for crossing in hull_intersection(hull, path) {
+          let Some(theirs) = crossing.theirs else {
+            continue;
+          };
+          // :400. `index_their` is the segment hint.
+          let Some(distance) =
+            path.path_length(crossing.point, Some(theirs.index()))
+          else {
+            continue;
+          };
+
+          if nearest.is_none_or(|(closest, _)| distance < closest) {
+            nearest = Some((distance, crossing.point));
+          }
+        }
+      }
+
+      // :460
+      if let Some((distance, point)) = nearest
+        && best.is_none_or(|(closest, _, _)| distance < closest)
+      {
+        best = Some((distance, point, index));
+
+        // :466
+        if distance == 0 {
+          break;
+        }
+      }
+    }
+
+    // :471. Nothing intersected the path at all. KiCad overwrites its
+    // `INT_MAX` sentinel with the whole of `obstacles[0]`, whose
+    // `m_distFirst` is the zero `collideSimple` wrote
+    // (`pcbnew/router/pns_item.cpp:264`) and whose `m_ipFirst` is a
+    // default `VECTOR2I`, so a caller cannot tell this case from a line
+    // that starts exactly on a hull.
+    let (distance, point, index, found_intersection) = match best {
+      Some((distance, point, index)) => (distance, point, index, true),
+      None => (0, Vec2::new(0, 0), 0, false),
+    };
+
+    Some(NearestObstacle {
+      item: obstacles[index].item,
+      clearance: obstacles[index].clearance,
+      ip_first: point,
+      dist_first: distance,
+      pos: Vec2::new(0, 0),
+      max_fanout_width: 0,
+      hull: hulls[index].line.clone(),
+      found_intersection,
+    })
   }
 
   /// Every item whose shape contains a point.
@@ -2525,6 +2889,141 @@ impl World {
 }
 
 // ---------------------------------------------------------------------
+// The nearest obstacle
+// ---------------------------------------------------------------------
+
+/// The uid a line's throwaway probe items carry.
+///
+/// [`Line::segment_item`] and [`Line::rule_item`] take a uid because a
+/// stored item's has to come from the world's counter (`DESIGN.md`
+/// section 8). A probe is never stored, so nothing can sort by its uid;
+/// `World::uid_of` answers `u64::MAX` for the missing handle anyway, so
+/// this is the same number by a different route.
+const PROBE_UID: u64 = u64::MAX;
+
+/// What [`World::nearest_obstacle`] found, and where.
+///
+/// Port of the `OBSTACLE` that `NODE::NearestObstacle` returns
+/// (`pcbnew/router/pns_node.h:88`), restricted to the fields something
+/// reads and extended with the hull, so that the walkaround does not have
+/// to rebuild it.
+///
+/// Two of KiCad's fields are not here. `m_head` points at the stack
+/// `SEGMENT` the query loop built and dangles the moment the loop ends;
+/// nothing in the tree reads it (note 02 section 11 entry 4). `m_pos` is
+/// [`NearestObstacle::pos`], kept because the struct is a port, and it is
+/// never written anywhere in KiCad's tree either.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct NearestObstacle {
+  /// The item that collides. Port of `m_item`. `None` only for an
+  /// obstacle the arena has forgotten between the query and the scan.
+  pub item: Option<ItemId>,
+  /// The clearance the ladder applied when the collision was found. Port
+  /// of `m_clearance`, written by `collideSimple`
+  /// (`pcbnew/router/pns_item.cpp:263`), which is **not** the clearance
+  /// the hull was built at: that one folds in half the line's width and
+  /// is asked for again with the line rather than one of its segments.
+  pub clearance: i32,
+  /// Where the line first enters the obstacle's hull. Port of
+  /// `m_ipFirst` (`pcbnew/router/pns_node.cpp:464`).
+  pub ip_first: Vec2,
+  /// The path length from the line's first point to
+  /// [`NearestObstacle::ip_first`]. Port of `m_distFirst` (`:463`),
+  /// widened to `i64` as [`LineChain::path_length`] is.
+  pub dist_first: i64,
+  /// Port of `m_pos`, which no code in KiCad's tree writes. Always the
+  /// origin here, so that a consumer that reads it gets the same nothing.
+  pub pos: Vec2,
+  /// The widest track fanning out of an obstacle via. Port of
+  /// `m_maxFanoutWidth`, which `collideSimple` zeroes
+  /// (`pcbnew/router/pns_item.cpp:264`) and only the shove fills in
+  /// (`pcbnew/router/pns_shove.cpp:1553`), so it is zero until the shove
+  /// lands.
+  pub max_fanout_width: i32,
+  /// The obstacle's hull at the clearance this line needs from it, with a
+  /// walkaround thickness of zero, exactly the chain the scan intersected
+  /// (`pcbnew/router/pns_node.cpp:361`).
+  ///
+  /// KiCad keeps no hull and its callers rebuild one; note that
+  /// `WALKAROUND::processCluster` rebuilds it under a **different** key,
+  /// the line's width as the thickness rather than half of it as
+  /// clearance (`pcbnew/router/pns_walkaround.cpp:157`), so this is the
+  /// hull for the distance measurement and not a drop in replacement for
+  /// the walkaround's.
+  ///
+  /// It is the line hull even when the via hull is what produced the
+  /// winning intersection, because that is the only one a consumer has a
+  /// use for. `None` only for an obstacle whose handle went stale.
+  pub hull: Option<Rc<LineChain>>,
+  /// Whether the winner was chosen by geometry or by the fallback.
+  ///
+  /// Not a KiCad field. `false` means no obstacle's hull met the line at
+  /// all and `:471` picked the first candidate in the deterministic
+  /// order, in which case [`NearestObstacle::dist_first`] and
+  /// [`NearestObstacle::ip_first`] carry the zeroes `collideSimple` left
+  /// and mean nothing. Note 02 section 3.9 calls that fallback a
+  /// correctness wart: the item it names may not block the path at all.
+  /// A consumer that wants KiCad's behaviour to the letter ignores this
+  /// field, since KiCad cannot tell the two cases apart.
+  pub found_intersection: bool,
+}
+
+/// The two hulls one obstacle contributes to the distance scan.
+///
+/// `hullData[i]`, `pcbnew/router/pns_node.cpp:350`. KiCad owns a copy of
+/// each chain there, precisely so that the parallel phase cannot race the
+/// cache it came from (`:346`); [`Rc`] shares them instead.
+#[derive(Clone, Default)]
+struct ObstacleHulls {
+  /// The hull at the line's clearance (`:361`).
+  line: Option<Rc<LineChain>>,
+  /// The hull at the via's clearance, when the line ends with one
+  /// (`:371`).
+  via: Option<Rc<LineChain>>,
+}
+
+/// The clearance between two items, uncached.
+///
+/// Port of `NODE::GetClearance`, `pcbnew/router/pns_node.cpp:143`, for the
+/// one caller that cannot use [`World::clearance_between`]: a line is not
+/// in the arena, so there is no [`ItemId`] to key a cache entry on. KiCad
+/// caches it by pointer and reaches this path with a `LINE*`
+/// (`pcbnew/router/pns_node.cpp:360`), so it caches on an address that
+/// belongs to a stack temporary.
+///
+/// `-1` is KiCad's "these two can never collide" sentinel arriving in an
+/// `int` and being added to a half width regardless (`:361`), which is
+/// reproduced rather than tidied because the hull it sizes is only ever
+/// compared with other hulls.
+fn clearance_of(
+  resolver: &dyn RuleResolver,
+  item: ItemRef<'_>,
+  head: ItemRef<'_>,
+  use_epsilon: bool,
+) -> i32 {
+  // :148
+  if item.item().is_virtual() || head.item().is_virtual() {
+    return 0;
+  }
+
+  resolver
+    .clearance(item, Some(head), use_epsilon)
+    .unwrap_or(-1)
+}
+
+/// Half a via's copper diameter on a layer.
+///
+/// The `via.Diameter( aLine->Layer() ) / 2` at
+/// `pcbnew/router/pns_node.cpp:369`. `None` when the item is not a via,
+/// which KiCad's typed `const VIA&` makes unrepresentable.
+fn via_radius_on(item: &Item, layer: i32) -> Option<i32> {
+  match item.body() {
+    ItemBody::Via(via) => Some(via.diameter(item.layers(), layer) / 2),
+    _ => None,
+  }
+}
+
+// ---------------------------------------------------------------------
 // Line assembly helpers
 // ---------------------------------------------------------------------
 
@@ -2579,6 +3078,7 @@ fn index_or_missing(index: Option<usize>) -> isize {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::collide::{LineHead, collide_line_into, collide_line_items};
   use crate::geometry::seg::Seg;
   use crate::item::{Segment, Solid, Via, ViaType};
   use crate::rules::FixedClearance;
@@ -3985,6 +4485,603 @@ mod tests {
         origin,
         added,
         between,
+      }
+    }
+
+    assert_eq!(run(), run());
+  }
+
+  // -----------------------------------------------------------------
+  // The line queries and the nearest obstacle
+  // -----------------------------------------------------------------
+
+  /// Where the near obstacle of the crossing fixture stands.
+  const NEAR_X: i32 = 100000;
+
+  /// Where the far obstacle of the crossing fixture stands.
+  const FAR_X: i32 = 200000;
+
+  /// How far the head line of the crossing fixture runs.
+  const HEAD_END: i32 = 300000;
+
+  /// The resolver every line query test uses.
+  fn rules() -> FixedClearance {
+    FixedClearance::uniform(CLEARANCE)
+  }
+
+  /// A head line the placer could be dragging: width 1000, layer 0, on
+  /// [`OTHER_NET`] so that nothing in a fixture exempts it.
+  fn head_line(points: &[Vec2]) -> Line {
+    let mut line = Line::new();
+
+    line.set_width(1000);
+    line.set_layer(0);
+    line.set_net(OTHER_NET);
+    line.set_shape(LineChain::from_slice(points, false));
+
+    line
+  }
+
+  /// A vertical track on layer 0, 50 millimetres either side of the x
+  /// axis, which a head line along that axis has to cross.
+  fn crossing_track(world: &mut World, node: NodeId, x: i32) -> ItemId {
+    let item = track(world, Vec2::new(x, -50000), Vec2::new(x, 50000), 0, NET);
+
+    world
+      .add_segment(node, item, false)
+      .expect("the crossing track is neither degenerate nor redundant")
+  }
+
+  /// The head line of the crossing fixture, from the origin along the x
+  /// axis past both tracks.
+  fn crossing_head() -> Line {
+    head_line(&[Vec2::new(0, 0), Vec2::new(HEAD_END, 0)])
+  }
+
+  #[test]
+  fn nearest_obstacle_answers_nothing_when_the_line_is_clear() {
+    let mut world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let root = world.root();
+    crossing_track(&mut world, root, NEAR_X);
+
+    let clear = head_line(&[Vec2::new(0, 400000), Vec2::new(HEAD_END, 400000)]);
+    let options = CollisionSearchOptions::default();
+
+    assert!(
+      world
+        .nearest_obstacle(root, &clear, &rules(), &options)
+        .is_none()
+    );
+  }
+
+  #[test]
+  fn nearest_obstacle_measures_where_the_line_meets_the_hull() {
+    let mut world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let root = world.root();
+    let near = crossing_track(&mut world, root, NEAR_X);
+    let head = crossing_head();
+    let options = CollisionSearchOptions::default();
+
+    let found = world
+      .nearest_obstacle(root, &head, &rules(), &options)
+      .expect("the line crosses the track");
+
+    assert_eq!(found.item, Some(near));
+    assert!(found.found_intersection);
+    // The hull reaches back towards the line's start, so the line enters
+    // it well before it reaches the track itself.
+    assert!(found.dist_first > 0);
+    assert!(found.dist_first < i64::from(NEAR_X));
+    assert_eq!(found.ip_first.y, 0);
+
+    let hull = found.hull.as_ref().expect("a live obstacle has a hull");
+
+    assert!(hull.point_on_edge(found.ip_first, 0));
+    // The two extras KiCad never fills in here.
+    assert_eq!(found.pos, Vec2::new(0, 0));
+    assert_eq!(found.max_fanout_width, 0);
+  }
+
+  #[test]
+  fn nearest_obstacle_picks_the_nearer_of_two_tracks() {
+    let mut world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let root = world.root();
+    let near = crossing_track(&mut world, root, NEAR_X);
+    let far = crossing_track(&mut world, root, FAR_X);
+    let head = crossing_head();
+    let options = CollisionSearchOptions::default();
+
+    let every = world.query_colliding_line(root, &head, &rules(), &options);
+
+    assert_eq!(
+      every
+        .iter()
+        .filter_map(|found| found.item)
+        .collect::<Vec<_>>(),
+      [near, far]
+    );
+
+    let found = world
+      .nearest_obstacle(root, &head, &rules(), &options)
+      .expect("the line crosses both tracks");
+
+    assert_eq!(found.item, Some(near));
+    assert!(found.dist_first < i64::from(FAR_X));
+  }
+
+  /// The far track is added **first**, so it holds the smaller uid. The
+  /// nearer one still wins, which is what makes the scan a distance test
+  /// and not an order test.
+  #[test]
+  fn the_nearer_track_wins_even_with_the_larger_uid() {
+    let mut world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let root = world.root();
+    let far = crossing_track(&mut world, root, FAR_X);
+    let near = crossing_track(&mut world, root, NEAR_X);
+    let head = crossing_head();
+    let options = CollisionSearchOptions::default();
+
+    assert!(world.item(far).map(Item::uid) < world.item(near).map(Item::uid));
+
+    let found = world
+      .nearest_obstacle(root, &head, &rules(), &options)
+      .expect("the line crosses both tracks");
+
+    assert_eq!(found.item, Some(near));
+  }
+
+  /// `DESIGN.md` section 8 and note 04 section 9 item 2: obstacles at one
+  /// distance are separated by the item uid, where KiCad's are separated
+  /// by an address.
+  ///
+  /// The two tracks are mirror images across the head line's axis, so
+  /// their hulls meet the line at the same point and the geometry cannot
+  /// decide between them. Whichever was added first wins, in both
+  /// orders.
+  #[test]
+  fn a_distance_tie_is_broken_by_the_item_uid() {
+    /// One world, with the upper or the lower track added first, and the
+    /// handle of the one added first.
+    fn run(above_first: bool) -> (ItemId, NearestObstacle) {
+      let mut world = World::new(World::DEFAULT_MAX_CLEARANCE);
+      let root = world.root();
+      let above = (Vec2::new(NEAR_X, 1000), Vec2::new(NEAR_X, 50000));
+      let below = (Vec2::new(NEAR_X, -50000), Vec2::new(NEAR_X, -1000));
+      let (first, second) = if above_first {
+        (above, below)
+      } else {
+        (below, above)
+      };
+
+      let item = track(&mut world, first.0, first.1, 0, NET);
+      let first = world
+        .add_segment(root, item, false)
+        .expect("the first mirrored track is fine");
+      let item = track(&mut world, second.0, second.1, 0, NET);
+      world
+        .add_segment(root, item, false)
+        .expect("the second mirrored track is fine");
+
+      let head = crossing_head();
+      let found = world
+        .nearest_obstacle(
+          root,
+          &head,
+          &rules(),
+          &CollisionSearchOptions::default(),
+        )
+        .expect("the line crosses both hulls");
+
+      (first, found)
+    }
+
+    let (above_first, from_above) = run(true);
+    let (below_first, from_below) = run(false);
+
+    assert_eq!(from_above.dist_first, from_below.dist_first);
+    assert_eq!(from_above.ip_first, from_below.ip_first);
+    assert_eq!(from_above.item, Some(above_first));
+    assert_eq!(from_below.item, Some(below_first));
+  }
+
+  /// Note 04 section 9 item 4: when no hull meets the line, KiCad falls
+  /// back to the address first obstacle. Here it is the uid first one,
+  /// and the distance it reports is the zero `collideSimple` left behind.
+  #[test]
+  fn a_line_inside_a_hull_falls_back_to_the_first_obstacle() {
+    let mut world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let root = world.root();
+    let item = pad(&mut world, Vec2::new(0, 0), 0);
+    let disc = world.add_solid(root, item, None);
+    let options = CollisionSearchOptions::default();
+
+    // Both points sit well inside the pad's hull, so the hull and the
+    // line never cross.
+    let head = head_line(&[Vec2::new(0, 0), Vec2::new(1000, 0)]);
+    let found = world
+      .nearest_obstacle(root, &head, &rules(), &options)
+      .expect("the line is inside the pad's clearance");
+
+    assert_eq!(found.item, Some(disc));
+    assert!(!found.found_intersection);
+    assert_eq!(found.dist_first, 0);
+    assert_eq!(found.ip_first, Vec2::new(0, 0));
+  }
+
+  /// The zero distance case, which is also the early break at
+  /// `pcbnew/router/pns_node.cpp:466`. The break cannot change an answer,
+  /// since nothing beats zero under a strict `<`; what this pins is that
+  /// a line starting on a hull measures zero and still names its
+  /// obstacle.
+  #[test]
+  fn a_line_starting_on_a_hull_is_at_distance_zero() {
+    let mut world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let root = world.root();
+    let item = pad(&mut world, Vec2::new(0, 0), 0);
+    let disc = world.add_solid(root, item, None);
+    crossing_track(&mut world, root, NEAR_X);
+    let options = CollisionSearchOptions::default();
+
+    // The clearance `nearest_obstacle` builds the hull at: the rule plus
+    // half the line's width, with a walkaround thickness of zero.
+    let hull = world
+      .hull_of(disc, CLEARANCE + 500, 0, 0)
+      .expect("the pad is live");
+    let start = hull.point(0);
+    let head = head_line(&[start, Vec2::new(0, 0)]);
+
+    let found = world
+      .nearest_obstacle(root, &head, &rules(), &options)
+      .expect("the line starts on the pad's hull");
+
+    assert_eq!(found.item, Some(disc));
+    assert!(found.found_intersection);
+    assert_eq!(found.dist_first, 0);
+    assert_eq!(found.ip_first, start);
+  }
+
+  #[test]
+  fn a_line_with_an_owned_via_collides_through_the_via() {
+    let mut world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let root = world.root();
+    let options = CollisionSearchOptions::default();
+
+    // A pad on the far layer, which the line's own segment can never
+    // reach.
+    let item = pad(&mut world, Vec2::new(NEAR_X, 0), 1);
+    let target = world.add_solid(root, item, None);
+
+    let body = ItemBody::Via(Via::new(
+      Vec2::new(NEAR_X, 0),
+      3000,
+      1000,
+      ViaType::Through,
+    ));
+    let mut via = world.make_item(body);
+    via.set_layers_and_flash_all(LayerRange::new(0, 1));
+
+    let mut head = head_line(&[Vec2::new(0, 0), Vec2::new(NEAR_X, 0)]);
+    head.append_via(via);
+
+    // The segment on its own finds nothing: it is on layer 0 and the pad
+    // is on layer 1.
+    let seg = head.segment_item(&world, 0, u64::MAX);
+
+    assert!(
+      world
+        .check_colliding(root, ItemRef::unstored(&seg), &rules(), &options)
+        .is_none()
+    );
+
+    // The line finds it, because the via is queried as well.
+    let found = world.query_colliding_line(root, &head, &rules(), &options);
+
+    assert_eq!(
+      found
+        .iter()
+        .filter_map(|found| found.item)
+        .collect::<Vec<_>>(),
+      [target]
+    );
+    assert!(
+      world
+        .check_colliding_line(root, &head, &rules(), &options)
+        .is_some()
+    );
+  }
+
+  #[test]
+  fn check_colliding_line_agrees_with_check_colliding_on_one_segment() {
+    let mut world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let root = world.root();
+    crossing_track(&mut world, root, NEAR_X);
+    let options = CollisionSearchOptions::default();
+
+    let head = crossing_head();
+    let seg = head.segment_item(&world, 0, u64::MAX);
+
+    let from_line = world
+      .check_colliding_line(root, &head, &rules(), &options)
+      .expect("the line crosses the track");
+    let from_item = world
+      .check_colliding(root, ItemRef::unstored(&seg), &rules(), &options)
+      .expect("so does the one segment it is made of");
+
+    assert_eq!(from_line.item, from_item.item);
+    assert_eq!(from_line.clearance, from_item.clearance);
+    assert_eq!(from_line.detail, from_item.detail);
+  }
+
+  #[test]
+  fn check_colliding_items_stops_at_the_first_colliding_item() {
+    let (world, ids) = fixture();
+    let root = world.root();
+    let options = CollisionSearchOptions::default();
+
+    let clear = probe(Vec2::new(0, 400000), Vec2::new(1000, 400000), 0);
+    let over_the_via =
+      probe(Vec2::new(MIDDLE.x, -50000), Vec2::new(MIDDLE.x, 50000), 0);
+    let set = [ItemRef::unstored(&clear), ItemRef::unstored(&over_the_via)];
+
+    let found = world
+      .check_colliding_items(root, &set, &rules(), &options)
+      .expect("the second probe runs over the via");
+
+    assert_eq!(found.item, Some(ids.via));
+    assert!(
+      world
+        .check_colliding_items(root, &set[..1], &rules(), &options)
+        .is_none()
+    );
+    assert!(
+      world
+        .check_colliding_items(root, &[], &rules(), &options)
+        .is_none()
+    );
+  }
+
+  // -----------------------------------------------------------------
+  // The retired via hole heuristic
+  // -----------------------------------------------------------------
+
+  /// A world holding one through via at the origin, its hole, and a line
+  /// that ends on it.
+  ///
+  /// This is the fixture the 2026-09-08 log asks for: the input KiCad's
+  /// geometric heuristic (`pcbnew/router/pns_item.cpp:65`) exists to
+  /// answer, a line whose via is the node's via.
+  fn via_line_fixture() -> (World, ItemId, ItemId, Line) {
+    let mut world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let root = world.root();
+
+    let body =
+      ItemBody::Via(Via::new(Vec2::new(0, 0), 3000, 1000, ViaType::Through));
+    let mut item = world.make_item(body);
+    item.set_layers_and_flash_all(LayerRange::new(0, 1));
+    item.set_net(NET);
+    let stored = world.add_via(root, item);
+    let hole = world
+      .item(stored)
+      .and_then(Item::hole)
+      .expect("a via is drilled");
+
+    let mut line = Line::new();
+    line.set_width(1000);
+    line.set_layer(0);
+    line.set_net(NET);
+    line.set_shape(LineChain::from_slice(
+      &[Vec2::new(-50000, 0), Vec2::new(0, 0)],
+      false,
+    ));
+
+    (world, stored, hole, line)
+  }
+
+  /// Collide a whole line against one stored item through the line aware
+  /// entry point, the way the shove and the optimizer will.
+  fn collide_line_with(
+    world: &World,
+    line: &Line,
+    obstacle: ItemId,
+  ) -> Option<Obstacle> {
+    let item = world.item(obstacle).expect("the obstacle is live");
+    let seg = line.rule_item(world, u64::MAX);
+    let head =
+      LineHead::new(ItemRef::unstored(&seg), line, line.via_item(world));
+
+    collide_line_items(
+      &world.items,
+      ItemRef::stored(obstacle, item),
+      &head,
+      &rules(),
+      &CollisionSearchOptions::default(),
+    )
+  }
+
+  /// A line whose via **is** the node's via reports nothing, against the
+  /// via and against its hole, because both sides are one arena item.
+  #[test]
+  fn a_linked_line_via_is_pruned_by_identity() {
+    let (world, stored, hole, mut line) = via_line_fixture();
+    line.link_via(stored, Vec2::new(0, 0));
+
+    assert_eq!(collide_line_with(&world, &line, stored), None);
+    assert_eq!(collide_line_with(&world, &line, hole), None);
+
+    // And through the node, which is the path the placer takes.
+    let root = world.root();
+
+    assert!(
+      world
+        .check_colliding_line(
+          root,
+          &line,
+          &rules(),
+          &CollisionSearchOptions::default()
+        )
+        .is_none()
+    );
+  }
+
+  /// The case the heuristic was written for: a line carrying its **own**
+  /// via that duplicates one already in the node, built the way the
+  /// placer builds one, from scratch.
+  ///
+  /// KiCad's `LINE::AppendVia` clones the via it is given and
+  /// `VIA::Clone` drills the clone a hole of its own
+  /// (`pcbnew/router/pns_via.cpp:278`), so there the two holes are
+  /// distinct objects and only the geometric test keeps them apart. Here
+  /// a hole is a separate arena item that nothing creates until
+  /// [`World::add_via`] stores the via, so an owned via has no hole and
+  /// the hole to hole branch is never entered at all. What is left, the
+  /// copper pair, is exempt for being on one net, exactly as KiCad's is.
+  #[test]
+  fn an_owned_line_via_built_from_scratch_has_no_hole_to_prune() {
+    let (world, stored, hole, mut line) = via_line_fixture();
+    let original = world.item(stored).expect("the stored via is live");
+    let mut duplicate = Item::new(u64::MAX, original.body().clone());
+    duplicate.set_layers_and_flash_all(original.layers());
+    duplicate.set_net(original.net());
+
+    // Geometrically indistinguishable, which is exactly what the retired
+    // heuristic tested for.
+    assert_eq!(duplicate.body(), original.body());
+    assert_eq!(duplicate.net(), original.net());
+    assert_eq!(duplicate.layers(), original.layers());
+
+    line.append_via(duplicate);
+
+    let owned = line.via_item(&world).expect("the line ends with a via");
+
+    // The premise: no second hole exists for a heuristic to prune.
+    assert_eq!(owned.id(), None);
+    assert_eq!(owned.item().hole(), None);
+
+    assert_eq!(collide_line_with(&world, &line, stored), None);
+    assert_eq!(collide_line_with(&world, &line, hole), None);
+
+    let root = world.root();
+
+    assert!(
+      world
+        .check_colliding_line(
+          root,
+          &line,
+          &rules(),
+          &CollisionSearchOptions::default()
+        )
+        .is_none()
+    );
+  }
+
+  /// The other way to build an owned via, cloning the stored [`Item`]
+  /// whole. That copies the handle of the hole rather than the hole, so
+  /// the two sides share **one** arena hole and the parent identity test
+  /// at `pcbnew/router/pns_item.cpp:75` prunes it. KiCad's clone cannot
+  /// reach this state: a copied `HOLE*` would be double freed, which is
+  /// why `VIA::Clone` drills a new one and why the heuristic had to exist
+  /// there.
+  #[test]
+  fn an_owned_line_via_cloned_whole_shares_the_stored_hole() {
+    let (world, stored, hole, mut line) = via_line_fixture();
+    let duplicate = world.item(stored).expect("the stored via is live").clone();
+
+    line.append_via(duplicate);
+
+    let owned = line.via_item(&world).expect("the line ends with a via");
+
+    assert_eq!(owned.id(), None);
+    assert_eq!(owned.item().hole(), Some(hole));
+
+    assert_eq!(collide_line_with(&world, &line, stored), None);
+    assert_eq!(collide_line_with(&world, &line, hole), None);
+  }
+
+  /// The same owned via on another net does collide, so the tests above
+  /// are not passing for want of a collision path.
+  ///
+  /// Both passes fire: the line's own chain ends on the via, and the
+  /// via pass reports the head line's via against the stored one. The
+  /// second is the one worth naming, because
+  /// `line->Via().collideSimple( this, ... )`
+  /// (`pcbnew/router/pns_item.cpp:141`) puts the via in the obstacle
+  /// position and this item in the head position, so its obstacle names
+  /// the two the other way round.
+  #[test]
+  fn an_owned_line_via_on_another_net_collides_with_the_stored_via() {
+    let (world, stored, _, mut line) = via_line_fixture();
+    let duplicate = world.item(stored).expect("the stored via is live").clone();
+
+    line.set_net(OTHER_NET);
+    line.append_via(duplicate);
+
+    let found = collide_line_with(&world, &line, stored)
+      .expect("two vias of different nets on one spot collide");
+
+    assert_eq!(found.item, Some(stored));
+
+    // The accumulating form keeps both, which is where the via pass
+    // becomes visible.
+    let item = world.item(stored).expect("the stored via is live");
+    let seg = line.rule_item(&world, u64::MAX);
+    let head =
+      LineHead::new(ItemRef::unstored(&seg), &line, line.via_item(&world));
+    let mut every = Vec::new();
+
+    collide_line_into(
+      &world.items,
+      ItemRef::stored(stored, item),
+      &head,
+      -1,
+      &rules(),
+      &CollisionSearchOptions::default(),
+      &mut every,
+    );
+
+    assert!(
+      every
+        .iter()
+        .any(|found| found.item.is_none() && found.head == Some(stored)),
+      "the via pass reports the head line's via as the obstacle"
+    );
+  }
+
+  #[test]
+  fn every_line_query_answer_is_the_same_across_two_identical_runs() {
+    /// What one run of the line queries produces.
+    #[derive(PartialEq, Eq, Debug)]
+    struct Answers {
+      /// Everything the head line collides with.
+      obstacles: Vec<Option<ItemId>>,
+      /// The first obstacle the early returning form reports.
+      first: Option<Option<ItemId>>,
+      /// The nearest obstacle, hull and all.
+      nearest: Option<NearestObstacle>,
+    }
+
+    fn run() -> Answers {
+      let mut world = World::new(World::DEFAULT_MAX_CLEARANCE);
+      let root = world.root();
+      crossing_track(&mut world, root, NEAR_X);
+      crossing_track(&mut world, root, FAR_X);
+
+      let item = pad(&mut world, Vec2::new(HEAD_END, 0), 0);
+      let centre = Vec2::new(HEAD_END, 0);
+      world.add_solid(root, item, Some(Hole::circular(centre, 500)));
+
+      let head = crossing_head();
+      let options = CollisionSearchOptions::default();
+
+      Answers {
+        obstacles: world
+          .query_colliding_line(root, &head, &rules(), &options)
+          .into_iter()
+          .map(|found| found.item)
+          .collect(),
+        first: world
+          .check_colliding_line(root, &head, &rules(), &options)
+          .map(|found| found.item),
+        nearest: world.nearest_obstacle(root, &head, &rules(), &options),
       }
     }
 
