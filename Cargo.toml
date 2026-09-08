@@ -1,0 +1,19 @@
+[package]
+name = "pnsrouter"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "GPL-3.0-or-later"
+description = "Interactive push and shove PCB router, inspired by KiCad's PNS router"
+repository = "https://github.com/Tubbles/pnsrouter"
+readme = "README.md"
+keywords = ["pcb", "eda", "routing", "router"]
+categories = ["science", "algorithms"]
+
+[features]
+# Turn compiler warnings into errors (used on CI).
+fail-on-warnings = []
+
+[dependencies]
+
+[dev-dependencies]
