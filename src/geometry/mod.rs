@@ -16,12 +16,16 @@
 //!   collinearity tolerances the router depends on.
 //! - [`box2`]: axis aligned bounding boxes, always normalised, with `i64`
 //!   coordinates so a clearance inflation cannot overflow.
+//! - [`direction45`]: the octant directions of the 45 degree routing
+//!   regime, their angle classification and the initial trace builder.
 
 pub mod box2;
+pub mod direction45;
 pub mod math;
 pub mod seg;
 pub mod vec2;
 
 pub use box2::Box2;
+pub use direction45::{AngleType, CornerMode, Direction45, Octant};
 pub use seg::{NearestPoints, Seg, SegCollision};
 pub use vec2::{Vec2, Vec2L};
