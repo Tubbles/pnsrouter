@@ -27,6 +27,7 @@ pub mod placer;
 pub mod router;
 pub mod rules;
 pub mod settings;
+pub mod shove;
 pub mod snapshot;
 pub mod topology;
 pub mod walkaround;

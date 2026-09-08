@@ -2349,6 +2349,181 @@ fn test_segment_hit(
   Seg::new(start, end).squared_distance_to_point(reference) < squared_threshold
 }
 
+// ---------------------------------------------------------------------
+// POINT_INSIDE_TRACKER
+// ---------------------------------------------------------------------
+
+/// Whether a point is inside a ring assembled from several open chains.
+///
+/// Port of `SHAPE_LINE_CHAIN::POINT_INSIDE_TRACKER`,
+/// `libs/kimath/include/geometry/shape_line_chain.h:126` and
+/// `libs/kimath/src/geometry/shape_line_chain.cpp:3131`. It answers the
+/// same question as [`LineChain::point_inside`] but for a boundary that
+/// arrives in pieces: every [`PointInsideTracker::add_polyline`] call
+/// appends one more run of vertices, and
+/// [`PointInsideTracker::is_inside`] closes the ring from the last point
+/// back to the very first one before answering.
+///
+/// That is what the shove's direction heuristic needs
+/// (`pcbnew/router/pns_shove.cpp:259`): the region it tests is bounded by
+/// the obstacle line and by the shoved line walked backwards, two open
+/// chains that only form a closed area together.
+///
+/// The rule is the odd even crossing number of a ray cast in `+x`. A
+/// degenerate case (the ray through a vertex, the point exactly on an
+/// edge) sets the parity to `-1` and abandons the rest of the polyline
+/// being added, which reads as "outside".
+///
+/// # Not ported
+///
+/// KiCad's `m_finished` is written by all three degenerate branches and
+/// **never read** (`shape_line_chain.cpp:3148`, `:3169`, `:3187`); the
+/// only thing the latch actually does is end the current `AddPolyline`
+/// early, which is what the `bool` returned by
+/// `process_vertex` does here. A later
+/// `AddPolyline` resumes as if nothing had happened, in KiCad as here.
+///
+/// # Deviation
+///
+/// KiCad computes the cross product as a `double`
+/// (`shape_line_chain.cpp:3164`) and the coordinate differences in
+/// wrapping 32 bit arithmetic. This widens both to `i64`, which is exact
+/// over the whole coordinate range (`DESIGN.md` section 2); the `double`
+/// loses the low bits of a product above 2^53 and can disagree there.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct PointInsideTracker {
+  /// The point under test. Port of `m_point`.
+  point: Vec2,
+  /// The very first vertex handed in, which the closing edge runs back
+  /// to. Port of `m_firstPoint`.
+  first_point: Vec2,
+  /// The vertex the next edge starts at. Port of `m_lastPoint`.
+  last_point: Vec2,
+  /// The crossing parity, or `-1` once a degenerate case has set it.
+  /// Port of `m_state`.
+  state: i32,
+  /// How many vertices have arrived. Port of `m_count`, which is only
+  /// read as "is this the first polyline".
+  count: usize,
+}
+
+impl PointInsideTracker {
+  /// A tracker for one point, with no boundary yet.
+  ///
+  /// Port of the constructor, `shape_line_chain.cpp:3131`.
+  pub const fn new(point: Vec2) -> Self {
+    Self {
+      point,
+      first_point: point,
+      last_point: point,
+      state: 0,
+      count: 0,
+    }
+  }
+
+  /// Append one open run of the boundary.
+  ///
+  /// Port of `AddPolyline`, `shape_line_chain.cpp:3202`. The first call
+  /// also fixes the point the closing edge returns to. Note that KiCad
+  /// starts the edge walk at index 1 of every polyline, so the join
+  /// between two consecutive polylines is an edge like any other: the
+  /// caller is responsible for handing in runs that actually meet.
+  ///
+  /// An empty chain is skipped; KiCad reads `CPoint( 0 )` unchecked and
+  /// would trip its own assertion.
+  pub fn add_polyline(&mut self, polyline: &LineChain) {
+    if polyline.is_empty() {
+      return;
+    }
+
+    if self.count == 0 {
+      self.last_point = polyline.point(0);
+      self.first_point = polyline.point(0);
+    }
+
+    self.count += polyline.point_count();
+
+    for index in 1..polyline.point_count() {
+      let point = polyline.point(index);
+
+      if !self.process_vertex(self.last_point, point) {
+        return;
+      }
+
+      self.last_point = point;
+    }
+  }
+
+  /// Close the ring and answer.
+  ///
+  /// Port of `IsInside`, `shape_line_chain.cpp:3225`, which processes the
+  /// closing edge from the last vertex back to the first and then asks
+  /// for a positive parity. It mutates the tracker, so a second call
+  /// processes the closing edge again; KiCad has the same shape and no
+  /// caller does it twice.
+  pub fn is_inside(&mut self) -> bool {
+    self.process_vertex(self.last_point, self.first_point);
+
+    self.state > 0
+  }
+
+  /// One edge of the boundary.
+  ///
+  /// Port of `processVertex`, `shape_line_chain.cpp:3140`. It answers
+  /// whether the scan should continue; `false` means a degenerate case
+  /// has latched the answer to "outside".
+  fn process_vertex(&mut self, from: Vec2, to: Vec2) -> bool {
+    let point = self.point;
+
+    // :3143. The ray runs through the edge's far vertex.
+    if to.y == point.y
+      && (to.x == point.x
+        || (from.y == point.y && ((to.x > point.x) == (from.x < point.x))))
+    {
+      self.state = -1;
+
+      return false;
+    }
+
+    // :3154. Does the edge straddle the ray at all?
+    if (from.y < point.y) == (to.y < point.y) {
+      return true;
+    }
+
+    // :3156 and :3180, which differ only in the branch that needs no
+    // cross product: an edge whose two ends are both to the right of the
+    // point always crosses the ray.
+    if from.x >= point.x && to.x > point.x {
+      self.state = 1 - self.state;
+
+      return true;
+    }
+
+    if from.x < point.x && to.x <= point.x {
+      return true;
+    }
+
+    // :3164 and :3182, the same determinant twice.
+    let cross = (i64::from(from.x) - i64::from(point.x))
+      * (i64::from(to.y) - i64::from(point.y))
+      - (i64::from(to.x) - i64::from(point.x))
+        * (i64::from(from.y) - i64::from(point.y));
+
+    // :3167. The point sits exactly on the edge's line.
+    if cross == 0 {
+      self.state = -1;
+
+      return false;
+    }
+
+    if (cross > 0) == (to.y > from.y) {
+      self.state = 1 - self.state;
+    }
+
+    true
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -4549,5 +4724,78 @@ mod tests {
         point(0, 0)
       ]
     );
+  }
+  // ---------------------------------------------------------------
+  // POINT_INSIDE_TRACKER
+  // ---------------------------------------------------------------
+
+  #[test]
+  fn a_tracker_fed_one_square_answers_like_point_inside() {
+    // Three sides plus the closing edge the tracker adds itself.
+    let ring = LineChain::from_slice(
+      &[point(0, 0), point(100, 0), point(100, 100), point(0, 100)],
+      false,
+    );
+
+    let mut inside = PointInsideTracker::new(point(50, 50));
+
+    inside.add_polyline(&ring);
+    assert!(inside.is_inside());
+
+    let mut outside = PointInsideTracker::new(point(150, 50));
+
+    outside.add_polyline(&ring);
+    assert!(!outside.is_inside());
+  }
+
+  #[test]
+  fn a_ring_assembled_from_two_open_chains_closes_on_its_own() {
+    // The shove's shape: one chain out and one chain back, meeting at
+    // both ends only through the closing edge.
+    let there = LineChain::from_slice(
+      &[point(0, 0), point(100, 0), point(100, 100)],
+      false,
+    );
+    let back = LineChain::from_slice(&[point(100, 100), point(0, 100)], false);
+
+    let mut tracker = PointInsideTracker::new(point(50, 50));
+
+    tracker.add_polyline(&there);
+    tracker.add_polyline(&back);
+
+    assert!(tracker.is_inside());
+  }
+
+  #[test]
+  fn a_point_on_the_boundary_reads_as_outside() {
+    let ring = LineChain::from_slice(
+      &[point(0, 0), point(100, 0), point(100, 100), point(0, 100)],
+      false,
+    );
+
+    // On an edge: the cross product is zero, which sets the parity to -1.
+    let mut on_edge = PointInsideTracker::new(point(50, 0));
+
+    on_edge.add_polyline(&ring);
+    assert!(!on_edge.is_inside());
+
+    // On a vertex: the ray runs through the far end of an edge.
+    let mut on_vertex = PointInsideTracker::new(point(100, 100));
+
+    on_vertex.add_polyline(&ring);
+    assert!(!on_vertex.is_inside());
+  }
+
+  #[test]
+  fn an_empty_polyline_is_skipped() {
+    let mut tracker = PointInsideTracker::new(point(50, 50));
+
+    tracker.add_polyline(&LineChain::new());
+    tracker.add_polyline(&LineChain::from_slice(
+      &[point(0, 0), point(100, 0), point(100, 100), point(0, 100)],
+      false,
+    ));
+
+    assert!(tracker.is_inside());
   }
 }

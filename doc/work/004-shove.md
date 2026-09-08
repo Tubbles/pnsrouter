@@ -1,6 +1,6 @@
 # 004 Shove
 
-Status: todo
+Status: in progress (started 2026-09-08)
 
 ## Goal
 
@@ -8,8 +8,8 @@ The shove algorithm and shove mode in the placer.
 
 ## Tasks
 
-- [ ] Phase 1: segment only shove. Hull walk, `check_shove_direction`, `shove_line_to_hull_set`, `shove_obstacle_line`, line stack, main loop with rank based anti ping pong, effects applied by the caller.
-- [ ] Phase 2: springback stack, root line index, optimizer queue as an insertion ordered map.
+- [x] Phase 1: segment only shove. Hull walk, `check_shove_direction`, `shove_line_to_hull_set`, `shove_obstacle_line`, line stack, main loop with rank based anti ping pong, effects applied by the caller.
+- [x] Phase 2: springback stack, root line index, optimizer queue as an insertion ordered map.
 - [ ] Phase 3: solids, cluster assembly, walkaround escalation (`TryWalk`).
 - [ ] Phase 4: vias, via hulls, lone via shove, via fanout drag, reverse via collision.
 - [ ] Shove mode in the placer (`rh_shove_only`) with the node handoff documented in doc/reference/kicad/03 section 9.3.

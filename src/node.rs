@@ -110,7 +110,9 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::rc::Rc;
 
 use crate::arena::{Arena, ArenaId};
-use crate::collide::{CollisionSearchOptions, Obstacle, collide_into};
+use crate::collide::{
+  CollisionSearchOptions, LineHead, Obstacle, collide_into, collide_line_items,
+};
 use crate::geometry::box2::Box2;
 use crate::geometry::collision;
 use crate::geometry::direction45::CornerMode;
@@ -1768,6 +1770,64 @@ impl World {
     items
       .iter()
       .find_map(|item| self.check_colliding(node, *item, resolver, options))
+  }
+
+  /// Whether two lines collide, neither of them stored.
+  ///
+  /// Port of the `LINE::Collide( const LINE*, const NODE*, int )` call
+  /// the shove makes at `pcbnew/router/pns_shove.cpp:481` to decide
+  /// whether a freshly walked candidate still touches the line that is
+  /// pushing it. In KiCad a `LINE` is an `ITEM`, so that is one
+  /// `collideSimple` call with a line on both sides.
+  ///
+  /// A [`Line`] is not an [`Item`] here and `src/collide.rs` only accepts
+  /// a line on the head side (note 03 section 6, and the milestone 2
+  /// entry in `doc/log/2026-09-08.md`: "the shove, optimizer and multi
+  /// dragger call sites that collide two lines will decompose one side
+  /// into segments"). This is that decomposition: `obstacle` becomes one
+  /// unstored [`Line::segment_item`] per segment, which is the same
+  /// geometry, because a chain tested with half its width folded into the
+  /// clearance and a run of segments each carrying its width in its shape
+  /// cover the same area.
+  ///
+  /// `obstacle` maps to KiCad's `this` and `head` to its `aHead`, so the
+  /// roles, and with them the head side via handling of
+  /// `pcbnew/router/pns_item.cpp:140`, are the way round the shove asks
+  /// for.
+  ///
+  /// No node is consulted: KiCad passes one only so that `collideSimple`
+  /// can reach the rule resolver, which arrives here as a parameter. The
+  /// layer is not a parameter either, for the reason `src/collide.rs`
+  /// gives: the loop runs over the candidate's relevant shape layers
+  /// rather than over the one layer KiCad's caller happens to name.
+  ///
+  /// `TODO(part 2)`: a via on the **obstacle** side
+  /// (`pcbnew/router/pns_item.cpp:132`) is not decomposed, because
+  /// `ShoveObstacleLine` strips the obstacle's via before it walks
+  /// (`pcbnew/router/pns_shove.cpp:548`) and nothing else calls this yet.
+  /// A via on the `head` side is handled, through [`Line::via_item`].
+  pub fn collide_lines(
+    &self,
+    obstacle: &Line,
+    head: &Line,
+    resolver: &dyn RuleResolver,
+    options: &CollisionSearchOptions,
+  ) -> Option<Obstacle> {
+    let probe = head.rule_item(self, PROBE_UID);
+    let line_head =
+      LineHead::new(ItemRef::unstored(&probe), head, head.via_item(self));
+
+    (0..obstacle.shape().segment_count()).find_map(|index| {
+      let segment = obstacle.segment_item(self, index, PROBE_UID);
+
+      collide_line_items(
+        &self.items,
+        ItemRef::unstored(&segment),
+        &line_head,
+        resolver,
+        options,
+      )
+    })
   }
 
   /// The query loop [`World::query_colliding_line`] and
@@ -5132,6 +5192,82 @@ mod tests {
     assert_eq!(from_line.item, from_item.item);
     assert_eq!(from_line.clearance, from_item.clearance);
     assert_eq!(from_line.detail, from_item.detail);
+  }
+
+  /// A line on [`NET`], so that it is not exempt from a head on
+  /// [`OTHER_NET`].
+  fn board_line(points: &[Vec2]) -> Line {
+    let mut line = head_line(points);
+
+    line.set_net(NET);
+    line
+  }
+
+  #[test]
+  fn collide_lines_finds_two_parallel_lines_that_are_too_close() {
+    let world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let head = crossing_head();
+    // Half a width each plus the clearance is 3000, so 2000 apart is a
+    // collision and 10000 apart is not.
+    let near = board_line(&[Vec2::new(0, 2000), Vec2::new(HEAD_END, 2000)]);
+    let far = board_line(&[Vec2::new(0, 10000), Vec2::new(HEAD_END, 10000)]);
+    let options = CollisionSearchOptions::default();
+
+    assert!(
+      world
+        .collide_lines(&near, &head, &rules(), &options)
+        .is_some()
+    );
+    assert!(
+      world
+        .collide_lines(&far, &head, &rules(), &options)
+        .is_none()
+    );
+  }
+
+  #[test]
+  fn collide_lines_answers_the_same_as_one_decomposed_segment() {
+    let world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let head = crossing_head();
+    let near = board_line(&[Vec2::new(0, 2000), Vec2::new(HEAD_END, 2000)]);
+    let options = CollisionSearchOptions::default();
+
+    let probe = head.rule_item(&world, PROBE_UID);
+    let line_head =
+      LineHead::new(ItemRef::unstored(&probe), &head, head.via_item(&world));
+    let segment = near.segment_item(&world, 0, PROBE_UID);
+
+    let from_lines = world
+      .collide_lines(&near, &head, &rules(), &options)
+      .expect("the two lines run 2000 apart");
+    let from_segment = collide_line_items(
+      &world.items,
+      ItemRef::unstored(&segment),
+      &line_head,
+      &rules(),
+      &options,
+    )
+    .expect("so does the one segment the obstacle is made of");
+
+    assert_eq!(from_lines.clearance, from_segment.clearance);
+    assert_eq!(from_lines.detail, from_segment.detail);
+  }
+
+  #[test]
+  fn collide_lines_exempts_two_lines_of_one_net() {
+    let world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let mut head = crossing_head();
+
+    head.set_net(NET);
+
+    let near = board_line(&[Vec2::new(0, 2000), Vec2::new(HEAD_END, 2000)]);
+    let options = CollisionSearchOptions::default();
+
+    assert!(
+      world
+        .collide_lines(&near, &head, &rules(), &options)
+        .is_none()
+    );
   }
 
   #[test]
