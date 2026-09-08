@@ -72,7 +72,12 @@ fn saturate_i32(value: i64) -> i32 {
 ///
 /// Port of the `int( isqrt( ... ) )` idiom at
 /// `libs/kimath/src/geometry/seg.cpp:700`, `:706` and `:611`.
-fn distance_from_squared(squared: i64) -> i32 {
+///
+/// Visible to the rest of the crate because
+/// `SHAPE_LINE_CHAIN::Collide` and `SHAPE_LINE_CHAIN::Distance` narrow the
+/// same way (`libs/kimath/src/geometry/shape_line_chain.cpp:474`, `:864`,
+/// `libs/kimath/include/geometry/shape_line_chain.h:888`).
+pub(crate) fn distance_from_squared(squared: i64) -> i32 {
   debug_assert!(squared >= 0, "a squared distance cannot be negative");
 
   saturate_i32(isqrt(squared.max(0) as u64) as i64)

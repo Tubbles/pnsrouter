@@ -3,11 +3,10 @@
 //! Polylines, the container the router lives in.
 //!
 //! [`LineChain`] is the port of KiCad's `SHAPE_LINE_CHAIN`,
-//! `libs/kimath/include/geometry/shape_line_chain.h:77`. This module is
-//! part 1 of the port: the container, its editing members and the queries
-//! that read points and segments. Intersection, collision, distance,
-//! nearest point, point containment and self intersection are part 2 and
-//! are deliberately absent.
+//! `libs/kimath/include/geometry/shape_line_chain.h:77`: the container,
+//! its editing members, the queries that read points and segments, and
+//! the intersection, collision, distance, nearest point, containment and
+//! self intersection queries the router asks of it.
 //!
 //! Three structural decisions come from `DESIGN.md` section 3 and
 //! `doc/reference/kicad/01-geometry.md` sections 6.8 and 14.3:
@@ -44,11 +43,37 @@
 //!
 //! `m_accuracy` (`slc.h:994`) is not ported: every constructor sets it to
 //! zero and nothing ever reads it.
+//!
+//! Members of `SHAPE_LINE_CHAIN` that are not here, and why.
+//!
+//! - No caller anywhere in the router core: `Intersects( const SEG& )`
+//!   (`slc.cpp:1773`), `ClosestPoints` (`slc.cpp:751`), `ClosestSegments`
+//!   (`slc.cpp:666`), `ClosestSegmentsFast` (`slc.cpp:505`, which note 01
+//!   section 6.8 item 19 shows assumes a closed chain), `FindSegment`
+//!   (`slc.cpp:1257`), `OffsetLine` (`slc.cpp:3007`), `Rotate`
+//!   (`slc.cpp:495`), `TransformToPolygon` (`slc.cpp:3124`) and the
+//!   `POINT_INSIDE_TRACKER` (`slc.cpp:3140`).
+//! - Called, but from a part of the router this milestone has not
+//!   reached: `PointAlong` (`slc.cpp:2671`), which only the multi item
+//!   dragger uses (`pcbnew/router/pns_multi_dragger.cpp:313`).
+//! - An editing member, so it belongs with part 1's mutators rather than
+//!   with these queries: `RemoveDuplicatePoints` (`slc.cpp:2720`, called
+//!   from `pcbnew/router/pns_node.cpp:1204`).
+//! - Waiting for the arc vectors: `SelfIntersectingWithArcs`
+//!   (`slc.cpp:2234`) and every member that reads `m_arcs`.
+//! - Dead or deliberately dropped: `m_accuracy` (`slc.h:994`), which
+//!   every constructor sets to zero and nothing reads, and the bounding
+//!   box cache with `GenerateBBoxCache` (`slc.h:468`), for the reason
+//!   given above.
+//! - Debug serialisation, which the crate will grow its own form of:
+//!   `Format` and `Parse` (`slc.cpp:2506`, `:2623`), which note 01
+//!   section 6.8 item 16 shows are not round trip compatible anyway.
 
 use std::fmt;
 
 use crate::geometry::box2::Box2;
-use crate::geometry::seg::Seg;
+use crate::geometry::math::rescale;
+use crate::geometry::seg::{Seg, distance_from_squared};
 use crate::geometry::vec2::{Vec2, Vec2L};
 
 /// Why [`LineChain::slice`] could not produce a subchain.
@@ -94,6 +119,131 @@ impl fmt::Display for SliceError {
 }
 
 impl std::error::Error for SliceError {}
+
+/// Where an intersection landed on one of the two chains.
+///
+/// Replaces the `index_our` plus `is_corner_our` (and `index_their` plus
+/// `is_corner_their`) pairs of `SHAPE_LINE_CHAIN::INTERSECTION`,
+/// `libs/kimath/include/geometry/shape_line_chain.h:86`, as
+/// `DESIGN.md` section 3 asks for.
+///
+/// KiCad stores one `int` per chain and a flag beside it. When the hit
+/// lands exactly on a segment's `A` endpoint the flag is raised and the
+/// index is left alone, so it names the corner already; when it lands on
+/// the `B` endpoint the flag is raised **and the index is incremented**
+/// (`libs/kimath/src/geometry/shape_line_chain.cpp:1895`, `:1910`,
+/// `:1929`, `:1940`), so the index again names the corner. That is the
+/// aliasing note 01 section 6.6 warns about: a raw `index_our` can come
+/// out equal to `SegmentCount()`, which is out of range as a segment
+/// index.
+///
+/// This type carries the distinction in the tag instead, and
+/// [`Hit::Corner`] always holds a **point** index that is in range for
+/// its chain. For an open chain the raw KiCad value already is, since
+/// `SegmentCount() == PointCount() - 1`. For a closed chain the value
+/// `SegmentCount() == PointCount()` means the vertex at index 0, and this
+/// type stores the 0. That is why
+/// `PNS::HullIntersection`'s compensation, `if( p.index_our >=
+/// hull.SegmentCount() ) p.index_our -= hull.SegmentCount();`
+/// (`pcbnew/router/pns_utils.cpp:423`), has no counterpart here: a
+/// transcription of that routine indexes [`Hit::Corner`] straight into
+/// the hull's points and only has to wrap the *predecessor* segment index
+/// itself.
+///
+/// [`Hit::Segment`] holds a segment index, always in range.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum Hit {
+  /// The intersection lies on the segment at this index and is not one of
+  /// its endpoints.
+  Segment(usize),
+  /// The intersection is exactly the vertex at this point index.
+  Corner(usize),
+}
+
+impl Hit {
+  /// The index this hit carries, whichever kind it is.
+  ///
+  /// Two router call sites want the bare number that KiCad's `index_our`
+  /// and `index_their` hold: `pcbnew/router/pns_line_placer.cpp:128`
+  /// picks the intersection with the smallest `index_our`, and
+  /// `pcbnew/router/pns_node.cpp:400` feeds `index_their` to
+  /// [`LineChain::path_length`] as its segment hint.
+  pub fn index(self) -> usize {
+    match self {
+      Hit::Segment(index) => index,
+      Hit::Corner(index) => index,
+    }
+  }
+
+  /// Whether the intersection landed exactly on a vertex.
+  ///
+  /// The `is_corner_our` / `is_corner_their` flags,
+  /// `libs/kimath/include/geometry/shape_line_chain.h:99` and `:104`.
+  pub fn is_corner(self) -> bool {
+    matches!(self, Hit::Corner(_))
+  }
+}
+
+/// One point where a chain meets a segment or another chain.
+///
+/// Port of `SHAPE_LINE_CHAIN::INTERSECTION`,
+/// `libs/kimath/include/geometry/shape_line_chain.h:86`. Two fields of
+/// KiCad's record are gone. The index and corner flag of each side are
+/// folded into a [`Hit`], and `valid` (`slc.h:109`) is dropped: nothing
+/// outside `PNS::HullIntersection` reads it, and that routine writes it
+/// itself before deciding whether to keep a record
+/// (`pcbnew/router/pns_utils.cpp:414`), so note 01 section 14.3 puts it
+/// there rather than here.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct Intersection {
+  /// The intersection point.
+  ///
+  /// Port of `INTERSECTION::p`,
+  /// `libs/kimath/include/geometry/shape_line_chain.h:89`.
+  pub point: Vec2,
+  /// Where the point sits on the chain the query was made on.
+  ///
+  /// Port of `index_our` and `is_corner_our`,
+  /// `libs/kimath/include/geometry/shape_line_chain.h:92` and `:99`.
+  pub ours: Hit,
+  /// Where the point sits on the other chain, or `None` when the query
+  /// was made against a bare [`Seg`].
+  ///
+  /// Port of `index_their` and `is_corner_their`,
+  /// `libs/kimath/include/geometry/shape_line_chain.h:96` and `:104`.
+  /// `None` reproduces the `index_their = -1` that
+  /// [`LineChain::intersect_seg`] writes
+  /// (`libs/kimath/src/geometry/shape_line_chain.cpp:1758`), where there
+  /// is no second chain to index into.
+  pub theirs: Option<Hit>,
+}
+
+/// A chain came closer to something than the clearance allowed.
+///
+/// Replaces the `bool` return plus the `int* aActual` and
+/// `VECTOR2I* aLocation` out parameters of the two `SHAPE_LINE_CHAIN`
+/// collision members, `libs/kimath/include/geometry/shape_line_chain.h:195`
+/// and `:210`. KiCad writes both out parameters only when it returns
+/// `true`, which is exactly what an `Option` says.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct Collision {
+  /// The distance between the two shapes in nanometres, zero when they
+  /// touch or overlap.
+  ///
+  /// Port of `*aActual`. KiCad computes it as `sqrt` of the squared
+  /// distance in `f64` and truncates
+  /// (`libs/kimath/src/geometry/shape_line_chain.cpp:474`, `:864`); this
+  /// takes the exact integer square root, the choice note 01 section 14.1
+  /// records for the whole port.
+  pub actual: i32,
+  /// A point near the collision.
+  ///
+  /// Port of `*aLocation`. For a point that is inside a closed chain it
+  /// is the query point itself; otherwise it is the point **on the
+  /// chain** that is nearest to the other shape
+  /// (`libs/kimath/src/geometry/shape_line_chain.cpp:471`, `:861`).
+  pub location: Vec2,
+}
 
 /// A polyline with an explicit closed flag and a nominal width.
 ///
@@ -1114,6 +1264,941 @@ impl LineChain {
   }
 
   // ---------------------------------------------------------------
+  // Intersections
+  // ---------------------------------------------------------------
+
+  /// Every point where a segment crosses this chain, nearest end first.
+  ///
+  /// Port of `Intersect( const SEG&, INTERSECTIONS& )`,
+  /// `libs/kimath/src/geometry/shape_line_chain.cpp:1731`. The results
+  /// are ordered by squared distance from `seg.a`
+  /// (`shape_line_chain.cpp:1767`), which is what makes the optimizer's
+  /// breakout builder able to take entry zero as the nearest hit
+  /// (`pcbnew/router/pns_optimizer.cpp:961`).
+  ///
+  /// Every record comes back as [`Hit::Segment`] with
+  /// [`Intersection::theirs`] unset, even when the point is exactly a
+  /// vertex: KiCad's `SEG` overload never raises the corner flags
+  /// (`shape_line_chain.cpp:1760`), unlike
+  /// [`LineChain::intersect_chain`]. A caller that needs to know whether
+  /// the hit was a vertex has to ask [`LineChain::find`].
+  ///
+  /// Two deviations from KiCad, both from note 01 section 6.8 item 10.
+  /// KiCad appends to a caller supplied vector and returns its **total**
+  /// size, then sorts that whole vector, so entries a caller had already
+  /// put there are reordered; this returns a fresh `Vec`. And KiCad sorts
+  /// with `std::sort`, which is not stable, so hits at equal distance come
+  /// out in an unspecified order; this sorts stably, so equal distances
+  /// keep chain order, which `DESIGN.md` section 8 requires.
+  pub fn intersect_seg(&self, seg: &Seg) -> Vec<Intersection> {
+    let segment_min_x = seg.a.x.min(seg.b.x);
+    let segment_max_x = seg.a.x.max(seg.b.x);
+    let segment_min_y = seg.a.y.min(seg.b.y);
+    let segment_max_y = seg.a.y.max(seg.b.y);
+
+    let mut found: Vec<Intersection> = Vec::new();
+
+    for index in 0..self.segment_count() {
+      let candidate = self.segment(index);
+
+      if candidate.a.x.max(candidate.b.x) < segment_min_x
+        || candidate.a.x.min(candidate.b.x) > segment_max_x
+        || candidate.a.y.max(candidate.b.y) < segment_min_y
+        || candidate.a.y.min(candidate.b.y) > segment_max_y
+      {
+        continue;
+      }
+
+      if let Some(point) = candidate.intersect(seg, false, false) {
+        found.push(Intersection {
+          point,
+          ours: Hit::Segment(index),
+          theirs: None,
+        });
+      }
+    }
+
+    found.sort_by_key(|intersection| {
+      intersection
+        .point
+        .widening_sub(seg.a)
+        .squared_euclidean_norm()
+    });
+
+    found
+  }
+
+  /// Every point where another chain crosses this one.
+  ///
+  /// Port of `Intersect( const SHAPE_LINE_CHAIN&, INTERSECTIONS&, bool
+  /// aExcludeColinearAndTouching, BOX2I* aChainBBox )`,
+  /// `libs/kimath/src/geometry/shape_line_chain.cpp:1802`.
+  ///
+  /// `include_colinear_and_touching` is KiCad's
+  /// `aExcludeColinearAndTouching` turned the right way round, which note
+  /// 01 section 6.8 item 11 asks for: the branch it guards is written
+  /// `if( !aExcludeColinearAndTouching && a.Collinear( b ) )`
+  /// (`shape_line_chain.cpp:1882`), so KiCad's default of `false` means
+  /// **include**. Pass `true` to transcribe a KiCad call site that uses
+  /// the default, which both router call sites do
+  /// (`pcbnew/router/pns_line_placer.cpp:125`,
+  /// `pcbnew/router/pns_utils.cpp:403`). With it set, a pair of collinear
+  /// segments contributes one record per endpoint of either segment that
+  /// the other contains, up to four; without it, the pair falls through
+  /// to [`Seg::intersect`], which answers collinear overlap with the
+  /// single midpoint of the overlap interval.
+  ///
+  /// The corner rule that [`Hit`] documents applies to both sides. Note
+  /// that KiCad reuses one `INTERSECTION` local across the up to four
+  /// pushes of the collinear branch without resetting it
+  /// (`shape_line_chain.cpp:1884` to `:1945`), so a record pushed later
+  /// inherits the corner flag, and the incremented index, of an earlier
+  /// one. That is reproduced: the state carries here in the same way.
+  ///
+  /// Two deviations. KiCad appends to a caller supplied vector and
+  /// returns the total size (note 01 section 6.8 item 10); this returns a
+  /// fresh `Vec`. And KiCad walks the other chain's segments in an order
+  /// sorted by their minimum x, an indexing trick for the `upper_bound`
+  /// pruning at `shape_line_chain.cpp:1861`; this walks them in chain
+  /// order with the same axis aligned rejection, which yields the same
+  /// **set** of records in a deterministic order. No consumer depends on
+  /// the order: the placer takes the record with the smallest `index_our`
+  /// (`pns_line_placer.cpp:128`), the walkaround splits at every point
+  /// (`pcbnew/router/pns_line.cpp:369`) and the node takes the shortest
+  /// path length (`pcbnew/router/pns_node.cpp:403`).
+  ///
+  /// KiCad's `aChainBBox` parameter, a precomputed bounding box for the
+  /// other chain, is not ported: no router call site passes it.
+  pub fn intersect_chain(
+    &self,
+    other: &LineChain,
+    include_colinear_and_touching: bool,
+  ) -> Vec<Intersection> {
+    let our_segment_count = self.segment_count();
+    let their_segment_count = other.segment_count();
+
+    if our_segment_count == 0 || their_segment_count == 0 {
+      return Vec::new();
+    }
+
+    // `aChain.BBox()` with its default clearance of zero, which still
+    // grows the box by the other chain's width (`slc.h:457`).
+    let Some(their_box) = other.bbox(0) else {
+      return Vec::new();
+    };
+
+    let our_point_count = self.points.len();
+    let their_point_count = other.points.len();
+    let mut found: Vec<Intersection> = Vec::new();
+
+    for our_index in 0..our_segment_count {
+      let ours = self.segment(our_index);
+
+      let our_min_x = i64::from(ours.a.x.min(ours.b.x));
+      let our_max_x = i64::from(ours.a.x.max(ours.b.x));
+      let our_min_y = i64::from(ours.a.y.min(ours.b.y));
+      let our_max_y = i64::from(ours.a.y.max(ours.b.y));
+
+      if our_max_x < their_box.left()
+        || our_min_x > their_box.right()
+        || our_max_y < their_box.top()
+        || our_min_y > their_box.bottom()
+      {
+        continue;
+      }
+
+      for their_index in 0..their_segment_count {
+        let theirs = other.segment(their_index);
+
+        // The combined effect of the `upper_bound` cutoff at
+        // `shape_line_chain.cpp:1861` and the per entry rejection at
+        // `:1873`, which together are a plain box overlap test.
+        if i64::from(theirs.a.x.max(theirs.b.x)) < our_min_x
+          || i64::from(theirs.a.x.min(theirs.b.x)) > our_max_x
+          || i64::from(theirs.a.y.max(theirs.b.y)) < our_min_y
+          || i64::from(theirs.a.y.min(theirs.b.y)) > our_max_y
+        {
+          continue;
+        }
+
+        // KiCad's single `INTERSECTION is`, mutated in place across the
+        // pushes below (`shape_line_chain.cpp:1877`).
+        let mut index_our = our_index;
+        let mut index_their = their_index;
+        let mut corner_our = false;
+        let mut corner_their = false;
+
+        let crossing = ours.intersect(&theirs, false, false);
+
+        if include_colinear_and_touching && ours.collinear(&theirs) {
+          if ours.contains_point(theirs.a) {
+            corner_their = true;
+            found.push(Intersection {
+              point: theirs.a,
+              ours: hit_at(index_our, corner_our, our_point_count),
+              theirs: Some(hit_at(
+                index_their,
+                corner_their,
+                their_point_count,
+              )),
+            });
+          }
+
+          if ours.contains_point(theirs.b) {
+            index_their += 1;
+            corner_their = true;
+            found.push(Intersection {
+              point: theirs.b,
+              ours: hit_at(index_our, corner_our, our_point_count),
+              theirs: Some(hit_at(
+                index_their,
+                corner_their,
+                their_point_count,
+              )),
+            });
+          }
+
+          if theirs.contains_point(ours.a) {
+            corner_our = true;
+            found.push(Intersection {
+              point: ours.a,
+              ours: hit_at(index_our, corner_our, our_point_count),
+              theirs: Some(hit_at(
+                index_their,
+                corner_their,
+                their_point_count,
+              )),
+            });
+          }
+
+          if theirs.contains_point(ours.b) {
+            index_our += 1;
+            corner_our = true;
+            found.push(Intersection {
+              point: ours.b,
+              ours: hit_at(index_our, corner_our, our_point_count),
+              theirs: Some(hit_at(
+                index_their,
+                corner_their,
+                their_point_count,
+              )),
+            });
+          }
+        } else if let Some(point) = crossing {
+          if point == ours.a {
+            corner_our = true;
+          }
+
+          if point == ours.b {
+            corner_our = true;
+            index_our += 1;
+          }
+
+          if point == theirs.a {
+            corner_their = true;
+          }
+
+          if point == theirs.b {
+            corner_their = true;
+            index_their += 1;
+          }
+
+          found.push(Intersection {
+            point,
+            ours: hit_at(index_our, corner_our, our_point_count),
+            theirs: Some(hit_at(index_their, corner_their, their_point_count)),
+          });
+        }
+      }
+    }
+
+    found
+  }
+
+  /// Whether another chain touches or crosses this one.
+  ///
+  /// Port of `Intersects( const SHAPE_LINE_CHAIN& )`,
+  /// `libs/kimath/src/geometry/shape_line_chain.cpp:2610`, which runs the
+  /// full [`LineChain::intersect_chain`] with the colinear and touching
+  /// records included and asks whether anything came back. The diff pair
+  /// placer uses it to reject a candidate pair whose two lines meet
+  /// (`pcbnew/router/pns_diff_pair.cpp:257`).
+  pub fn intersects_chain(&self, other: &LineChain) -> bool {
+    !self.intersect_chain(other, true).is_empty()
+  }
+
+  /// The first place where the chain crosses or touches itself.
+  ///
+  /// Port of `SelfIntersecting`,
+  /// `libs/kimath/src/geometry/shape_line_chain.cpp:2135`. Segment pairs
+  /// are tried in the order `s1 < s2` and the first hit wins, so the
+  /// answer is the earliest crossing along the chain and not the only
+  /// one. Both indices come back as [`Hit::Segment`]: KiCad leaves the
+  /// corner flags, and `valid`, false on this record (note 01 section 6.8
+  /// item 12).
+  ///
+  /// Three rules decide what counts. A vertex of the later segment that
+  /// merely **lies on** the earlier one is a hit, through
+  /// [`Seg::contains_point`] with its squared tolerance of 3, which is
+  /// why the axis aligned rejection pads by 2 nm
+  /// (`shape_line_chain.cpp:2157`). Adjacent segments are exempt from the
+  /// `a2` test only, `s1 + 1 != s2` at `:2181`, because they legitimately
+  /// share that vertex. And the closing joint of a closed chain is exempt
+  /// from the `b2` test by index, `!( closed && s1 == 0 && s2 ==
+  /// segCount - 1 )` at `:2189`, because the last segment ending on the
+  /// first segment's start is what closing means. Note that the exemption
+  /// is spelled with the *segment* indices, not with a geometric test, so
+  /// a chain that returns to its start in the middle is still reported.
+  ///
+  /// KiCad computes the padded rejection box in wrapping 32 bit
+  /// arithmetic; this widens to `i64` first, so a chain that reaches the
+  /// coordinate limit cannot fold a rejection into an acceptance.
+  ///
+  /// The arc exact `SelfIntersectingWithArcs` (`:2234`) is not ported:
+  /// there are no arcs yet and the router never calls it.
+  pub fn self_intersecting(&self) -> Option<Intersection> {
+    let segment_count = self.segment_count();
+
+    if segment_count < 2 {
+      return None;
+    }
+
+    for first_index in 0..segment_count {
+      let first = self.segment(first_index);
+
+      // Expanded by 2 to cover `SEG::Contains`'s squared tolerance of 3.
+      let first_min_x = i64::from(first.a.x.min(first.b.x)) - 2;
+      let first_max_x = i64::from(first.a.x.max(first.b.x)) + 2;
+      let first_min_y = i64::from(first.a.y.min(first.b.y)) - 2;
+      let first_max_y = i64::from(first.a.y.max(first.b.y)) + 2;
+
+      for second_index in (first_index + 1)..segment_count {
+        let second = self.segment(second_index);
+
+        if first_max_x < i64::from(second.a.x.min(second.b.x))
+          || i64::from(second.a.x.max(second.b.x)) < first_min_x
+        {
+          continue;
+        }
+
+        if first_max_y < i64::from(second.a.y.min(second.b.y))
+          || i64::from(second.a.y.max(second.b.y)) < first_min_y
+        {
+          continue;
+        }
+
+        let record = |point: Vec2| Intersection {
+          point,
+          ours: Hit::Segment(first_index),
+          theirs: Some(Hit::Segment(second_index)),
+        };
+
+        if first_index + 1 != second_index && first.contains_point(second.a) {
+          return Some(record(second.a));
+        } else if first.contains_point(second.b)
+          && !(self.closed
+            && first_index == 0
+            && second_index == segment_count - 1)
+        {
+          return Some(record(second.b));
+        } else if let Some(point) = first.intersect(&second, true, false) {
+          return Some(record(point));
+        }
+      }
+    }
+
+    None
+  }
+
+  // ---------------------------------------------------------------
+  // Collision
+  // ---------------------------------------------------------------
+
+  /// Whether a point comes closer to the chain than a clearance.
+  ///
+  /// Port of `Collide( const VECTOR2I&, int, int*, VECTOR2I* )`,
+  /// `libs/kimath/src/geometry/shape_line_chain.cpp:426`. A point inside
+  /// a closed chain collides at distance zero and reports itself as the
+  /// location (`:429`); note that the containment test is run with the
+  /// **clearance as the accuracy**, so a clearance above 1 also catches a
+  /// point sitting on the outline through
+  /// [`LineChain::point_on_edge`].
+  ///
+  /// The comparison is `closest == 0 || closest < clearance` on the
+  /// squared values (`:468`), so a point exactly `clearance` away does
+  /// **not** collide while a point exactly on the chain always does, at
+  /// any clearance including zero. That strictness is what the `- 1` in
+  /// `pcbnew/router/pns_item.cpp:249` is written against, and note 01
+  /// section 14.6 warns that the walkaround can fail to terminate if the
+  /// two disagree.
+  ///
+  /// Deviation: KiCad breaks out of the scan early when it has a
+  /// collision and the caller asked for no actual distance
+  /// (`:461`), which leaves `*aLocation` at a segment that is not
+  /// necessarily the nearest. This always takes the `aActual != nullptr`
+  /// path, so `actual` and `location` always describe the nearest
+  /// segment. The boolean outcome is the same either way, because a later
+  /// segment can only shrink an already colliding distance.
+  pub fn collide_point(
+    &self,
+    point: Vec2,
+    clearance: i32,
+  ) -> Option<Collision> {
+    if self.closed && self.point_inside(point, clearance) {
+      return Some(Collision {
+        actual: 0,
+        location: point,
+      });
+    }
+
+    let mut closest_squared = i64::MAX;
+    let mut nearest = Vec2::new(0, 0);
+
+    for index in 0..self.segment_count() {
+      let segment = self.segment(index);
+      let projected = segment.nearest_point_to_point(point);
+      let squared = projected.widening_sub(point).squared_euclidean_norm();
+
+      if squared < closest_squared {
+        nearest = projected;
+        closest_squared = squared;
+
+        if closest_squared == 0 {
+          break;
+        }
+      }
+    }
+
+    let clearance_squared = i64::from(clearance) * i64::from(clearance);
+
+    if closest_squared == 0 || closest_squared < clearance_squared {
+      return Some(Collision {
+        actual: distance_from_squared(closest_squared),
+        location: nearest,
+      });
+    }
+
+    None
+  }
+
+  /// Whether a segment comes closer to the chain than a clearance.
+  ///
+  /// Port of `Collide( const SEG&, int, int*, VECTOR2I* )`,
+  /// `libs/kimath/src/geometry/shape_line_chain.cpp:815`. The comparison
+  /// and the early exit are the same as in
+  /// [`LineChain::collide_point`], and so is the deviation: this always
+  /// takes KiCad's `aActual != nullptr` path.
+  ///
+  /// The closed chain shortcut differs from the point one in a detail
+  /// worth keeping. It tests only `seg.a`, not the whole segment, and it
+  /// tests it with the **default accuracy of zero** rather than with the
+  /// clearance (`:818`), so a segment whose start sits exactly on the
+  /// outline of a closed chain does not take the shortcut and is measured
+  /// against the segments instead. A segment that passes through a closed
+  /// chain without either endpoint inside is likewise not caught by the
+  /// shortcut; it is caught by the ordinary scan, since it must cross an
+  /// edge.
+  ///
+  /// The location is `SEG::NearestPoint( const SEG& )` on the winning
+  /// chain segment (`:845`), so it lies on the **chain**, not on the
+  /// argument.
+  pub fn collide_seg(&self, seg: &Seg, clearance: i32) -> Option<Collision> {
+    if self.closed && self.point_inside(seg.a, 0) {
+      return Some(Collision {
+        actual: 0,
+        location: seg.a,
+      });
+    }
+
+    let mut closest_squared = i64::MAX;
+    let mut nearest = Vec2::new(0, 0);
+
+    for index in 0..self.segment_count() {
+      let segment = self.segment(index);
+      let squared = segment.squared_distance_to_segment(seg);
+
+      if squared < closest_squared {
+        nearest = segment.nearest_point_to_segment(seg);
+        closest_squared = squared;
+
+        if closest_squared == 0 {
+          break;
+        }
+      }
+    }
+
+    let clearance_squared = i64::from(clearance) * i64::from(clearance);
+
+    if closest_squared == 0 || closest_squared < clearance_squared {
+      return Some(Collision {
+        actual: distance_from_squared(closest_squared),
+        location: nearest,
+      });
+    }
+
+    None
+  }
+
+  // ---------------------------------------------------------------
+  // Distances and nearest points
+  // ---------------------------------------------------------------
+
+  /// The squared distance from a point to the chain.
+  ///
+  /// Port of `SquaredDistance( const VECTOR2I&, bool aOutlineOnly )`,
+  /// `libs/kimath/src/geometry/shape_line_chain.cpp:1167`. A point inside
+  /// a closed chain is at distance zero unless `outline_only` is set,
+  /// which is the flag's only effect (`:1171`).
+  ///
+  /// An empty chain answers `i64::MAX`, which is KiCad's
+  /// `VECTOR2I::ECOORD_MAX` sentinel (`math/vector2d.h:72`) reached by a
+  /// loop that never runs.
+  pub fn squared_distance(&self, point: Vec2, outline_only: bool) -> i64 {
+    if self.closed && self.point_inside(point, 0) && !outline_only {
+      return 0;
+    }
+
+    let mut squared = i64::MAX;
+
+    for index in 0..self.segment_count() {
+      squared =
+        squared.min(self.segment(index).squared_distance_to_point(point));
+    }
+
+    squared
+  }
+
+  /// The distance from a point to the chain in nanometres.
+  ///
+  /// Port of `Distance( const VECTOR2I&, bool aOutlineOnly )`,
+  /// `libs/kimath/include/geometry/shape_line_chain.h:886`, the square
+  /// root of [`LineChain::squared_distance`]. KiCad takes an `f64` square
+  /// root and narrows the result to `int`, which is undefined for the
+  /// `ECOORD_MAX` an empty chain produces; this takes the exact integer
+  /// square root and saturates, so an empty chain answers `i32::MAX`.
+  pub fn distance(&self, point: Vec2, outline_only: bool) -> i32 {
+    distance_from_squared(self.squared_distance(point, outline_only))
+  }
+
+  /// The point of the chain that is nearest to a point.
+  ///
+  /// Port of `NearestPoint( const VECTOR2I&, bool
+  /// aAllowInternalShapePoints )`,
+  /// `libs/kimath/src/geometry/shape_line_chain.cpp:2401`. The nearest
+  /// **segment** is found first, by [`Seg::distance_to_point`] with ties
+  /// going to the earlier segment, and the answer is that segment's
+  /// nearest point.
+  ///
+  /// KiCad's `aAllowInternalShapePoints` is not ported. Its whole body is
+  /// inside `if( !aAllowInternalShapePoints )` and every branch of it is
+  /// guarded by `IsArcSegment( nearest )` (`:2425` to `:2452`), so it
+  /// snaps to arc endpoints and does nothing at all on an arc free chain.
+  /// It has to come back with the arc vectors; the router passes both
+  /// values (`pcbnew/router/pns_shove.cpp:359` passes `true`,
+  /// `pcbnew/router/pns_helpers.cpp:98` passes `false`).
+  ///
+  /// Returns `None` for an empty chain, where KiCad returns `(0, 0)` with
+  /// the comment that the only right answer is not to crash (`:2406`). A
+  /// chain of one point answers with that point, which is what KiCad's
+  /// failed `wxCHECK` in `Segment` degrades to (`:1293`).
+  pub fn nearest_point(&self, point: Vec2) -> Option<Vec2> {
+    let first_point = *self.points.first()?;
+    let segment_count = self.segment_count();
+
+    if segment_count == 0 {
+      return Some(first_point);
+    }
+
+    let mut min_distance = i32::MAX;
+    let mut nearest = 0usize;
+
+    for index in 0..segment_count {
+      let distance = self.segment(index).distance_to_point(point);
+
+      if distance < min_distance {
+        min_distance = distance;
+        nearest = index;
+      }
+    }
+
+    Some(self.segment(nearest).nearest_point_to_point(point))
+  }
+
+  /// The vertex of the chain that is nearest to the infinite line through
+  /// a segment, and its distance to that line.
+  ///
+  /// Port of `NearestPoint( const SEG&, int& dist )`,
+  /// `libs/kimath/src/geometry/shape_line_chain.cpp:2459`. Note 01
+  /// section 6.8 item 13 flags what this is not: it walks **vertices**,
+  /// not segments, and it measures with [`Seg::line_distance`], so it
+  /// answers neither the nearest point of the chain to the segment nor
+  /// the nearest point to the infinite line. `PNS::MoveDiagonal`
+  /// (`pcbnew/router/pns_utils.cpp:293`) is the only caller and depends
+  /// on exactly this behaviour, so it is reproduced rather than fixed.
+  ///
+  /// Ties go to the earlier vertex. Returns `None` for an empty chain,
+  /// where KiCad returns `(0, 0)` and leaves `dist` at `INT_MAX`
+  /// (`:2464`).
+  pub fn nearest_point_to_seg(&self, seg: &Seg) -> Option<(Vec2, i32)> {
+    if self.points.is_empty() {
+      return None;
+    }
+
+    let mut min_distance = i32::MAX;
+    let mut nearest = 0usize;
+
+    for (index, point) in self.points.iter().enumerate() {
+      let distance = seg.line_distance(*point);
+
+      if distance < min_distance {
+        min_distance = distance;
+        nearest = index;
+      }
+    }
+
+    Some((self.points[nearest], min_distance))
+  }
+
+  /// The index of the segment nearest to a point.
+  ///
+  /// Port of `NearestSegment`,
+  /// `libs/kimath/src/geometry/shape_line_chain.cpp:2486`, with ties
+  /// going to the earlier segment. The walkaround uses it to find where a
+  /// collision point sits on a line (`pcbnew/router/pns_line.cpp:693`).
+  ///
+  /// Returns `None` when the chain has no segments, where KiCad returns
+  /// the index 0 it started the scan with.
+  pub fn nearest_segment(&self, point: Vec2) -> Option<usize> {
+    let segment_count = self.segment_count();
+
+    if segment_count == 0 {
+      return None;
+    }
+
+    let mut min_distance = i32::MAX;
+    let mut nearest = 0usize;
+
+    for index in 0..segment_count {
+      let distance = self.segment(index).distance_to_point(point);
+
+      if distance < min_distance {
+        min_distance = distance;
+        nearest = index;
+      }
+    }
+
+    Some(nearest)
+  }
+
+  // ---------------------------------------------------------------
+  // Containment
+  // ---------------------------------------------------------------
+
+  /// Whether a point lies inside the closed chain.
+  ///
+  /// Port of `PointInside( const VECTOR2I&, int aAccuracy, bool
+  /// aUseBBoxCache )`,
+  /// `libs/kimath/src/geometry/shape_line_chain.cpp:1986`, with the cache
+  /// flag left off. That is not a simplification: KiCad's bounding box
+  /// test is written `if( aUseBBoxCache && GetCachedBBox() && ... )`
+  /// (`:1989`), so with the flag false, which is the default and the only
+  /// value the router passes, no box test runs at all. There is nothing
+  /// to recompute.
+  ///
+  /// An **open** chain, or one of fewer than three points, is always
+  /// outside (`:1994`).
+  ///
+  /// The rule is a crossing number, not a winding number: a ray is cast
+  /// in `+x` and every edge, the closing one included, flips the answer
+  /// when it straddles the ray. Two details decide the boundary cases.
+  /// The straddle test is the half open `( p1.y >= aPt.y ) != ( p2.y >=
+  /// aPt.y )`, so a vertex exactly on the ray belongs to the edge below
+  /// it and is counted once, not twice. And the side test is the strict
+  /// `aPt.x - p1.x < d` with `d` rounded to nearest by `rescale`
+  /// (`src/math/util.cpp:62`), so a point exactly on a non horizontal
+  /// edge is **outside** by this rule alone. Horizontal edges are skipped
+  /// entirely.
+  ///
+  /// `accuracy` therefore does not widen the polygon. Up to and including
+  /// 1 it is ignored outright (`:2016`); above that the answer is the
+  /// crossing number **or** [`LineChain::point_on_edge`] at that
+  /// accuracy, which the base class copy of the routine explains as using
+  /// "on the edge" as a proxy for "inside" (`:2065`). So a point on the
+  /// outline reads as inside only from an accuracy of 2 upwards.
+  ///
+  /// Deviation: KiCad computes the edge vector and the ray offset in
+  /// wrapping 32 bit arithmetic and narrows `d` back to `int`; this
+  /// widens to `i64` throughout. The straddle test bounds the numerator
+  /// by the denominator, so `d` fits in an `i32` whenever it is used, and
+  /// no in range chain can see a difference.
+  pub fn point_inside(&self, point: Vec2, accuracy: i32) -> bool {
+    let point_count = self.points.len();
+
+    if !self.closed || point_count < 3 {
+      return false;
+    }
+
+    let mut inside = false;
+
+    for index in 0..point_count {
+      let first = self.points[index];
+      let second = self.points[if index + 1 == point_count {
+        0
+      } else {
+        index + 1
+      }];
+      let difference = second.widening_sub(first);
+
+      if difference.y == 0 {
+        continue;
+      }
+
+      let projected = rescale(
+        difference.x,
+        i64::from(point.y) - i64::from(first.y),
+        difference.y,
+      );
+
+      if ((first.y >= point.y) != (second.y >= point.y))
+        && (i64::from(point.x) - i64::from(first.x) < projected)
+      {
+        inside = !inside;
+      }
+    }
+
+    if accuracy <= 1 {
+      inside
+    } else {
+      inside || self.point_on_edge(point, accuracy)
+    }
+  }
+
+  /// Whether a point lies on one of the chain's edges.
+  ///
+  /// Port of `PointOnEdge`,
+  /// `libs/kimath/src/geometry/shape_line_chain.cpp:2074`, which is
+  /// [`LineChain::edge_containing_point`] answering with an edge. Unlike
+  /// [`LineChain::point_inside`] it works on an open chain.
+  pub fn point_on_edge(&self, point: Vec2, accuracy: i32) -> bool {
+    self.edge_containing_point(point, accuracy).is_some()
+  }
+
+  /// The index of the first edge that contains a point.
+  ///
+  /// Port of `EdgeContainingPoint`,
+  /// `libs/kimath/src/geometry/shape_line_chain.cpp:2080`. The tolerance
+  /// is `accuracy + 1` compared as a square and inclusively (`:2081`),
+  /// one of the constants note 01 section 13 lists, so an accuracy of
+  /// zero still accepts a point up to a nanometre off the edge. An exact
+  /// match with either endpoint of a segment short circuits ahead of the
+  /// distance test (`:2101`), which matters for a chain whose vertex is
+  /// further from the segment interior than the tolerance would allow.
+  ///
+  /// A chain of a single point is a special case: it is contained when
+  /// the point is within the same tolerance of that vertex (`:2092`). An
+  /// empty chain contains nothing.
+  ///
+  /// Returns `None` where KiCad returns `-1`. The router never calls this
+  /// directly, only through [`LineChain::point_on_edge`].
+  pub fn edge_containing_point(
+    &self,
+    point: Vec2,
+    accuracy: i32,
+  ) -> Option<usize> {
+    let threshold = i64::from(accuracy) + 1;
+    let threshold_squared = threshold * threshold;
+    let point_count = self.points.len();
+
+    if point_count == 0 {
+      return None;
+    }
+
+    if point_count == 1 {
+      return if self.points[0].squared_distance(point) <= threshold_squared {
+        Some(0)
+      } else {
+        None
+      };
+    }
+
+    for index in 0..self.segment_count() {
+      let segment = self.segment(index);
+
+      if segment.a == point || segment.b == point {
+        return Some(index);
+      }
+
+      if segment.squared_distance_to_point(point) <= threshold_squared {
+        return Some(index);
+      }
+    }
+
+    None
+  }
+
+  /// Whether a point is a vertex of the chain or within a distance of one
+  /// of its segments.
+  ///
+  /// Port of `CheckClearance`,
+  /// `libs/kimath/src/geometry/shape_line_chain.cpp:2113`. It reads like
+  /// [`LineChain::edge_containing_point`] and is not the same test: the
+  /// comparison is on the **unsquared** distance, `s.Distance( aP ) <=
+  /// aDist` (`:2127`), so it is subject to the truncation in
+  /// [`Seg::distance_to_point`], and a distance of zero accepts anything
+  /// less than a nanometre away rather than the `accuracy + 1` band. A
+  /// chain of one point matches only that point exactly (`:2118`), and an
+  /// empty chain matches nothing.
+  ///
+  /// The router does not call it; it is ported because it is a public
+  /// predicate of the type and the shape level code may reach for it.
+  pub fn check_clearance(&self, point: Vec2, distance: i32) -> bool {
+    if self.points.is_empty() {
+      return false;
+    }
+
+    if self.points.len() == 1 {
+      return self.points[0] == point;
+    }
+
+    for index in 0..self.segment_count() {
+      let segment = self.segment(index);
+
+      if segment.a == point || segment.b == point {
+        return true;
+      }
+
+      if segment.distance_to_point(point) <= distance {
+        return true;
+      }
+    }
+
+    false
+  }
+
+  // ---------------------------------------------------------------
+  // Area and the three way split
+  // ---------------------------------------------------------------
+
+  /// The area enclosed by the closed chain.
+  ///
+  /// Port of `Area( bool aAbsolute )`,
+  /// `libs/kimath/src/geometry/shape_line_chain.cpp:2696`, the trapezoid
+  /// form of the shoelace sum. An **open** chain has area zero whatever
+  /// its shape (`:2700`).
+  ///
+  /// The return type is `f64`, as KiCad's is: the sum is accumulated in
+  /// `double` and the callers compare it as one, the optimizer picking
+  /// the smallest enclosed loop (`pcbnew/router/pns_optimizer.cpp:785`)
+  /// and the posture solver comparing the areas of two candidate traces
+  /// against the mouse trail (`pcbnew/router/pns_mouse_trail_tracer.cpp:123`).
+  /// Values above 2^53 lose exactness, which a board sized polygon in
+  /// nanometres reaches, so this is a comparison quantity and not an
+  /// exact one.
+  ///
+  /// With `absolute` the answer is the magnitude. Without, the sign says
+  /// which way the chain winds, and the negation at `:2718` is what makes
+  /// a clockwise chain in screen coordinates, where y grows downwards,
+  /// come out **positive**.
+  pub fn area(&self, absolute: bool) -> f64 {
+    if !self.closed {
+      return 0.0;
+    }
+
+    let point_count = self.points.len();
+    let mut area = 0.0f64;
+    let mut previous = point_count.wrapping_sub(1);
+
+    for index in 0..point_count {
+      area += (f64::from(self.points[previous].x)
+        + f64::from(self.points[index].x))
+        * (f64::from(self.points[previous].y)
+          - f64::from(self.points[index].y));
+      previous = index;
+    }
+
+    if absolute {
+      (area * 0.5).abs()
+    } else {
+      -area * 0.5
+    }
+  }
+
+  /// Insert a vertex at a point, leaving an existing vertex alone.
+  ///
+  /// Port of `Split( const VECTOR2I&, true )`,
+  /// `libs/kimath/src/geometry/shape_line_chain.cpp:1181`, the form with
+  /// `aExact` set that part 1 left out. The only difference from
+  /// [`LineChain::split`] is the short circuit at `:1188`: a point that
+  /// already is a vertex answers with that vertex's index and the search
+  /// for a nearer segment never runs. Both forms are needed, because
+  /// [`LineChain::split_three_way`] is the exact one's only caller
+  /// (`:2885`) while the walkaround, the optimizer and the placer all
+  /// call the inexact one.
+  pub fn split_exact(&mut self, point: Vec2) -> Option<usize> {
+    if let Some(found) = self.find(point, 0) {
+      return Some(found);
+    }
+
+    self.split(point)
+  }
+
+  /// Cut the chain into the part before a point, the part between two
+  /// points, and the part after.
+  ///
+  /// Port of `Split( const VECTOR2I& aStart, const VECTOR2I& aEnd,
+  /// SHAPE_LINE_CHAIN& aPre, SHAPE_LINE_CHAIN& aMid, SHAPE_LINE_CHAIN&
+  /// aPost )`, `libs/kimath/src/geometry/shape_line_chain.cpp:2877`, the
+  /// five argument overload the meander placers use to carve out the
+  /// stretch of a line they are about to replace
+  /// (`pcbnew/router/pns_meander_placer.cpp:241`,
+  /// `pcbnew/router/pns_dp_meander_placer.cpp:262`).
+  ///
+  /// Neither argument has to be on the chain: each is first snapped with
+  /// [`LineChain::nearest_point`] and then inserted as a vertex with
+  /// [`LineChain::split_exact`]. If the two land out of order the working
+  /// copy is reversed, so `pre` and `post` swap ends relative to the
+  /// original chain rather than the range coming back empty.
+  ///
+  /// The three results are all open and all of width zero, because they
+  /// come from [`LineChain::slice`]. `pre` and `post` can be a single
+  /// point when the range reaches an end of the chain.
+  ///
+  /// Returns `None` for an empty chain, and for the case KiCad cannot
+  /// express: when a snapped point cannot be located afterwards, where
+  /// KiCad's `Find` answers `-1` and the `Slice` calls that follow read
+  /// it as a wrapped index. The snap puts both points on the chain, so
+  /// the case is not reachable through this API.
+  pub fn split_three_way(
+    &self,
+    start: Vec2,
+    end: Vec2,
+  ) -> Option<(LineChain, LineChain, LineChain)> {
+    let end_on_chain = self.nearest_point(end)?;
+    let start_on_chain = self.nearest_point(start)?;
+
+    let mut working = self.clone();
+
+    working.split_exact(end_on_chain);
+    working.split_exact(start_on_chain);
+
+    let mut first = working.find(start_on_chain, 0)?;
+    let mut last = working.find(end_on_chain, 0)?;
+
+    if first > last {
+      working.reverse();
+      first = working.find(start_on_chain, 0)?;
+      last = working.find(end_on_chain, 0)?;
+    }
+
+    let final_index = working.normalize_index(-1)?;
+    let pre = working.slice(0, first).ok()?;
+    let post = working.slice(last, final_index).ok()?;
+    let mid = working.slice(first, last).ok()?;
+
+    Some((pre, mid, post))
+  }
+
+  // ---------------------------------------------------------------
   // Internals
   // ---------------------------------------------------------------
 
@@ -1135,6 +2220,26 @@ impl LineChain {
     {
       self.points.pop();
     }
+  }
+}
+
+/// Build a [`Hit`] out of KiCad's index and corner flag pair.
+///
+/// The corner index is folded back into the chain's point range, which is
+/// the compensation `PNS::HullIntersection` writes out by hand at
+/// `pcbnew/router/pns_utils.cpp:423`. It only ever fires for a closed
+/// chain, where a hit on the last segment's `B` endpoint leaves the
+/// incremented index equal to `PointCount()` and the vertex it names is
+/// the one at index 0.
+fn hit_at(index: usize, corner: bool, point_count: usize) -> Hit {
+  if !corner {
+    return Hit::Segment(index);
+  }
+
+  if point_count > 0 && index >= point_count {
+    Hit::Corner(index - point_count)
+  } else {
+    Hit::Corner(index)
   }
 }
 
@@ -2488,5 +3593,836 @@ mod tests {
       point(2000, 0),
       1
     ));
+  }
+
+  // ---------------------------------------------------------------
+  // Intersections
+  // ---------------------------------------------------------------
+
+  /// The four unit squares of the walkaround's world, as a closed hull.
+  fn closed_square(side: i32) -> LineChain {
+    LineChain::from_slice(
+      &[
+        point(0, 0),
+        point(side, 0),
+        point(side, side),
+        point(0, side),
+      ],
+      true,
+    )
+  }
+
+  #[test]
+  fn intersect_seg_sorts_by_distance_from_the_segments_start() {
+    // `shape_line_chain.cpp:1767` sorts the whole output by squared
+    // distance from `aSeg.A`, which is what lets
+    // `pcbnew/router/pns_optimizer.cpp:961` read entry zero as the
+    // nearest breakout.
+    let square = closed_square(10);
+    let crossing = Seg::new(point(-5, 5), point(15, 5));
+    let hits = square.intersect_seg(&crossing);
+
+    assert_eq!(hits.len(), 2);
+    assert_eq!(hits[0].point, point(0, 5));
+    assert_eq!(hits[0].ours, Hit::Segment(3));
+    assert_eq!(hits[0].theirs, None);
+    assert_eq!(hits[1].point, point(10, 5));
+    assert_eq!(hits[1].ours, Hit::Segment(1));
+  }
+
+  #[test]
+  fn intersect_seg_never_reports_a_corner() {
+    // The `SEG` overload leaves both corner flags false and
+    // `index_their` at `-1` (`shape_line_chain.cpp:1758`), even when the
+    // hit is exactly a vertex. Here the segment goes through the corner
+    // `(10, 0)`, so both adjoining chain segments report it, as segments.
+    let square = closed_square(10);
+    let through_corner = Seg::new(point(5, -5), point(15, 5));
+    let hits = square.intersect_seg(&through_corner);
+
+    assert_eq!(hits.len(), 2);
+    assert!(hits.iter().all(|hit| hit.point == point(10, 0)));
+    assert!(hits.iter().all(|hit| hit.theirs.is_none()));
+    // Equal distances keep chain order, because the sort is stable.
+    assert_eq!(hits[0].ours, Hit::Segment(0));
+    assert_eq!(hits[1].ours, Hit::Segment(1));
+  }
+
+  #[test]
+  fn intersect_chain_on_a_vertex_of_both_chains_reports_two_corners() {
+    // The two chains meet only at `(10, 0)`, which is point 1 of each.
+    // All four segment pairs see it, and every record names the corner
+    // rather than the segment.
+    let ours =
+      LineChain::from_slice(&[point(0, 0), point(10, 0), point(10, 10)], false);
+    let theirs = LineChain::from_slice(
+      &[point(0, 10), point(10, 0), point(20, 10)],
+      false,
+    );
+
+    let hits = ours.intersect_chain(&theirs, true);
+
+    assert_eq!(hits.len(), 4);
+
+    for hit in &hits {
+      assert_eq!(hit.point, point(10, 0));
+      assert_eq!(hit.ours, Hit::Corner(1));
+      assert_eq!(hit.theirs, Some(Hit::Corner(1)));
+    }
+  }
+
+  #[test]
+  fn intersect_chain_on_the_b_endpoint_of_a_closing_segment_wraps_to_corner_zero()
+   {
+    // The aliasing rule of note 01 section 6.6. The hit on the hull's
+    // closing segment (index 3) lands on that segment's `B`, so KiCad
+    // increments `index_our` to 4 == `SegmentCount()`. `Hit::Corner`
+    // carries the point index instead, so it comes back as corner 0, and
+    // `PNS::HullIntersection`'s modulo at
+    // `pcbnew/router/pns_utils.cpp:423` has nothing left to do.
+    let hull = closed_square(10);
+    let line = LineChain::from_slice(&[point(-5, 0), point(5, 0)], false);
+
+    let hits = hull.intersect_chain(&line, true);
+
+    assert_eq!(hits.len(), 3);
+
+    // The first two come from the collinear overlap with the bottom edge.
+    assert_eq!(hits[0].point, point(5, 0));
+    assert_eq!(hits[0].ours, Hit::Segment(0));
+    assert_eq!(hits[0].theirs, Some(Hit::Corner(1)));
+
+    assert_eq!(hits[1].point, point(0, 0));
+    assert_eq!(hits[1].ours, Hit::Corner(0));
+    // KiCad reuses one record across the pushes of the collinear branch
+    // without resetting it (`shape_line_chain.cpp:1884` to `:1945`), so
+    // this one inherits the corner flag and the incremented index of the
+    // push before it even though the point is not `(5, 0)`.
+    assert_eq!(hits[1].theirs, Some(Hit::Corner(1)));
+
+    // And this is the closing segment's `B` endpoint.
+    assert_eq!(hits[2].point, point(0, 0));
+    assert_eq!(hits[2].ours, Hit::Corner(0));
+    assert_eq!(hits[2].theirs, Some(Hit::Segment(0)));
+  }
+
+  #[test]
+  fn intersect_chain_on_collinear_overlap_depends_on_the_flag() {
+    let ours = LineChain::from_slice(&[point(0, 0), point(100, 0)], false);
+    let theirs = LineChain::from_slice(&[point(30, 0), point(70, 0)], false);
+
+    // Included: one record per contained endpoint, so the overlap comes
+    // back as its two ends (`shape_line_chain.cpp:1884`).
+    let included = ours.intersect_chain(&theirs, true);
+
+    assert_eq!(included.len(), 2);
+    assert_eq!(included[0].point, point(30, 0));
+    assert_eq!(included[0].ours, Hit::Segment(0));
+    assert_eq!(included[0].theirs, Some(Hit::Corner(0)));
+    assert_eq!(included[1].point, point(70, 0));
+    assert_eq!(included[1].ours, Hit::Segment(0));
+    assert_eq!(included[1].theirs, Some(Hit::Corner(1)));
+
+    // Excluded: the pair falls through to `SEG::Intersect`, which answers
+    // a collinear overlap with the midpoint of the overlap interval.
+    let excluded = ours.intersect_chain(&theirs, false);
+
+    assert_eq!(excluded.len(), 1);
+    assert_eq!(excluded[0].point, point(50, 0));
+    assert_eq!(excluded[0].ours, Hit::Segment(0));
+    assert_eq!(excluded[0].theirs, Some(Hit::Segment(0)));
+  }
+
+  #[test]
+  fn intersect_chain_is_empty_when_either_chain_has_no_segments() {
+    let square = closed_square(10);
+    let single = LineChain::from_slice(&[point(5, 5)], false);
+
+    assert!(square.intersect_chain(&single, true).is_empty());
+    assert!(single.intersect_chain(&square, true).is_empty());
+    assert!(!square.intersects_chain(&single));
+  }
+
+  #[test]
+  fn intersects_chain_answers_the_diff_pair_placers_question() {
+    // `pcbnew/router/pns_diff_pair.cpp:257`.
+    let positive = LineChain::from_slice(&[point(0, 0), point(100, 0)], false);
+    let crossing =
+      LineChain::from_slice(&[point(50, -50), point(50, 50)], false);
+    let parallel =
+      LineChain::from_slice(&[point(0, 20), point(100, 20)], false);
+
+    assert!(positive.intersects_chain(&crossing));
+    assert!(!positive.intersects_chain(&parallel));
+  }
+
+  // ---------------------------------------------------------------
+  // Self intersection
+  // ---------------------------------------------------------------
+
+  #[test]
+  fn self_intersecting_no_intersection_open_chain() {
+    // `SelfIntersecting_NoIntersection_OpenChain`,
+    // `qa/tests/libs/kimath/geometry/test_shape_line_chain.cpp:1793`.
+    let chain = LineChain::from_slice(
+      &[
+        point(0, 0),
+        point(1000, 0),
+        point(2000, 1000),
+        point(3000, 0),
+      ],
+      false,
+    );
+
+    assert!(chain.self_intersecting().is_none());
+  }
+
+  #[test]
+  fn self_intersecting_no_intersection_closed_chain() {
+    // `SelfIntersecting_NoIntersection_ClosedChain`, `:1801`. A simple
+    // closed square is not self intersecting.
+    let chain = LineChain::from_slice(
+      &[
+        point(0, 0),
+        point(10000, 0),
+        point(10000, 10000),
+        point(0, 10000),
+      ],
+      true,
+    );
+
+    assert!(chain.self_intersecting().is_none());
+  }
+
+  #[test]
+  fn self_intersecting_crossing_segments() {
+    // `SelfIntersecting_CrossingSegments`, `:1810`.
+    let chain = LineChain::from_slice(
+      &[
+        point(0, 0),
+        point(10000, 10000),
+        point(10000, 0),
+        point(0, 10000),
+      ],
+      false,
+    );
+
+    let found = chain.self_intersecting().expect("the chain crosses itself");
+
+    assert_eq!(found.ours, Hit::Segment(0));
+    assert_eq!(found.theirs, Some(Hit::Segment(2)));
+  }
+
+  #[test]
+  fn self_intersecting_closed_figure_eight() {
+    // `SelfIntersecting_ClosedFigureEight`, `:1823`. The bow tie.
+    let chain = LineChain::from_slice(
+      &[
+        point(0, 0),
+        point(10000, 10000),
+        point(10000, 0),
+        point(0, 10000),
+      ],
+      true,
+    );
+
+    assert!(chain.self_intersecting().is_some());
+  }
+
+  #[test]
+  fn self_intersecting_vertex_on_segment() {
+    // `SelfIntersecting_VertexOnSegment`, `:1833`. A vertex that merely
+    // lies on an earlier segment counts, through `SEG::Contains`.
+    let chain = LineChain::from_slice(
+      &[
+        point(0, 0),
+        point(20000, 0),
+        point(20000, 10000),
+        point(10000, 0),
+        point(10000, -10000),
+      ],
+      false,
+    );
+
+    let found = chain
+      .self_intersecting()
+      .expect("the vertex lies on segment 0");
+
+    assert_eq!(found.point, point(10000, 0));
+  }
+
+  #[test]
+  fn self_intersecting_two_segments() {
+    // `SelfIntersecting_TwoSegments`, `:1846`, and
+    // `SelfIntersecting_SinglePoint`, `:1854`: fewer than two segments
+    // answers immediately.
+    let two = LineChain::from_slice(&[point(0, 0), point(10000, 0)], false);
+    let one = LineChain::from_slice(&[point(0, 0)], false);
+
+    assert!(two.self_intersecting().is_none());
+    assert!(one.self_intersecting().is_none());
+  }
+
+  #[test]
+  fn self_intersecting_adjacent_segments_ignored() {
+    // `SelfIntersecting_AdjacentSegmentsIgnored`, `:1863`.
+    let chain = LineChain::from_slice(
+      &[
+        point(0, 0),
+        point(5000, 10000),
+        point(10000, 0),
+        point(15000, 10000),
+        point(20000, 0),
+      ],
+      false,
+    );
+
+    assert!(chain.self_intersecting().is_none());
+  }
+
+  #[test]
+  fn self_intersecting_closed_triangle() {
+    // `SelfIntersecting_ClosedTriangle`, `:1873`.
+    let chain = LineChain::from_slice(
+      &[point(0, 0), point(10000, 0), point(5000, 10000)],
+      true,
+    );
+
+    assert!(chain.self_intersecting().is_none());
+  }
+
+  #[test]
+  fn self_intersecting_closed_last_first_not_false_positive() {
+    // `SelfIntersecting_ClosedLastFirstNotFalsePositive`, `:1882`. The
+    // closing joint is exempted by index, `!( closed && s1 == 0 && s2 ==
+    // segCount - 1 )` at `shape_line_chain.cpp:2189`, and not by any
+    // geometric test.
+    let chain = LineChain::from_slice(
+      &[
+        point(0, 0),
+        point(10000, 0),
+        point(10000, 10000),
+        point(0, 10000),
+      ],
+      true,
+    );
+
+    assert!(chain.self_intersecting().is_none());
+
+    // The same points left open still meet nowhere, because the closing
+    // segment does not exist at all.
+    let mut open = chain.clone();
+
+    open.set_closed(false);
+    assert!(open.self_intersecting().is_none());
+  }
+
+  #[test]
+  fn self_intersecting_spatially_distant() {
+    // `SelfIntersecting_SpatiallyDistant`, `:1893`.
+    let chain = LineChain::from_slice(
+      &[
+        point(0, 0),
+        point(1000, 0),
+        point(1000, 1000000),
+        point(2000, 1000000),
+        point(2000, 2000000),
+        point(3000, 2000000),
+      ],
+      false,
+    );
+
+    assert!(chain.self_intersecting().is_none());
+  }
+
+  #[test]
+  fn self_intersecting_large_non_intersecting() {
+    // `SelfIntersecting_LargeNonIntersecting`, `:1904`.
+    let mut chain = LineChain::new();
+
+    for index in 0..200 {
+      chain.append(point(index * 1000, (index % 2) * 5000));
+    }
+
+    assert!(chain.self_intersecting().is_none());
+  }
+
+  #[test]
+  fn self_intersecting_large_with_crossing() {
+    // `SelfIntersecting_LargeWithCrossing`, `:1916`.
+    let mut chain = LineChain::new();
+
+    for index in 0..50 {
+      chain.append(point(index * 1000, 0));
+    }
+
+    chain.append(point(5000, 10000));
+    chain.append(point(5000, -10000));
+
+    assert!(chain.self_intersecting().is_some());
+  }
+
+  // ---------------------------------------------------------------
+  // Collision
+  // ---------------------------------------------------------------
+
+  #[test]
+  fn collide_point_is_strict_at_exactly_the_clearance() {
+    // The `closest == 0 || closest < clearance` of
+    // `shape_line_chain.cpp:468`. This is the comparison the `- 1` at
+    // `pcbnew/router/pns_item.cpp:249` is written against.
+    let chain = LineChain::from_slice(&[point(0, 0), point(100, 0)], false);
+    let above = point(50, 10);
+
+    assert_eq!(chain.collide_point(above, 10), None);
+    assert_eq!(
+      chain.collide_point(above, 11),
+      Some(Collision {
+        actual: 10,
+        location: point(50, 0)
+      })
+    );
+
+    // A point on the chain collides at any clearance, zero included.
+    assert_eq!(
+      chain.collide_point(point(50, 0), 0),
+      Some(Collision {
+        actual: 0,
+        location: point(50, 0)
+      })
+    );
+  }
+
+  #[test]
+  fn collide_point_inside_a_closed_chain_reports_the_point_itself() {
+    // `shape_line_chain.cpp:429`. Note that the containment test runs
+    // with the clearance as its accuracy, so a clearance above 1 also
+    // catches a point sitting on the outline.
+    let square = closed_square(10);
+
+    assert_eq!(
+      square.collide_point(point(5, 5), 0),
+      Some(Collision {
+        actual: 0,
+        location: point(5, 5)
+      })
+    );
+
+    // On the outline the containment test says no at accuracy 0 and 1,
+    // and the segment scan answers instead, with the same distance but a
+    // location that is the projection rather than the query point.
+    assert_eq!(
+      square.collide_point(point(5, 0), 1),
+      Some(Collision {
+        actual: 0,
+        location: point(5, 0)
+      })
+    );
+  }
+
+  #[test]
+  fn collide_seg_reproduces_the_kicad_line_to_line_cases() {
+    // `Collide_LineToLine`, `Collide_WithClearance` and
+    // `Collide_NoClearance`,
+    // `qa/tests/libs/kimath/geometry/test_shape_line_chain_collision.cpp:33`,
+    // `:86` and `:105`. KiCad drives them through the shape level
+    // `SHAPE::Collide( const SHAPE* )`, which is the collision module's
+    // job; the second chain of each is a single segment, so the same
+    // expectations hold for this member.
+    let line = LineChain::from_slice(&[point(0, 0), point(10, 0)], false);
+
+    let crossing = Seg::new(point(5, 5), point(5, -5));
+
+    assert_eq!(
+      line.collide_seg(&crossing, 0),
+      Some(Collision {
+        actual: 0,
+        location: point(5, 0)
+      })
+    );
+
+    let above = Seg::new(point(5, 6), point(-5, 6));
+
+    assert_eq!(
+      line.collide_seg(&above, 7),
+      Some(Collision {
+        actual: 6,
+        location: point(0, 0)
+      })
+    );
+    assert_eq!(line.collide_seg(&above, 0), None);
+  }
+
+  #[test]
+  fn collide_seg_only_tests_the_segments_start_for_containment() {
+    // `shape_line_chain.cpp:818` tests `aSeg.A` and nothing else, and at
+    // the default accuracy rather than at the clearance. A segment that
+    // starts inside takes the shortcut and reports its own start; the
+    // same segment reversed does not, and is measured against the edges.
+    let square = closed_square(10);
+
+    assert_eq!(
+      square.collide_seg(&Seg::new(point(5, 5), point(50, 5)), 0),
+      Some(Collision {
+        actual: 0,
+        location: point(5, 5)
+      })
+    );
+    assert_eq!(
+      square.collide_seg(&Seg::new(point(50, 5), point(5, 5)), 0),
+      Some(Collision {
+        actual: 0,
+        location: point(10, 5)
+      })
+    );
+  }
+
+  // ---------------------------------------------------------------
+  // Distances and nearest points
+  // ---------------------------------------------------------------
+
+  #[test]
+  fn distance_into_a_closed_chain_is_zero_unless_outline_only() {
+    // `shape_line_chain.cpp:1171`.
+    let square = closed_square(10);
+    let inside = point(5, 5);
+
+    assert_eq!(square.squared_distance(inside, false), 0);
+    assert_eq!(square.distance(inside, false), 0);
+    assert_eq!(square.squared_distance(inside, true), 25);
+    assert_eq!(square.distance(inside, true), 5);
+
+    // An open chain over the same points has no inside at all.
+    let mut open = square.clone();
+
+    open.set_closed(false);
+    assert_eq!(open.squared_distance(inside, false), 25);
+  }
+
+  #[test]
+  fn distance_from_an_empty_chain_is_the_kicad_sentinel() {
+    let empty = LineChain::new();
+
+    assert_eq!(empty.squared_distance(point(0, 0), false), i64::MAX);
+    assert_eq!(empty.distance(point(0, 0), false), i32::MAX);
+  }
+
+  #[test]
+  fn nearest_point_uses_the_nearest_segment() {
+    let chain =
+      LineChain::from_slice(&[point(0, 0), point(10, 0), point(10, 10)], false);
+
+    assert_eq!(chain.nearest_point(point(20, 5)), Some(point(10, 5)));
+    assert_eq!(chain.nearest_point(point(-5, -5)), Some(point(0, 0)));
+
+    // A chain of one point answers with that point, an empty one with
+    // nothing.
+    let single = LineChain::from_slice(&[point(7, 7)], false);
+
+    assert_eq!(single.nearest_point(point(0, 0)), Some(point(7, 7)));
+    assert_eq!(LineChain::new().nearest_point(point(0, 0)), None);
+  }
+
+  #[test]
+  fn nearest_point_to_seg_walks_vertices_and_measures_to_the_line() {
+    // Note 01 section 6.8 item 13. The nearest point of this chain to the
+    // segment is `(60, 0)` at distance zero, but the routine only looks
+    // at vertices and measures to the infinite line, so it answers the
+    // vertex `(50, 0)` at distance 10. `PNS::MoveDiagonal`
+    // (`pcbnew/router/pns_utils.cpp:293`) depends on that.
+    let chain =
+      LineChain::from_slice(&[point(0, 0), point(50, 0), point(100, 0)], false);
+    let vertical = Seg::new(point(60, -10), point(60, 10));
+
+    assert_eq!(
+      chain.nearest_point_to_seg(&vertical),
+      Some((point(50, 0), 10))
+    );
+    assert_eq!(LineChain::new().nearest_point_to_seg(&vertical), None);
+  }
+
+  #[test]
+  fn nearest_segment_breaks_ties_towards_the_earlier_segment() {
+    let chain =
+      LineChain::from_slice(&[point(0, 0), point(10, 0), point(10, 10)], false);
+
+    assert_eq!(chain.nearest_segment(point(20, 5)), Some(1));
+    assert_eq!(chain.nearest_segment(point(5, -5)), Some(0));
+    // Equidistant from both segments, so the first one wins.
+    assert_eq!(chain.nearest_segment(point(10, 0)), Some(0));
+    assert_eq!(LineChain::new().nearest_segment(point(0, 0)), None);
+  }
+
+  // ---------------------------------------------------------------
+  // Containment
+  // ---------------------------------------------------------------
+
+  #[test]
+  fn point_in_polygon() {
+    // `PointInPolygon`,
+    // `qa/tests/libs/kimath/geometry/test_shape_line_chain.cpp:349`.
+    let mut outline1 = LineChain::from_slice(
+      &[
+        point(1316455, 913576),
+        point(1316455, 901129),
+        point(1321102, 901129),
+        point(1322152, 901191),
+        point(1323055, 901365),
+        point(1323830, 901639),
+        point(1324543, 902036),
+        point(1325121, 902521),
+        point(1325581, 903100),
+        point(1325914, 903759),
+        point(1326120, 904516),
+        point(1326193, 905390),
+        point(1326121, 906253),
+        point(1325915, 907005),
+        point(1325581, 907667),
+        point(1325121, 908248),
+        point(1324543, 908735),
+        point(1323830, 909132),
+        point(1323055, 909406),
+        point(1322153, 909579),
+        point(1321102, 909641),
+        point(1317174, 909641),
+        point(1317757, 909027),
+        point(1317757, 913576),
+      ],
+      false,
+    );
+    let mut outline2 = LineChain::from_slice(
+      &[
+        point(1297076, 916244),
+        point(1284629, 916244),
+        point(1284629, 911597),
+        point(1284691, 910547),
+        point(1284865, 909644),
+        point(1285139, 908869),
+        point(1285536, 908156),
+        point(1286021, 907578),
+        point(1286600, 907118),
+        point(1287259, 906785),
+        point(1288016, 906579),
+        point(1288890, 906506),
+        point(1289753, 906578),
+        point(1290505, 906784),
+        point(1291167, 907118),
+        point(1291748, 907578),
+        point(1292235, 908156),
+        point(1292632, 908869),
+        point(1292906, 909644),
+        point(1293079, 910546),
+        point(1293141, 911597),
+        point(1293141, 915525),
+        point(1292527, 914942),
+        point(1297076, 914942),
+      ],
+      false,
+    );
+
+    outline1.set_closed(true);
+    outline2.set_closed(true);
+
+    assert!(outline1.point_inside(point(1317757, 909133), 0));
+    assert!(outline2.point_inside(point(1292633, 914942), 0));
+  }
+
+  #[test]
+  fn point_inside_needs_a_closed_chain_of_at_least_three_points() {
+    // `shape_line_chain.cpp:1994`.
+    let mut square = closed_square(10);
+
+    assert!(square.point_inside(point(5, 5), 0));
+    square.set_closed(false);
+    assert!(!square.point_inside(point(5, 5), 0));
+
+    let two = LineChain::from_slice(&[point(0, 0), point(10, 0)], true);
+
+    assert!(!two.point_inside(point(5, 0), 0));
+  }
+
+  #[test]
+  fn point_inside_puts_the_edge_and_the_vertices_outside() {
+    // The strict `aPt.x - p1.x < d` at `shape_line_chain.cpp:2011` leaves
+    // a point on a non horizontal edge outside, and the half open
+    // `>=` y rule counts a vertex on the ray once. Only from an accuracy
+    // of 2 does `PointOnEdge` stand in for "inside" (`:2016`).
+    let square = closed_square(10);
+
+    for on_the_outline in
+      [point(5, 0), point(10, 5), point(0, 0), point(10, 10)]
+    {
+      assert!(!square.point_inside(on_the_outline, 0));
+      assert!(!square.point_inside(on_the_outline, 1));
+      assert!(square.point_inside(on_the_outline, 2));
+    }
+  }
+
+  #[test]
+  fn point_inside_a_concave_polygon() {
+    // A U shape with the notch at x in (10, 20), y above 10.
+    let outline = LineChain::from_slice(
+      &[
+        point(0, 0),
+        point(30, 0),
+        point(30, 30),
+        point(20, 30),
+        point(20, 10),
+        point(10, 10),
+        point(10, 30),
+        point(0, 30),
+      ],
+      true,
+    );
+
+    assert!(outline.point_inside(point(15, 5), 0));
+    assert!(outline.point_inside(point(5, 20), 0));
+    assert!(outline.point_inside(point(25, 20), 0));
+    // In the notch, so outside despite being within the bounding box.
+    assert!(!outline.point_inside(point(15, 20), 0));
+    assert!(!outline.point_inside(point(40, 15), 0));
+  }
+
+  #[test]
+  fn edge_containing_point_uses_an_accuracy_plus_one_band() {
+    // `shape_line_chain.cpp:2081`, one of the constants note 01 section
+    // 13 lists.
+    let chain = LineChain::from_slice(&[point(0, 0), point(10, 0)], false);
+
+    assert_eq!(chain.edge_containing_point(point(5, 1), 0), Some(0));
+    assert_eq!(chain.edge_containing_point(point(5, 2), 0), None);
+    assert_eq!(chain.edge_containing_point(point(5, 2), 1), Some(0));
+    assert!(chain.point_on_edge(point(5, 1), 0));
+    assert!(!chain.point_on_edge(point(5, 2), 0));
+
+    // A chain of one point is measured against that point (`:2092`), and
+    // an empty one contains nothing.
+    let single = LineChain::from_slice(&[point(0, 0)], false);
+
+    assert_eq!(single.edge_containing_point(point(1, 0), 0), Some(0));
+    assert_eq!(single.edge_containing_point(point(2, 0), 0), None);
+    assert_eq!(
+      LineChain::new().edge_containing_point(point(0, 0), 100),
+      None
+    );
+  }
+
+  #[test]
+  fn check_clearance_compares_the_unsquared_distance() {
+    // `shape_line_chain.cpp:2127` compares `s.Distance( aP ) <= aDist`,
+    // so unlike `edge_containing_point` there is no `+ 1` band, and a
+    // single point chain wants an exact match (`:2118`).
+    let chain = LineChain::from_slice(&[point(0, 0), point(10, 0)], false);
+
+    assert!(!chain.check_clearance(point(5, 1), 0));
+    assert!(chain.check_clearance(point(5, 1), 1));
+    assert!(chain.check_clearance(point(0, 0), 0));
+
+    let single = LineChain::from_slice(&[point(0, 0)], false);
+
+    assert!(single.check_clearance(point(0, 0), 100));
+    assert!(!single.check_clearance(point(1, 0), 100));
+    assert!(!LineChain::new().check_clearance(point(0, 0), 100));
+  }
+
+  // ---------------------------------------------------------------
+  // Area and the three way split
+  // ---------------------------------------------------------------
+
+  #[test]
+  fn area_is_positive_for_a_clockwise_chain_in_screen_coordinates() {
+    // `shape_line_chain.cpp:2718` negates the shoelace sum, so a chain
+    // that runs clockwise on a screen where y grows downwards comes out
+    // positive.
+    let clockwise = closed_square(10);
+    let counter_clockwise = clockwise.reversed();
+
+    assert_eq!(clockwise.area(false), 100.0);
+    assert_eq!(counter_clockwise.area(false), -100.0);
+    assert_eq!(clockwise.area(true), 100.0);
+    assert_eq!(counter_clockwise.area(true), 100.0);
+
+    // An open chain encloses nothing whatever its shape (`:2700`).
+    let mut open = clockwise.clone();
+
+    open.set_closed(false);
+    assert_eq!(open.area(false), 0.0);
+    assert_eq!(LineChain::new().area(true), 0.0);
+  }
+
+  #[test]
+  fn split_exact_leaves_an_existing_vertex_alone() {
+    // The only difference from `split`: the short circuit at
+    // `shape_line_chain.cpp:1188`.
+    let base =
+      LineChain::from_slice(&[point(0, 0), point(50, 0), point(100, 0)], false);
+
+    let mut exact = base.clone();
+
+    assert_eq!(exact.split_exact(point(50, 0)), Some(1));
+    assert_eq!(exact.point_count(), 3);
+
+    let mut inexact = base.clone();
+
+    assert_eq!(inexact.split_exact(point(60, 0)), Some(2));
+    assert_eq!(
+      points_of(&inexact),
+      vec![point(0, 0), point(50, 0), point(60, 0), point(100, 0)]
+    );
+  }
+
+  #[test]
+  fn split_three_way_cuts_out_the_middle() {
+    // `shape_line_chain.cpp:2877`, the form the meander placers use.
+    let chain = LineChain::from_slice(&[point(0, 0), point(100, 0)], false);
+
+    let (pre, mid, post) = chain
+      .split_three_way(point(20, 0), point(60, 0))
+      .expect("both points snap onto the chain");
+
+    assert_eq!(points_of(&pre), vec![point(0, 0), point(20, 0)]);
+    assert_eq!(points_of(&mid), vec![point(20, 0), point(60, 0)]);
+    assert_eq!(points_of(&post), vec![point(60, 0), point(100, 0)]);
+    assert!(!mid.is_closed());
+    assert_eq!(mid.width(), 0);
+  }
+
+  #[test]
+  fn split_three_way_reverses_when_the_points_arrive_backwards() {
+    // `shape_line_chain.cpp:2891` reverses the working copy rather than
+    // returning an empty middle, so `pre` and `post` swap ends.
+    let chain = LineChain::from_slice(&[point(0, 0), point(100, 0)], false);
+
+    let (pre, mid, post) = chain
+      .split_three_way(point(60, 0), point(20, 0))
+      .expect("both points snap onto the chain");
+
+    assert_eq!(points_of(&pre), vec![point(100, 0), point(60, 0)]);
+    assert_eq!(points_of(&mid), vec![point(60, 0), point(20, 0)]);
+    assert_eq!(points_of(&post), vec![point(20, 0), point(0, 0)]);
+  }
+
+  #[test]
+  fn split_three_way_snaps_points_that_are_off_the_chain() {
+    let chain = LineChain::from_slice(
+      &[point(0, 0), point(100, 0), point(100, 100)],
+      false,
+    );
+
+    let (pre, mid, post) = chain
+      .split_three_way(point(20, 40), point(140, 50))
+      .expect("both points snap onto the chain");
+
+    assert_eq!(points_of(&pre), vec![point(0, 0), point(20, 0)]);
+    assert_eq!(
+      points_of(&mid),
+      vec![point(20, 0), point(100, 0), point(100, 50)]
+    );
+    assert_eq!(points_of(&post), vec![point(100, 50), point(100, 100)]);
+
+    assert_eq!(
+      LineChain::new().split_three_way(point(0, 0), point(1, 0)),
+      None
+    );
   }
 }
