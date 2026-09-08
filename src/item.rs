@@ -640,6 +640,49 @@ impl LayerMask {
 
     (self.0 & (1u64 << layer)) != 0
   }
+
+  /// Whether the item has copper on **any** layer of an interval.
+  ///
+  /// Port of the layer range overload,
+  /// `ROUTER_IFACE::IsFlashedOnLayer( const ITEM*, const PNS_LAYER_RANGE& )`,
+  /// `pcbnew/router/pns_kicad_iface.cpp:2204`, which loops the interval
+  /// and answers true on the first flashed layer (`:2216`). It is the one
+  /// the collision ladder asks (`pcbnew/router/pns_item.cpp:206`,
+  /// `:210`), where the per layer form is what a hull asks.
+  ///
+  /// The three edge cases match [`LayerMask::is_flashed_on`]: an empty
+  /// interval answers false, which is KiCad's `test.Start() <= test.End()`
+  /// fallback at `:2257`; a negative start means "no layer context, assume
+  /// flashed"; and an interval reaching past [`LayerMask::MAX_LAYER`]
+  /// answers true, the conservative direction.
+  pub fn is_flashed_on_any(self, layers: LayerRange) -> bool {
+    if layers.start() > layers.end() {
+      return false;
+    }
+
+    if layers.start() < 0 {
+      return true;
+    }
+
+    if layers.end() > Self::MAX_LAYER {
+      debug_assert!(
+        false,
+        "layer {} is past the flashing mask's 64 layer limit",
+        layers.end()
+      );
+
+      return true;
+    }
+
+    let width = layers.end() - layers.start() + 1;
+    let span = if width > Self::MAX_LAYER {
+      u64::MAX
+    } else {
+      ((1u64 << width) - 1) << layers.start()
+    };
+
+    (self.0 & span) != 0
+  }
 }
 
 // ---------------------------------------------------------------------
@@ -2011,6 +2054,20 @@ impl Item {
     self.flashed_layers.is_flashed_on(layer)
   }
 
+  /// Whether the item has copper anywhere in the layers it shares with an
+  /// interval.
+  ///
+  /// Port of the layer range overload of `IsFlashedOnLayer`,
+  /// `pcbnew/router/pns_kicad_iface.cpp:2204`, whose first line is the
+  /// intersection with the item's own range (`:2206`). This is the form
+  /// the clearance ladder asks, as `IsFlashedOnLayer( this,
+  /// aHead->Layers() )` (`pcbnew/router/pns_item.cpp:206`).
+  pub fn is_flashed_on_any(&self, layers: LayerRange) -> bool {
+    self
+      .flashed_layers
+      .is_flashed_on_any(self.layers.intersection(layers))
+  }
+
   /// The transient marks. Port of `Marker`,
   /// `pcbnew/router/pns_item.h:263`.
   pub const fn marker(&self) -> MarkerFlags {
@@ -2703,6 +2760,61 @@ mod tests {
     assert!(!mask.is_flashed_on(4));
     assert!(!mask.with(-1).with(64).without(-1).is_flashed_on(0));
     assert!(!mask.without(3).is_flashed_on(3));
+  }
+
+  #[test]
+  fn layer_mask_over_an_interval_answers_on_the_first_flashed_layer() {
+    let mask = LayerMask::NONE.with(3).with(5);
+
+    assert!(mask.is_flashed_on_any(LayerRange::new(0, 3)));
+    assert!(mask.is_flashed_on_any(LayerRange::new(5, 9)));
+    assert!(mask.is_flashed_on_any(LayerRange::new(3, 5)));
+    assert!(!mask.is_flashed_on_any(LayerRange::new(0, 2)));
+    assert!(!mask.is_flashed_on_any(LayerRange::new(6, 9)));
+    assert!(!mask.is_flashed_on_any(LayerRange::single(4)));
+  }
+
+  #[test]
+  fn layer_mask_over_an_empty_interval_is_not_flashed() {
+    let mask = LayerMask::ALL;
+
+    // What `LayerRange::intersection` produces for two disjoint ranges.
+    assert!(!mask.is_flashed_on_any(LayerRange { start: 5, end: 2 }));
+  }
+
+  #[test]
+  fn layer_mask_over_an_interval_without_a_layer_context_is_flashed() {
+    assert!(LayerMask::NONE.is_flashed_on_any(LayerRange::new(-1, 3)));
+  }
+
+  #[test]
+  fn layer_mask_over_the_widest_interval_does_not_overflow() {
+    assert!(
+      LayerMask::NONE
+        .with(63)
+        .is_flashed_on_any(LayerRange::new(0, 63))
+    );
+    assert!(!LayerMask::NONE.is_flashed_on_any(LayerRange::new(0, 63)));
+    assert!(
+      LayerMask::NONE
+        .with(0)
+        .is_flashed_on_any(LayerRange::new(0, 63))
+    );
+  }
+
+  #[test]
+  fn an_item_intersects_the_interval_with_its_own_layers() {
+    let mut item = item_on(2, ItemBody::Hole(Hole::circular(point(0, 0), 100)));
+    item.set_layers_and_flash_all(LayerRange::new(2, 4));
+
+    assert!(item.is_flashed_on_any(LayerRange::new(0, 2)));
+    assert!(item.is_flashed_on_any(LayerRange::all()));
+    assert!(!item.is_flashed_on_any(LayerRange::new(0, 1)));
+
+    item.set_flashed_layers(LayerMask::NONE.with(4));
+
+    assert!(!item.is_flashed_on_any(LayerRange::new(0, 3)));
+    assert!(item.is_flashed_on_any(LayerRange::new(3, 6)));
   }
 
   // -----------------------------------------------------------------

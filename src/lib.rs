@@ -12,5 +12,7 @@
 #![warn(clippy::missing_docs_in_private_items)]
 
 pub mod arena;
+pub mod collide;
 pub mod geometry;
 pub mod item;
+pub mod rules;
