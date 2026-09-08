@@ -61,14 +61,15 @@
 //!   back with the collision position the node needs to finish the test.
 //!   Until the node module exists, such a collision is reported where
 //!   KiCad might suppress it.
-//! - **The accumulating form.** With a `COLLISION_SEARCH_CONTEXT`,
-//!   `collideSimple` never returns early: it inserts every obstacle it
-//!   finds into the context's set and answers whether it found any
-//!   (`pcbnew/router/pns_item.cpp:257`, `:282`). Without one it returns
-//!   on the first hit. This module implements the second form, which is
-//!   what `NODE::CheckColliding` uses; `NODE::QueryColliding` needs the
-//!   first, and it arrives with the node module that owns the obstacle
-//!   set.
+//!
+//! # Both forms of the search
+//!
+//! Both forms of the search are here. [`collide_items`] is the early
+//! returning one, which stops at the first hit and loops the layers
+//! itself. [`collide_into`] is the accumulating one KiCad reaches with a
+//! `COLLISION_SEARCH_CONTEXT` (`pcbnew/router/pns_item.cpp:257`, `:282`):
+//! it takes one layer, appends every obstacle it finds and answers only
+//! whether it found any, which is what `NODE::QueryColliding` needs.
 //!
 //! # What remains of the geometric self collision heuristic
 //!
@@ -272,7 +273,8 @@ pub fn collide_items(
   options: &CollisionSearchOptions,
 ) -> Option<Obstacle> {
   for layer in item.item().relevant_shape_layers(head.item()) {
-    let found = collide_simple(arena, item, head, layer, resolver, options);
+    let found =
+      collide_simple(arena, item, head, layer, resolver, options, None);
 
     if found.is_some() {
       return found;
@@ -282,16 +284,67 @@ pub fn collide_items(
   None
 }
 
+/// Every collision between two items on one layer, appended to `found`.
+///
+/// Port of `ITEM::Collide` (`pcbnew/router/pns_item.cpp:305`) in its
+/// **collision search context** form, which is the one
+/// `NODE::QueryColliding` needs (`pcbnew/router/pns_node.cpp:256`): with a
+/// `COLLISION_SEARCH_CONTEXT` the test never returns early, it inserts
+/// every obstacle it finds into the context's set and answers only whether
+/// it found any (`pcbnew/router/pns_item.cpp:257`, `:282`). See the module
+/// documentation, "the accumulating form".
+///
+/// Three differences from [`collide_items`], all of them KiCad's:
+///
+/// - one candidate can contribute several obstacles, because a pad and its
+///   hole are reported as separate pairs;
+/// - both hole recursions run, where the early returning form stops at the
+///   first hit (`pcbnew/router/pns_item.cpp:146`, `:154`, whose `|=`
+///   evaluates both);
+/// - an obstacle the hole recursion appended **stays** appended even when
+///   a later test makes this call answer `false`, because the three late
+///   exits throw away the local flag and not the set. That is the quirk
+///   the module documentation ends on, and it is observable here where it
+///   is not in the early returning form.
+///
+/// `layer` is the layer context KiCad's spatial index stamps onto the
+/// visitor (`pcbnew/router/pns_index.h:172`), so the caller passes the
+/// layer of the sub index the candidate came out of rather than looping
+/// over [`Item::relevant_shape_layers`] itself.
+///
+/// The return value is KiCad's `collisionsFound`, which the obstacle
+/// visitor uses to decide whether to test its limit
+/// (`pcbnew/router/pns_node.cpp:255`).
+pub fn collide_into(
+  arena: &Arena<Item>,
+  item: ItemRef<'_>,
+  head: ItemRef<'_>,
+  layer: i32,
+  resolver: &dyn RuleResolver,
+  options: &CollisionSearchOptions,
+  found: &mut Vec<Obstacle>,
+) -> bool {
+  collide_simple(arena, item, head, layer, resolver, options, Some(found))
+    .is_some()
+}
+
 // ---------------------------------------------------------------------
 // collideSimple
 // ---------------------------------------------------------------------
 
 /// One layer's worth of the item level collision test.
 ///
-/// Port of `ITEM::collideSimple`, `pcbnew/router/pns_item.cpp:104`, in
-/// its "no collision search context" form: it returns on the first hit.
+/// Port of `ITEM::collideSimple`, `pcbnew/router/pns_item.cpp:104`.
 /// `layer` is KiCad's `aLayer`, the layer context, where `-1` means "this
 /// item has one shape and no layer decides it".
+///
+/// `sink` is KiCad's `COLLISION_SEARCH_CONTEXT*`. `None` is the early
+/// returning form, which stops at the first hit; `Some` is the
+/// accumulating form behind [`collide_into`], which appends every obstacle
+/// it finds and runs both hole recursions. The three late exits return
+/// `None` in either form, which throws away the **answer** and never what
+/// was already appended, exactly as KiCad's `return false` throws away
+/// `collisionsFound` and never the set.
 fn collide_simple(
   arena: &Arena<Item>,
   item: ItemRef<'_>,
@@ -299,6 +352,7 @@ fn collide_simple(
   layer: i32,
   resolver: &dyn RuleResolver,
   options: &CollisionSearchOptions,
+  mut sink: Option<&mut Vec<Obstacle>>,
 ) -> Option<Obstacle> {
   // :119. Nothing collides with itself.
   if item.is_same_as(head) {
@@ -324,7 +378,7 @@ fn collide_simple(
     layer,
     resolver,
     options,
-    run_physical_only,
+    sink.as_deref_mut(),
   );
 
   // :161 to :165, the line widths, are both zero here.
@@ -376,27 +430,47 @@ fn collide_simple(
     }
 
     // :270
-    return Some(Obstacle {
-      head: head.id(),
-      item: item.id(),
-      clearance,
-      detail: Some(detail),
-    });
+    return Some(report(
+      Obstacle {
+        head: head.id(),
+        item: item.id(),
+        clearance,
+        detail: Some(detail),
+      },
+      sink,
+    ));
   }
 
   // :280, the fast path, which asks for a boolean only.
   if collision::collides(&shape_head, &shape_item, distance) {
     // :295
-    return Some(Obstacle {
-      head: head.id(),
-      item: item.id(),
-      clearance,
-      detail: None,
-    });
+    return Some(report(
+      Obstacle {
+        head: head.id(),
+        item: item.id(),
+        clearance,
+        detail: None,
+      },
+      sink,
+    ));
   }
 
   // :301
   found
+}
+
+/// Hand one obstacle to the collision search context, if there is one.
+///
+/// Port of the two `aCtx->obstacles.insert( obs )` sites,
+/// `pcbnew/router/pns_item.cpp:265` and `:290`. Without a context KiCad
+/// returns the hit instead of recording it, which is what returning the
+/// obstacle unchanged stands for.
+fn report(obstacle: Obstacle, sink: Option<&mut Vec<Obstacle>>) -> Obstacle {
+  if let Some(sink) = sink {
+    sink.push(obstacle);
+  }
+
+  obstacle
 }
 
 /// The two hole recursions of `collideSimple`.
@@ -414,8 +488,10 @@ fn collide_simple(
 /// extra pass from reporting anything KiCad would not.
 ///
 /// KiCad's `|=` evaluates both recursions whatever the first one
-/// answered. Only the first hit is kept here, which is unobservable: the
-/// calls are pure and the caller looks at one obstacle.
+/// answered. Without a sink only the first hit is kept, which is
+/// unobservable there: the calls are pure and the caller looks at one
+/// obstacle. With a sink both recursions run, because each of them can
+/// append an obstacle of its own.
 fn collide_holes(
   arena: &Arena<Item>,
   item: ItemRef<'_>,
@@ -423,8 +499,12 @@ fn collide_holes(
   layer: i32,
   resolver: &dyn RuleResolver,
   options: &CollisionSearchOptions,
-  run_physical_only: bool,
+  mut sink: Option<&mut Vec<Obstacle>>,
 ) -> Option<Obstacle> {
+  // :127, asked again rather than passed down, so that the argument list
+  // stays at seven.
+  let run_physical_only = resolver.has_user_defined_physical_constraint();
+  let accumulating = sink.is_some();
   let mut found = None;
 
   // :146. The head's hole against this item.
@@ -436,15 +516,26 @@ fn collide_holes(
       || net_of(arena, item) != net_of(arena, hole)
       || run_physical_only)
   {
-    found = collide_simple(arena, item, hole, layer, resolver, options);
+    found = collide_simple(
+      arena,
+      item,
+      hole,
+      layer,
+      resolver,
+      options,
+      sink.as_deref_mut(),
+    );
   }
 
   // :154. This item's hole against the head.
-  if found.is_none()
+  if (found.is_none() || accumulating)
     && let Some(hole) = hole_of(arena, item)
     && should_consider_hole_collisions(arena, hole, head)
   {
-    found = collide_simple(arena, hole, head, layer, resolver, options);
+    let second =
+      collide_simple(arena, hole, head, layer, resolver, options, sink);
+
+    found = found.or(second);
   }
 
   found
@@ -1574,5 +1665,80 @@ mod tests {
     let second = store(&mut arena, pad(1, 500, 1000, 2));
 
     assert_eq!(collide_stored(&arena, &Forgiving, first, second), None);
+  }
+
+  // -----------------------------------------------------------------
+  // The accumulating form
+  // -----------------------------------------------------------------
+
+  /// The early returning form answers with the first obstacle it finds,
+  /// the accumulating one with the pad and its hole both.
+  #[test]
+  fn the_accumulating_form_reports_a_via_and_its_hole_separately() {
+    let mut arena = Arena::new();
+    let rules = TestRules::uniform(CLEARANCE);
+    let (via_id, hole_id) =
+      store_with_hole(&mut arena, via(0, 0, 2000, 1000, 1), hole(1, 0, 500));
+    let head_id = store(&mut arena, segment(2, 0, 100, 2));
+
+    let mut found = Vec::new();
+    let any = collide_into(
+      &arena,
+      stored(&arena, via_id),
+      stored(&arena, head_id),
+      0,
+      &rules,
+      &CollisionSearchOptions::default(),
+      &mut found,
+    );
+
+    assert!(any);
+    assert_eq!(found.len(), 2);
+    assert_eq!(found[0].item, Some(hole_id));
+    assert_eq!(found[1].item, Some(via_id));
+
+    for obstacle in &found {
+      assert_eq!(obstacle.head, Some(head_id));
+    }
+
+    // The early returning form answers with one obstacle only, and it is
+    // the via: the item's own shape test runs last and returns directly,
+    // over the hole the recursion had already found
+    // (`pcbnew/router/pns_item.cpp:295` against `:301`).
+    let first = collide_stored(&arena, &rules, via_id, head_id);
+    assert_eq!(first.map(|obstacle| obstacle.item), Some(Some(via_id)));
+  }
+
+  /// The quirk the module documentation ends on, which only the
+  /// accumulating form can show: the layer overlap test at
+  /// `pcbnew/router/pns_item.cpp:168` throws away the answer and not the
+  /// obstacles the hole recursion has already appended.
+  #[test]
+  fn an_obstacle_found_through_a_hole_survives_the_layer_test() {
+    let mut arena = Arena::new();
+    let rules = TestRules::uniform(CLEARANCE);
+
+    // A via whose copper is nowhere near the head's layer, drilled by a
+    // hole that is.
+    let mut drilled = via(0, 0, 2000, 1000, 1);
+    drilled.set_layers_and_flash_all(LayerRange::new(5, 6));
+    let (via_id, hole_id) =
+      store_with_hole(&mut arena, drilled, hole(1, 0, 500));
+    let head_id = store(&mut arena, segment(2, 0, 100, 2));
+
+    let mut found = Vec::new();
+    let any = collide_into(
+      &arena,
+      stored(&arena, via_id),
+      stored(&arena, head_id),
+      0,
+      &rules,
+      &CollisionSearchOptions::default(),
+      &mut found,
+    );
+
+    assert!(!any);
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].item, Some(hole_id));
   }
 }

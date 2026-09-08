@@ -17,4 +17,5 @@ pub mod geometry;
 pub mod index;
 pub mod item;
 pub mod joint;
+pub mod node;
 pub mod rules;
