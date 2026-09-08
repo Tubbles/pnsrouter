@@ -26,4 +26,5 @@ pub mod optimizer;
 pub mod placer;
 pub mod rules;
 pub mod settings;
+pub mod topology;
 pub mod walkaround;

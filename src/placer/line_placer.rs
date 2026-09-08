@@ -83,8 +83,9 @@ use crate::mouse_trail::MouseTrailTracer;
 use crate::node::{JointRef, NodeId, World};
 use crate::optimizer::{EffortFlags, Optimizer};
 use crate::placer::fixed_tail::FixedTail;
-use crate::rules::ItemRef;
+use crate::rules::{ItemRef, RuleResolver};
 use crate::settings::{OptimizerEffort, RouterMode, RoutingSettings, Sizes};
+use crate::topology;
 use crate::walkaround::{WalkPolicy, Walkaround, WalkaroundStatus};
 
 // ---------------------------------------------------------------------
@@ -2177,6 +2178,14 @@ pub struct LinePlacer {
   /// taken from the settings here, which is the same value in the only
   /// case anything reads it.
   initial_direction: Direction45,
+  /// The last rat line [`LinePlacer::update_leading_ratline`] computed.
+  ///
+  /// KiCad has no field for this: it hands the chain straight to
+  /// `ROUTER_IFACE::DisplayRatline`
+  /// (`pcbnew/router/pns_line_placer.cpp:2028`) and forgets it. The
+  /// engine draws nothing here, so the answer is kept for the facade to
+  /// read through [`LinePlacer::leading_rat_line`].
+  leading_rat_line: Option<LineChain>,
 }
 
 impl LinePlacer {
@@ -2214,6 +2223,7 @@ impl LinePlacer {
       last_node: None,
       sizes,
       initial_direction: settings.initial_direction(),
+      leading_rat_line: None,
     }
   }
 
@@ -2242,6 +2252,25 @@ impl LinePlacer {
   /// `pcbnew/router/pns_line_placer.cpp:1233`.
   pub fn trace(&self) -> Option<Line> {
     self.state.placing().map(Placing::trace)
+  }
+
+  /// The rat line from the end of the trace to the nearest thing on the
+  /// routed net it has not reached yet.
+  ///
+  /// What KiCad passes to `ROUTER_IFACE::DisplayRatline`
+  /// (`pcbnew/router/pns_line_placer.cpp:2028`), recomputed by every
+  /// [`LinePlacer::move_to`] and [`None`] before the first one. KiCad has
+  /// no accessor because it pushes the chain at the host instead.
+  ///
+  /// Two answers a facade has to tell apart. [`None`] means there is
+  /// nothing left to reach, or the net has no net code
+  /// (`pcbnew/router/pns_topology.cpp:123`). A chain of a **single**
+  /// point means the trace's end already touches its target, which is the
+  /// degenerate two identical points case
+  /// [`crate::topology::leading_rat_line`] documents; neither should be
+  /// drawn.
+  pub fn leading_rat_line(&self) -> Option<&LineChain> {
+    self.leading_rat_line.as_ref()
   }
 
   /// Every routed line, which is one for a single track placer.
@@ -2769,8 +2798,9 @@ impl LinePlacer {
   /// pushout of [`Placing::build_initial_line`] cannot resolve anything,
   /// and the head would carry no via for the next fix to commit.
   ///
-  /// `updateLeadingRatLine` (`:1549`) is
-  /// [`LinePlacer::update_leading_ratline`], a stub; see there.
+  /// `updateLeadingRatLine` (`:1549`) fills
+  /// [`LinePlacer::leading_rat_line`] instead of drawing, and runs on the
+  /// scratch branch this function has just rebuilt.
   ///
   /// Always answers true while a placement is running, as KiCad does; the
   /// "did the head reach the cursor" answer is internal and a host reads
@@ -2880,6 +2910,9 @@ impl LinePlacer {
         Self::remove_loops(world, last, &mut current);
       }
     }
+
+    // :1549
+    self.update_leading_ratline(world, context.resolver);
 
     // :1550
     if let Some(placing) = self.state.placing_mut() {
@@ -3313,16 +3346,38 @@ impl LinePlacer {
   /// `TOPOLOGY( m_lastNode ).LeadingRatLine( &Trace(), ratLine )` followed
   /// by a call into the host's `DisplayRatline`.
   ///
-  /// `TODO(milestone 5)`: `TOPOLOGY::LeadingRatLine`
-  /// (`pcbnew/router/pns_topology.cpp:168`) rests on
-  /// `NearestUnconnectedItem`, which needs the connectivity view of the
-  /// board that only the session facade has. The stub answers [`None`],
-  /// the same thing KiCad's does when nothing unconnected is left, and
-  /// the host draws nothing. `Move` calls it at `:1549`; the call is left
-  /// out until there is something to draw, because the answer is pure and
-  /// nothing else reads it.
-  pub const fn update_leading_ratline(&self) -> Option<LineChain> {
-    None
+  /// `LeadingRatLine` is [`crate::topology::leading_rat_line`] and the
+  /// `DisplayRatline` call becomes a field: this crate draws nothing, so
+  /// the chain is stored for the facade to hand on, and
+  /// [`LinePlacer::leading_rat_line`] reads it back.
+  ///
+  /// Storing [`None`] when the query fails is what a host sees in KiCad
+  /// too. KiCad only calls `DisplayRatline` on a true answer, but its
+  /// preview items are freed on every frame
+  /// (`PNS_KICAD_IFACE::EraseView`, `pcbnew/router/pns_kicad_iface.cpp`
+  /// `:2456`), so a rat line that is not redrawn is a rat line that is
+  /// gone.
+  ///
+  /// The query runs on `m_lastNode`, the scratch branch
+  /// [`LinePlacer::move_to`] has just rebuilt, and not on the routing
+  /// node, so the loops that move removed and the split end item are part
+  /// of the connectivity it reasons about.
+  fn update_leading_ratline(
+    &mut self,
+    world: &mut World,
+    resolver: &dyn RuleResolver,
+  ) {
+    self.leading_rat_line = None;
+
+    let Some(trace) = self.trace() else {
+      return;
+    };
+    let Some(node) = self.last_node else {
+      return;
+    };
+
+    self.leading_rat_line =
+      topology::leading_rat_line(world, node, resolver, &trace);
   }
 
   /// Fold the placed geometry into the root.
