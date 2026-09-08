@@ -22,6 +22,16 @@
 //!   segments' infinite lines cross.
 //! - [`Optimizer::merge_colinear`] ([`EffortFlags::MERGE_COLINEAR`])
 //!   drops the shared vertex of two collinear segments.
+//! - [`Optimizer::run_smart_pads`] ([`EffortFlags::SMART_PADS`]) redraws
+//!   the first few segments at each end so that the trace leaves its pad
+//!   along one of that pad's [`compute_breakouts`].
+//! - [`Optimizer::fanout_cleanup`] ([`EffortFlags::FANOUT_CLEANUP`])
+//!   redraws a very short pad to pad connection as a plain two segment
+//!   trace.
+//!
+//! The last two are the only passes that read the world's connectivity
+//! rather than only its obstacles: both start from
+//! [`find_pad_or_via`], a joint lookup at each endpoint.
 //!
 //! Everything a pass proposes is checked against the live node
 //! ([`Optimizer::check_colliding`]) and against the caller's constraints
@@ -38,7 +48,8 @@
 //! [`CostEstimator::corner_cost`] and nothing else. It is a pure lookup
 //! on the angle class of each corner, and a collinear joint still costs
 //! something, so the estimator prefers fewer vertices even when the shape
-//! is unchanged. Length is not part of any live decision in KiCad's tree.
+//! is unchanged. Length enters exactly one live decision in KiCad's
+//! tree, the breakout tie break of [`Optimizer::smart_pads_single`].
 //!
 //! # What is not here
 //!
@@ -48,12 +59,10 @@
 //!   and discarded, and `ClearCache( true )` would erase from a map while
 //!   iterating it (note 04 section 4.3). Every candidate is checked
 //!   against the live node here, exactly as KiCad actually does.
-//! - **The pad passes.** `runSmartPads`, `smartPadsSingle`, the four
-//!   breakout generators, `fanoutCleanup` and `findPadOrVia` are the next
-//!   work item; note 04 section 8.5 puts them in phase 5. The two flags
-//!   that select them, [`EffortFlags::SMART_PADS`] and
-//!   [`EffortFlags::FANOUT_CLEANUP`], are accepted and skipped so that a
-//!   caller passing them still gets the other passes.
+//! - **Breakouts for a compound pad.** KiCad's `computeBreakouts` has no
+//!   case for `SH_COMPOUND` (`pcbnew/router/pns_optimizer.cpp:1078`), so
+//!   a complex pad offers no exits and gets no smart connection. See
+//!   [`compute_breakouts`].
 //! - **The two no op constraints.** `RESTRICT_VERTEX_RANGE_CONSTRAINT`
 //!   returns true unconditionally and ignores both its bounds
 //!   (`pcbnew/router/pns_optimizer.cpp:279`,
@@ -97,11 +106,15 @@ use std::ops::{BitAnd, BitOr, BitOrAssign};
 use crate::algo_base::AlgoContext;
 use crate::collide::CollisionSearchOptions;
 use crate::geometry::box2::Box2;
-use crate::geometry::direction45::{AngleType, Direction45};
+use crate::geometry::collision::collide_seg;
+use crate::geometry::direction45::{AngleType, CornerMode, Direction45};
+use crate::geometry::hull::approximate_segment_as_rect;
 use crate::geometry::line_chain::LineChain;
+use crate::geometry::math::kiround;
 use crate::geometry::seg::Seg;
+use crate::geometry::shape::Shape;
 use crate::geometry::vec2::{Vec2, Vec2L};
-use crate::item::Kind;
+use crate::item::{Item, ItemBody, ItemId, Kind, NetId, Solid};
 use crate::line::Line;
 use crate::node::{NodeId, World};
 
@@ -196,13 +209,18 @@ impl EffortFlags {
   pub const MERGE_SEGMENTS: EffortFlags = EffortFlags(0x001);
 
   /// Reroute the exits from the pads at each end. Port of
-  /// `SMART_PADS = 0x02`, `pcbnew/router/pns_optimizer.h:100`.
+  /// `SMART_PADS = 0x02`, `pcbnew/router/pns_optimizer.h:100`, which
+  /// selects [`Optimizer::run_smart_pads`].
   ///
-  /// **Not implemented yet.** The pass is the next work item; the flag is
-  /// accepted and skipped, so a caller that asks for it still gets every
-  /// other pass. KiCad's `runSmartPads` always reports "changed"
-  /// (note 04 section 4.7), so an [`Optimizer::optimize`] that is given
-  /// only this flag answers `false` here where KiCad would answer `true`.
+  /// That pass reports "changed" unconditionally over a line of three
+  /// points or more, so [`Optimizer::optimize`] does too whenever this
+  /// bit is set; see [`Optimizer::run_smart_pads`] for why that is
+  /// reproduced and who it bites.
+  ///
+  /// The line placer and the shove only ask for it in the 45 degree
+  /// corner modes (`pcbnew/router/pns_line_placer.cpp:762`,
+  /// `pcbnew/router/pns_shove.cpp:2079`), because the connections the
+  /// pass builds are always mitered at 45 degrees whatever the mode.
   pub const SMART_PADS: EffortFlags = EffortFlags(0x002);
 
   /// Run [`Optimizer::merge_obtuse`]. Port of `MERGE_OBTUSE = 0x04`,
@@ -210,9 +228,12 @@ impl EffortFlags {
   pub const MERGE_OBTUSE: EffortFlags = EffortFlags(0x004);
 
   /// Redraw a very short pad to pad connection as a plain L. Port of
-  /// `FANOUT_CLEANUP = 0x08`, `pcbnew/router/pns_optimizer.h:102`.
+  /// `FANOUT_CLEANUP = 0x08`, `pcbnew/router/pns_optimizer.h:102`, which
+  /// selects [`Optimizer::fanout_cleanup`].
   ///
-  /// **Not implemented yet**, like [`EffortFlags::SMART_PADS`].
+  /// The line placer asks for it on its own, as the whole effort level of
+  /// `optimizeTailHeadTransition` (`pcbnew/router/pns_line_placer.cpp:1046`),
+  /// with a note that it can override the user's posture choice.
   pub const FANOUT_CLEANUP: EffortFlags = EffortFlags(0x008);
 
   /// Refuse a bypass that would swallow another net's pad. Port of
@@ -810,6 +831,541 @@ fn shape_index(seg: &Seg) -> usize {
 }
 
 // ---------------------------------------------------------------------
+// Pads and breakouts
+// ---------------------------------------------------------------------
+
+/// The exits a pad or via offers, in the order they are tried.
+///
+/// Port of the `BREAKOUT_LIST` typedef,
+/// `pcbnew/router/pns_optimizer.h:161`. Each chain starts at the pad's
+/// centre and ends where the trace is allowed to leave it, so the first
+/// point of every entry is the same and the list is ordered: the
+/// selection in [`Optimizer::smart_pads_single`] breaks a cost tie on
+/// breakout length, and among breakouts of equal length the earlier entry
+/// wins, so the order below is part of the answer.
+pub type BreakoutList = Vec<LineChain>;
+
+/// The corners smart pads refuses to build.
+///
+/// Port of the `ForbiddenAngles` local of
+/// `pcbnew/router/pns_optimizer.cpp:1114`. A breakout to connection
+/// corner in this set is dropped, and so is a whole candidate that
+/// contains one anywhere.
+pub const FORBIDDEN_ANGLES: AngleType = AngleType::ACUTE
+  .union(AngleType::RIGHT)
+  .union(AngleType::HALF_FULL)
+  .union(AngleType::UNDEFINED);
+
+/// How far along the line from a pad smart pads is allowed to rewrite.
+///
+/// Port of the `3` of `pcbnew/router/pns_optimizer.cpp:1133` and `:1246`,
+/// a point index and not a segment count.
+pub const SMART_PADS_MAX_VERTEX: isize = 3;
+
+/// How many track widths long a line may be and still be a fanout.
+///
+/// Port of the `aLine->Width() * 10` threshold of
+/// `pcbnew/router/pns_optimizer.cpp:1285`.
+pub const FANOUT_CLEANUP_WIDTH_FACTOR: i64 = 10;
+
+/// How many rays [`circle_breakouts`] casts.
+///
+/// Port of the `angle < ANGLE_360; angle += ANGLE_45` loop of
+/// `pcbnew/router/pns_optimizer.cpp:924`, which is eight steps whether or
+/// not diagonals were asked for.
+pub const CIRCLE_BREAKOUT_COUNT: usize = 8;
+
+/// How much longer than half the longer bounding box side a
+/// [`custom_breakouts`] ray is cast, in nanometres.
+///
+/// Port of the `+ 5` of `pcbnew/router/pns_optimizer.cpp:951`, whose
+/// comment says the ray "must be large enough to guarantee intersecting
+/// the convex polygon". It is not: half a side falls short of half a
+/// diagonal, so on an axis aligned square the four diagonal rays stop
+/// inside the polygon. See [`custom_breakouts`].
+pub const CUSTOM_BREAKOUT_RAY_MARGIN: i64 = 5;
+
+/// A full turn in degrees, the bound of every breakout loop.
+const FULL_TURN_DEGREES: f64 = 360.0;
+
+/// The angular step between two breakouts when diagonals are permitted.
+const DIAGONAL_STEP_DEGREES: f64 = 45.0;
+
+/// The angular step between two breakouts when they are not.
+const ORTHOGONAL_STEP_DEGREES: f64 = 90.0;
+
+/// An angle folded into `[0, 360)` degrees.
+///
+/// Port of `EDA_ANGLE::Normalize`,
+/// `libs/kimath/include/geometry/eda_angle.h:229`, whose first loop tests
+/// against `-0.0`. That comparison is the same as one against `0.0` in
+/// IEEE arithmetic, so a negative zero survives it, which is what makes
+/// `RotatePoint` take its "no rotation" branch for `-ANGLE_0`.
+fn normalize_degrees(degrees: f64) -> f64 {
+  let mut value = degrees;
+
+  while value < -0.0 {
+    value += FULL_TURN_DEGREES;
+  }
+
+  while value >= FULL_TURN_DEGREES {
+    value -= FULL_TURN_DEGREES;
+  }
+
+  value
+}
+
+/// The sine of an angle in degrees.
+///
+/// Port of `EDA_ANGLE::Sin`,
+/// `libs/kimath/include/geometry/eda_angle.h:178`. The eight multiples of
+/// 45 degrees are answered from a table so that they are exact; anything
+/// else goes through `sin`, and it goes through it on the **unnormalized**
+/// value, because KiCad normalizes a copy for the table lookup and then
+/// calls `AsRadians()` on `this` (`:193`). Every angle the breakout
+/// builders use is in the table, so the fallback is unreachable from this
+/// module.
+fn angle_sin(degrees: f64) -> f64 {
+  let normalized = normalize_degrees(degrees);
+
+  if normalized == 0.0 || normalized == 180.0 {
+    0.0
+  } else if normalized == 45.0 || normalized == 135.0 {
+    std::f64::consts::FRAC_1_SQRT_2
+  } else if normalized == 225.0 || normalized == 315.0 {
+    -std::f64::consts::FRAC_1_SQRT_2
+  } else if normalized == 90.0 {
+    1.0
+  } else if normalized == 270.0 {
+    -1.0
+  } else {
+    degrees.to_radians().sin()
+  }
+}
+
+/// The cosine of an angle in degrees.
+///
+/// Port of `EDA_ANGLE::Cos`,
+/// `libs/kimath/include/geometry/eda_angle.h:197`; see [`angle_sin`] for
+/// the table and for the unnormalized fallback.
+fn angle_cos(degrees: f64) -> f64 {
+  let normalized = normalize_degrees(degrees);
+
+  if normalized == 0.0 {
+    1.0
+  } else if normalized == 180.0 {
+    -1.0
+  } else if normalized == 90.0 || normalized == 270.0 {
+    0.0
+  } else if normalized == 45.0 || normalized == 315.0 {
+    std::f64::consts::FRAC_1_SQRT_2
+  } else if normalized == 135.0 || normalized == 225.0 {
+    -std::f64::consts::FRAC_1_SQRT_2
+  } else {
+    degrees.to_radians().cos()
+  }
+}
+
+/// A point turned about the origin.
+///
+/// Port of `RotatePoint( int*, int*, const EDA_ANGLE& )`,
+/// `libs/kimath/src/trigo.cpp:225`, including its four exact quadrant
+/// cases. The rotation is clockwise in a y down coordinate system, which
+/// is why the breakout builders pass a negated angle.
+///
+/// Deviation: none in value. KiCad multiplies an `int` by a `double` and
+/// rounds with `KiROUND`; this widens to `f64` and rounds with
+/// [`kiround`], which is the same operation. The crate otherwise avoids
+/// `f64` where KiCad uses integers (`DESIGN.md` section 2), but here
+/// KiCad's own arithmetic is floating point and reproducing the exact
+/// breakout coordinates requires reproducing it.
+fn rotate_point(point: Vec2, degrees: f64) -> Vec2 {
+  let normalized = normalize_degrees(degrees);
+
+  // :233. The cheap exact cases.
+  if normalized == 0.0 {
+    return point;
+  }
+
+  if normalized == 90.0 {
+    return Vec2::new(point.y, -point.x);
+  }
+
+  if normalized == 180.0 {
+    return Vec2::new(-point.x, -point.y);
+  }
+
+  if normalized == 270.0 {
+    return Vec2::new(-point.y, point.x);
+  }
+
+  // :250
+  let sinus = angle_sin(degrees);
+  let cosinus = angle_cos(degrees);
+
+  Vec2::new(
+    kiround(f64::from(point.y) * sinus + f64::from(point.x) * cosinus),
+    kiround(f64::from(point.y) * cosinus - f64::from(point.x) * sinus),
+  )
+}
+
+/// A point turned about a centre.
+///
+/// Port of `RotatePoint( VECTOR2I&, const VECTOR2I&, const EDA_ANGLE& )`,
+/// `libs/kimath/include/trigo.h:88`, which translates, rotates and
+/// translates back.
+fn rotate_point_about(point: Vec2, center: Vec2, degrees: f64) -> Vec2 {
+  center + rotate_point(point - center, degrees)
+}
+
+/// The pad or via a line ends on, if there is one.
+///
+/// Port of `OPTIMIZER::findPadOrVia`,
+/// `pcbnew/router/pns_optimizer.cpp:1093`: the joint at the point, then
+/// the **first** link of that joint that is a via or a solid.
+///
+/// # The link order matters
+///
+/// Note 04 section 9 item 7 flags this as one of the places KiCad's
+/// answer depends on container order: a point carrying both a pad and a
+/// via resolves to whichever was linked first, and the two give different
+/// breakout lists, so the whole smart pads pass can turn on it. KiCad's
+/// `JOINT::LinkList` is a `std::vector<ITEM*>` in insertion order
+/// (`pcbnew/router/pns_joint.h:303`) whose insertion order is inherited
+/// from a hash set walk in `NODE::Commit`
+/// (`pcbnew/router/pns_node.cpp:1630`), so it is stable within a session
+/// and arbitrary across builds. Here [`crate::joint::Joint::links`] is a
+/// `Vec` in insertion order too, and the order the world inserts in is
+/// the caller's, so the answer is reproducible; `DESIGN.md` section 8
+/// asks for exactly that.
+///
+/// # Deviation
+///
+/// KiCad's signature is `findPadOrVia( int aLayer, NET_HANDLE aNet, const
+/// VECTOR2I& aP )` and it reads the node off `m_world`. The world and the
+/// node are explicit here because this is a free function rather than a
+/// method, and the net is explicit for the same reason it is there:
+/// [`World::find_joint`] keys joints by position **and** net, so it
+/// cannot be dropped.
+pub fn find_pad_or_via(
+  world: &World,
+  node: NodeId,
+  layer: i32,
+  net: Option<NetId>,
+  position: Vec2,
+) -> Option<ItemId> {
+  // :1095
+  let reference = world.find_joint(node, position, layer, net)?;
+  let joint = world.joint(reference)?;
+
+  // :1100
+  joint.links().iter().copied().find(|id| {
+    world
+      .item(*id)
+      .is_some_and(|item| item.of_kind(Kind::VIA | Kind::SOLID))
+  })
+}
+
+/// The eight exits of a round pad or a via.
+///
+/// Port of `OPTIMIZER::circleBreakouts`,
+/// `pcbnew/router/pns_optimizer.cpp:919`. Eight rays from the centre at
+/// 45 degree steps, each of length `radius * sqrt(2)` truncated to a
+/// whole nanometre, so the four axis aligned ones end outside the copper
+/// and the four diagonal ones end on the corner of the bounding box, at
+/// distance `radius` in each axis.
+///
+/// `permit_diagonal` is accepted and **ignored**, as it is in KiCad
+/// (`:924` has no branch on it), so a round pad always offers all eight.
+/// `width` is ignored too: a circle's breakout length does not depend on
+/// the track.
+///
+/// A shape that is not a [`Shape::Circle`] gives an empty list, where
+/// KiCad `static_cast`s whatever it was handed.
+pub fn circle_breakouts(
+  width: i32,
+  shape: &Shape,
+  permit_diagonal: bool,
+) -> BreakoutList {
+  // Both are KiCad's unused parameters; see the doc comment.
+  let _ = (width, permit_diagonal);
+
+  let Shape::Circle { center, radius } = shape else {
+    return BreakoutList::new();
+  };
+
+  // :929. `VECTOR2I( double, int )` truncates towards zero.
+  let ray =
+    Vec2::new((f64::from(*radius) * std::f64::consts::SQRT_2) as i32, 0);
+
+  (0..CIRCLE_BREAKOUT_COUNT)
+    .map(|step| {
+      // :924, :931. KiCad accumulates `angle += ANGLE_45`; the multiple is
+      // the same value in binary floating point and does not drift.
+      let degrees = DIAGONAL_STEP_DEGREES * step as f64;
+
+      LineChain::from_slice(
+        &[*center, *center + rotate_point(ray, -degrees)],
+        false,
+      )
+    })
+    .collect()
+}
+
+/// The four or eight exits of a rectangular pad.
+///
+/// Port of `OPTIMIZER::rectBreakouts`,
+/// `pcbnew/router/pns_optimizer.cpp:988`.
+///
+/// The four orthogonal exits are single segments from the centre to
+/// `size / 2 + width` along each axis, so they clear the copper by a full
+/// track width. They come first and in the order east, west, south,
+/// north (`+x`, `-x`, `+y`, `-y`).
+///
+/// The four diagonal exits are two segment chains: first a run of
+/// `d_offset` along the pad's long axis, then a 45 degree leg of
+/// `width + min(size.x, size.y) / 2` in each axis. `d_offset` is half the
+/// difference between the two sides, so on an oblong pad the diagonals
+/// leave from the ends of the long axis rather than from the middle,
+/// which is what the tie break in [`Optimizer::smart_pads_single`] is
+/// there to prefer. On a square pad `d_offset` is zero and the first
+/// point is repeated, exactly as in KiCad.
+///
+/// The two branches at `:1008` and `:1021` emit the same four diagonals
+/// in **different orders**; that is transcribed rather than tidied,
+/// because the order decides which of two equal cost, equal length
+/// candidates wins.
+///
+/// # Orientation
+///
+/// A [`Shape::Rect`] is axis aligned by construction, here and in KiCad
+/// (`libs/kimath/include/geometry/shape_rect.h:34`), and this routine
+/// reads only its origin and size. [`crate::item::Solid`] carries an
+/// orientation (`pcbnew/router/pns_solid.h:162`) and **nothing here reads
+/// it**: a rotated rectangular pad reaches the router as a
+/// [`Shape::Simple`] polygon and goes to [`custom_breakouts`] instead.
+/// The only pad property the smart pads pass reads off the solid is the
+/// offset, at `pcbnew/router/pns_optimizer.cpp:1123`.
+///
+/// A shape that is not a [`Shape::Rect`] gives an empty list.
+pub fn rect_breakouts(
+  width: i32,
+  shape: &Shape,
+  permit_diagonal: bool,
+) -> BreakoutList {
+  let Shape::Rect { origin, size, .. } = shape else {
+    return BreakoutList::new();
+  };
+
+  // :991
+  let size = *size;
+  let center = *origin + Vec2::new(size.x / 2, size.y / 2);
+
+  // :998. Half the difference between the sides, along the longer one.
+  let offset = Vec2::new(
+    if size.x > size.y {
+      (size.x - size.y) / 2
+    } else {
+      0
+    },
+    if size.x < size.y {
+      (size.y - size.x) / 2
+    } else {
+      0
+    },
+  );
+
+  // :1003
+  let vertical = Vec2::new(0, size.y / 2 + width);
+  let horizontal = Vec2::new(size.x / 2 + width, 0);
+
+  let mut breakouts = BreakoutList::with_capacity(12);
+
+  // :1006
+  breakouts.push(LineChain::from_slice(&[center, center + horizontal], false));
+  breakouts.push(LineChain::from_slice(&[center, center - horizontal], false));
+  breakouts.push(LineChain::from_slice(&[center, center + vertical], false));
+  breakouts.push(LineChain::from_slice(&[center, center - vertical], false));
+
+  if !permit_diagonal {
+    return breakouts;
+  }
+
+  // :1013
+  let leg = width + size.x.min(size.y) / 2;
+  let mut diagonal = |corner: Vec2, tip: Vec2| {
+    breakouts.push(LineChain::from_slice(
+      &[center, corner, corner + tip],
+      false,
+    ));
+  };
+
+  if size.x >= size.y {
+    // :1017
+    diagonal(center + offset, Vec2::new(leg, leg));
+    diagonal(center + offset, Vec2::new(leg, -leg));
+    diagonal(center - offset, Vec2::new(-leg, leg));
+    diagonal(center - offset, Vec2::new(-leg, -leg));
+  } else {
+    // :1029, the same four with the middle two swapped.
+    diagonal(center + offset, Vec2::new(leg, leg));
+    diagonal(center - offset, Vec2::new(leg, -leg));
+    diagonal(center + offset, Vec2::new(-leg, leg));
+    diagonal(center - offset, Vec2::new(-leg, -leg));
+  }
+
+  breakouts
+}
+
+/// The exits of a polygonal pad.
+///
+/// Port of `OPTIMIZER::customBreakouts`,
+/// `pcbnew/router/pns_optimizer.cpp:942`. A ray is cast from the pad's
+/// **position** every 45 degrees, or every 90 when `permit_diagonal` is
+/// false, and the first point where it crosses the polygon boundary
+/// becomes the breakout endpoint. A ray that misses contributes nothing,
+/// so the list can be shorter than eight or four; KiCad's comment at
+/// `:963` says it does not believe a miss can happen.
+///
+/// It can. The ray is only `max(bbox side) / 2 + 5` long
+/// ([`CUSTOM_BREAKOUT_RAY_MARGIN`]), which is half a side and not half a
+/// diagonal, so on an axis aligned square pad the four diagonal rays end
+/// inside the copper and that pad silently offers four exits instead of
+/// eight. Reproduced, and pinned by a test.
+///
+/// KiCad has three endpoint formulas here, two of them commented out
+/// (`:967`, `:970`): a fraction of the centre to edge distance and a
+/// fixed 0.1 mm stand off. The live one puts the breakout exactly on the
+/// polygon edge and that is the one ported.
+///
+/// `width` is accepted and unused, as in KiCad.
+///
+/// The pad's centre is [`crate::item::Solid::pos`], which is **not**
+/// necessarily inside the polygon and is not the polygon's centroid;
+/// KiCad reads the same field (`:948`).
+///
+/// An item that is not a solid carrying a [`Shape::Simple`] gives an
+/// empty list.
+pub fn custom_breakouts(
+  width: i32,
+  item: &Item,
+  permit_diagonal: bool,
+) -> BreakoutList {
+  // KiCad's unused parameter.
+  let _ = width;
+
+  let ItemBody::Solid(solid) = item.body() else {
+    return BreakoutList::new();
+  };
+  let Some(Shape::Simple(convex)) = solid.shape() else {
+    return BreakoutList::new();
+  };
+  let Some(bbox) = convex.bbox(0) else {
+    return BreakoutList::new();
+  };
+
+  // :948
+  let center = solid.pos();
+
+  // :951
+  let length = i32::try_from(
+    bbox.width().max(bbox.height()) / 2 + CUSTOM_BREAKOUT_RAY_MARGIN,
+  )
+  .unwrap_or(i32::MAX);
+
+  // :952
+  let (step, count) = if permit_diagonal {
+    (DIAGONAL_STEP_DEGREES, CIRCLE_BREAKOUT_COUNT)
+  } else {
+    (ORTHOGONAL_STEP_DEGREES, CIRCLE_BREAKOUT_COUNT / 2)
+  };
+
+  let mut breakouts = BreakoutList::new();
+
+  for index in 0..count {
+    let degrees = step * index as f64;
+
+    // :956
+    let tip =
+      rotate_point_about(center + Vec2::new(length, 0), center, -degrees);
+
+    // :961
+    let intersections = convex.vertices().intersect_seg(&Seg::new(center, tip));
+
+    // :966. Entry zero is the nearest to the ray's origin.
+    if let Some(first) = intersections.first() {
+      breakouts.push(LineChain::from_slice(&[center, first.point], false));
+    }
+  }
+
+  breakouts
+}
+
+/// Every exit a pad or via offers.
+///
+/// Port of `OPTIMIZER::computeBreakouts`,
+/// `pcbnew/router/pns_optimizer.cpp:1044`, the dispatcher on the item's
+/// kind and then on its shape:
+///
+/// | item | shape | generator |
+/// | --- | --- | --- |
+/// | via | any | [`circle_breakouts`] on the layer 0 padstack circle |
+/// | solid | [`Shape::Rect`] | [`rect_breakouts`] |
+/// | solid | [`Shape::Segment`] | [`rect_breakouts`] over [`approximate_segment_as_rect`] |
+/// | solid | [`Shape::Circle`] | [`circle_breakouts`] |
+/// | solid | [`Shape::Simple`] | [`custom_breakouts`] |
+///
+/// Everything else, a [`Shape::Compound`] complex pad included, gives an
+/// empty list and therefore no smart exit at all. That is KiCad's
+/// `default: break` at `:1078` and it is deliberate here: inventing a
+/// breakout set for a compound would change routing answers against
+/// KiCad with no fixture to justify it.
+///
+/// The via branch asks the padstack for layer 0, carrying KiCad's
+/// "TODO(JE) padstacks -- computeBreakouts needs to have a layer
+/// argument" at `:1052` with it. It is unreachable from
+/// [`Optimizer::run_smart_pads`], which refuses vias one step earlier
+/// (`:1128`), and reachable from a caller that asks directly.
+pub fn compute_breakouts(
+  width: i32,
+  item: &Item,
+  permit_diagonal: bool,
+) -> BreakoutList {
+  match item.body() {
+    // :1049
+    ItemBody::Via(via) => {
+      circle_breakouts(width, &via.shape(item.layers(), 0), permit_diagonal)
+    }
+    // :1056
+    ItemBody::Solid(solid) => match solid.shape() {
+      // :1062
+      Some(shape @ Shape::Rect { .. }) => {
+        rect_breakouts(width, shape, permit_diagonal)
+      }
+      // :1065
+      Some(Shape::Segment {
+        seg,
+        width: segment_width,
+      }) => rect_breakouts(
+        width,
+        &approximate_segment_as_rect(seg, *segment_width),
+        permit_diagonal,
+      ),
+      // :1072
+      Some(shape @ Shape::Circle { .. }) => {
+        circle_breakouts(width, shape, permit_diagonal)
+      }
+      // :1075
+      Some(Shape::Simple(_)) => custom_breakouts(width, item, permit_diagonal),
+      // :1078
+      _ => BreakoutList::new(),
+    },
+    // :1086
+    _ => BreakoutList::new(),
+  }
+}
+
+// ---------------------------------------------------------------------
 // Optimizer
 // ---------------------------------------------------------------------
 
@@ -1135,8 +1691,17 @@ impl Optimizer {
       changed |= self.merge_colinear(result);
     }
 
-    // :724 and :728. `runSmartPads` and `fanoutCleanup` are the next work
-    // item; their flags are accepted and skipped.
+    // :724. This one reports "changed" for any line of three points or
+    // more, whether or not it moved anything; see
+    // `Optimizer::run_smart_pads`.
+    if self.effort.contains(EffortFlags::SMART_PADS) {
+      changed |= self.run_smart_pads(world, context, result);
+    }
+
+    // :728
+    if self.effort.contains(EffortFlags::FANOUT_CLEANUP) {
+      changed |= self.fanout_cleanup(world, context, result);
+    }
 
     changed
   }
@@ -1635,11 +2200,441 @@ impl Optimizer {
 
     chain.segment_count() < segments_before
   }
+
+  /// Redraw the exit from one pad so that the trace leaves it cleanly.
+  ///
+  /// Port of `OPTIMIZER::smartPadsSingle`,
+  /// `pcbnew/router/pns_optimizer.cpp:1110`. It builds every combination
+  /// of a breakout from the pad and a two segment connection from that
+  /// breakout back onto the line, keeps the ones that have no forbidden
+  /// corner anywhere, and picks the cheapest of those that does not
+  /// collide. The answer is the point index the winner rejoined the line
+  /// at, which [`Optimizer::run_smart_pads`] spends out of the budget for
+  /// the other end, or [`None`] for KiCad's `-1`.
+  ///
+  /// `at_end` is KiCad's `aEnd`: with it set the line is reversed first,
+  /// so that "the pad" is always at point zero, and the winner is
+  /// reversed back before it is stored.
+  ///
+  /// `end_vertex` is KiCad's `aEndVertex` and is signed because
+  /// [`Optimizer::run_smart_pads`] can compute a negative budget for the
+  /// far end; the loop then simply does not run.
+  ///
+  /// # What it refuses outright
+  ///
+  /// A pad whose copper is offset from its centre (`:1123`), because
+  /// every breakout starts at the centre and would begin outside the
+  /// copper. And a via (`:1128`), with KiCad's reason transcribed: vias
+  /// are round, so the eight breakouts are indistinguishable and the pass
+  /// would only destroy a deliberate via exit posture. That is why
+  /// [`compute_breakouts`]'s via branch is unreachable from here.
+  ///
+  /// # The tie break
+  ///
+  /// The baseline cost is the cost of the line the user drew (`:1193`),
+  /// so a candidate has to be strictly better to win. Equal cost
+  /// candidates are then ordered by **breakout** length, longest first
+  /// (`:1207`), which on an oblong pad picks the exit that runs along the
+  /// pad's long axis before leaving. KiCad's comment at `:1188` explains
+  /// it: a track should not leave an oblong pad from its short side and
+  /// then run alongside it.
+  ///
+  /// # Two quirks reproduced
+  ///
+  /// The connection is built with `diag == 0` as the diagonal first flag
+  /// (`:1151`), so posture 0 is the diagonal one here where it is the
+  /// straight one in [`Optimizer::merge_step`] and in
+  /// [`Optimizer::fanout_cleanup`]. And the connection is built with no
+  /// corner mode argument, so it always uses
+  /// [`crate::geometry::direction45::CornerMode::Mitered45`] even when
+  /// the board is being routed at 90 degrees; the line placer works
+  /// around that by not asking for [`EffortFlags::SMART_PADS`] in the 90
+  /// degree modes at all (`pcbnew/router/pns_line_placer.cpp:762`).
+  ///
+  /// # Deviation
+  ///
+  /// KiCad widens the running longest breakout with
+  /// `std::max<int>( len, max_length )` (`:1213`), narrowing a
+  /// `long long` to `int` on the way in. The comparison one line above is
+  /// done at full width, so the narrowing only matters for a breakout
+  /// longer than `i32::MAX` nanometres, that is two metres. This keeps
+  /// the full width.
+  pub fn smart_pads_single(
+    &self,
+    world: &World,
+    context: &AlgoContext<'_>,
+    line: &mut Line,
+    pad: ItemId,
+    at_end: bool,
+    end_vertex: isize,
+  ) -> Option<usize> {
+    let pad_item = world.item(pad)?;
+    let solid = match pad_item.body() {
+      ItemBody::Solid(solid) => Some(solid),
+      _ => None,
+    };
+
+    // :1123
+    if let Some(solid) = solid
+      && solid.offset() != Vec2::new(0, 0)
+    {
+      return None;
+    }
+
+    // :1128
+    if pad_item.of_kind(Kind::VIA) {
+      return None;
+    }
+
+    // :1131
+    let breakouts = compute_breakouts(line.width(), pad_item, true);
+
+    // :1132. With `at_end` the pad is put at point zero.
+    let path = if at_end {
+      line.shape().reversed()
+    } else {
+      line.shape().clone()
+    };
+
+    // :1133
+    let last_vertex = end_vertex
+      .min(SMART_PADS_MAX_VERTEX.min(path.point_count() as isize - 1));
+
+    // Every accepted rewrite: where it rejoined, how long its breakout
+    // was, and the whole candidate in the line's own direction.
+    let mut variants: Vec<(usize, i64, LineChain)> = Vec::new();
+    let path_length = path.length();
+
+    // :1136. Point zero is the pad connection itself, so start at one.
+    for vertex in 1..=last_vertex.max(0) {
+      let vertex = vertex as usize;
+
+      // :1139. When the span from the pad out to this vertex does not
+      // even touch the copper, the line has already left the pad and
+      // there is nothing to redraw from here.
+      if let Some(shape) = solid.and_then(Solid::shape)
+        && collide_seg(
+          shape,
+          &Seg::new(path.point(0), path.point(vertex)),
+          line.width() / 2,
+        )
+        .is_none()
+      {
+        continue;
+      }
+
+      for breakout in &breakouts {
+        // :1153. The direction the breakout leaves in.
+        let Some(last) = breakout.segment_count().checked_sub(1) else {
+          continue;
+        };
+        let Some(exit) = breakout.last_point() else {
+          continue;
+        };
+        let breakout_direction =
+          Direction45::from_seg(&breakout.segment(last), false);
+
+        for posture in 0..POSTURE_COUNT {
+          // :1150. Note the inverted posture flag, see the doc comment.
+          let connection = LineChain::from_points(
+            Direction45::default().build_initial_trace(
+              exit,
+              path.point(vertex),
+              posture == 0,
+              CornerMode::Mitered45,
+            ),
+            false,
+          );
+
+          // :1155
+          if connection.segment_count() == 0 {
+            continue;
+          }
+
+          // :1159
+          if breakout_direction
+            .angle(Direction45::from_seg(&connection.segment(0), false))
+            .intersects(FORBIDDEN_ANGLES)
+          {
+            continue;
+          }
+
+          // :1164. A breakout longer than the whole line is not an exit.
+          let breakout_length = breakout.length();
+
+          if breakout_length > path_length {
+            continue;
+          }
+
+          // :1166
+          let mut candidate = breakout.clone();
+
+          candidate.append_chain(&connection);
+
+          for index in vertex + 1..path.point_count() {
+            candidate.append(path.point(index));
+          }
+
+          // :1172
+          if Line::with_chain(line, candidate.clone())
+            .count_corners(FORBIDDEN_ANGLES)
+            != 0
+          {
+            continue;
+          }
+
+          // :1177
+          let mut stored = if at_end {
+            candidate.reversed()
+          } else {
+            candidate
+          };
+
+          stored.simplify2(true);
+          variants.push((vertex, breakout_length, stored));
+        }
+      }
+    }
+
+    // :1193. The line the user drew is the baseline to beat.
+    let mut min_cost = CostEstimator::corner_cost_of_line(line);
+    let mut max_length: i64 = 0;
+    let mut best: Option<(usize, LineChain)> = None;
+
+    // :1199
+    for (vertex, breakout_length, candidate) in &variants {
+      let cost = CostEstimator::corner_cost_of_chain(candidate);
+
+      // :1205
+      if self.check_colliding_path(world, context, line, candidate) {
+        continue;
+      }
+
+      // :1207
+      if cost < min_cost || (cost == min_cost && *breakout_length > max_length)
+      {
+        best = Some((*vertex, candidate.clone()));
+
+        if cost <= min_cost {
+          max_length = max_length.max(*breakout_length);
+        }
+
+        min_cost = min_cost.min(cost);
+      }
+    }
+
+    // :1221
+    let (vertex, shape) = best?;
+
+    line.set_shape(shape);
+
+    Some(vertex)
+  }
+
+  /// Redraw the exits from the pads at both ends of a line.
+  ///
+  /// Port of `OPTIMIZER::runSmartPads`,
+  /// `pcbnew/router/pns_optimizer.cpp:1231`. The start pad is rewritten
+  /// first, with a budget of [`SMART_PADS_MAX_VERTEX`] points; the end
+  /// pad then gets whatever is left of the line, minus what the start
+  /// pass consumed.
+  ///
+  /// # It always reports "changed"
+  ///
+  /// The `return true` at `:1254` is unconditional: as long as the line
+  /// has three points, this pass reports that it changed something even
+  /// when both ends had no pad and nothing was touched. It is transcribed
+  /// as it stands, so [`Optimizer::optimize`] answers `true` for any
+  /// effort level containing [`EffortFlags::SMART_PADS`] over a line of
+  /// three points or more, exactly as KiCad's `rv |= runSmartPads` does.
+  /// That matters to callers that only write the result back on a `true`
+  /// answer, such as `SHOVE::runOptimizer`
+  /// (`pcbnew/router/pns_shove.cpp:2121`): asking for this flag makes
+  /// them always write back.
+  ///
+  /// # The budget is read after the first pass
+  ///
+  /// KiCad holds `line` as a reference into the line's own chain
+  /// (`:1233`), so the `line.PointCount()` at `:1250` is the count
+  /// **after** the start pass rewrote it, not the one the pass started
+  /// with. That is reproduced by reading [`Line::point_count`] again, and
+  /// it is why the budget can come out negative and why
+  /// [`Optimizer::smart_pads_single`] takes a signed one.
+  pub fn run_smart_pads(
+    &self,
+    world: &World,
+    context: &AlgoContext<'_>,
+    line: &mut Line,
+  ) -> bool {
+    // :1235
+    if line.point_count() < 3 {
+      return false;
+    }
+
+    let start_point = line.point(0);
+    let Some(end_point) = line.last_point() else {
+      return false;
+    };
+
+    // :1240
+    let start_pad =
+      find_pad_or_via(world, self.node, line.layer(), line.net(), start_point);
+    let end_pad =
+      find_pad_or_via(world, self.node, line.layer(), line.net(), end_point);
+
+    // :1244
+    let mut spent = None;
+
+    // :1245
+    if let Some(pad) = start_pad {
+      spent = self.smart_pads_single(
+        world,
+        context,
+        line,
+        pad,
+        false,
+        SMART_PADS_MAX_VERTEX,
+      );
+    }
+
+    // :1248
+    if let Some(pad) = end_pad {
+      let remaining = line.point_count() as isize - 1;
+      let budget = match spent {
+        None => remaining,
+        Some(vertex) => remaining - vertex as isize,
+      };
+
+      self.smart_pads_single(world, context, line, pad, true, budget);
+    }
+
+    // :1252
+    line.chain_mut().simplify2(true);
+
+    // :1254
+    true
+  }
+
+  /// Redraw a very short pad to pad or pad to via connection as a plain
+  /// two segment trace.
+  ///
+  /// Port of `OPTIMIZER::fanoutCleanup`,
+  /// `pcbnew/router/pns_optimizer.cpp:1273`. When both ends of a line sit
+  /// on a pad or a via, or the far end carries the line's own via, and
+  /// the line is shorter than [`FANOUT_CLEANUP_WIDTH_FACTOR`] track
+  /// widths, the whole thing is replaced by whichever of the two
+  /// [`Direction45::build_initial_trace`] postures does not collide. This
+  /// is the "two pads next to each other, just draw the L" cleanup, and
+  /// it is why the line placer notes that the flag can override the
+  /// user's posture choice (`pcbnew/router/pns_line_placer.cpp:1044`).
+  ///
+  /// The corner mode comes from
+  /// [`crate::settings::RoutingSettings::corner_mode`] off `context`,
+  /// where KiCad reads it off the router singleton at `:1278`; that
+  /// singleton use is the one note 04 section 9.3 names as making the
+  /// routine untestable in C++.
+  ///
+  /// # The start end asymmetry
+  ///
+  /// A missing pad at the **start** ends the pass (`:1288`), while a
+  /// missing one at the end falls back to [`Line::ends_with_via`]
+  /// (`:1300`). So a line that starts in open copper is never cleaned up
+  /// even if it ends on a pad. That is KiCad's and it is reproduced.
+  ///
+  /// `start_match` is a second kind test on an item
+  /// [`find_pad_or_via`] already filtered by kind, so it is always true;
+  /// it is written out because KiCad writes it out.
+  ///
+  /// # Deviation
+  ///
+  /// KiCad holds both the length and the threshold in `int` (`:1285`,
+  /// `:1286`), which wraps for a line longer than two metres. Both are
+  /// `i64` here.
+  pub fn fanout_cleanup(
+    &self,
+    world: &World,
+    context: &AlgoContext<'_>,
+    line: &mut Line,
+  ) -> bool {
+    // :1275
+    if line.point_count() < 3 {
+      return false;
+    }
+
+    // :1278
+    let corner_mode = context.settings.corner_mode;
+
+    // :1280
+    let start_point = line.point(0);
+    let Some(end_point) = line.last_point() else {
+      return false;
+    };
+
+    let start_pad =
+      find_pad_or_via(world, self.node, line.layer(), line.net(), start_point);
+    let end_pad =
+      find_pad_or_via(world, self.node, line.layer(), line.net(), end_point);
+
+    // :1285
+    let threshold = i64::from(line.width()) * FANOUT_CLEANUP_WIDTH_FACTOR;
+    let length = line.shape().length();
+
+    // :1288
+    let Some(start_pad) = start_pad else {
+      return false;
+    };
+
+    // :1291
+    let start_match = world
+      .item(start_pad)
+      .is_some_and(|item| item.of_kind(Kind::VIA | Kind::SOLID));
+
+    // :1294
+    let end_match = match end_pad {
+      Some(pad) => world
+        .item(pad)
+        .is_some_and(|item| item.of_kind(Kind::VIA | Kind::SOLID)),
+      None => line.ends_with_via(),
+    };
+
+    // :1303
+    if !(start_match && end_match && length < threshold) {
+      return false;
+    }
+
+    // :1305. Posture 0 is straight leg first, posture 1 diagonal first,
+    // the same way round as in `merge_step` and the other way round from
+    // `smart_pads_single`.
+    for posture in 0..POSTURE_COUNT {
+      let candidate = LineChain::from_points(
+        Direction45::default().build_initial_trace(
+          start_point,
+          end_point,
+          posture == 1,
+          corner_mode,
+        ),
+        false,
+      );
+      let replacement = Line::with_chain(line, candidate);
+
+      // :1311
+      if !self.check_colliding(world, context, &replacement) {
+        line.set_shape(replacement.shape().clone());
+
+        return true;
+      }
+    }
+
+    false
+  }
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::item::{LayerRange, Segment, Via, ViaType};
+  use crate::rules::FixedClearance;
+  use crate::settings::RoutingSettings;
 
   /// A two point segment at the given coordinates.
   fn seg(x1: i32, y1: i32, x2: i32, y2: i32) -> Seg {
@@ -1858,5 +2853,507 @@ mod tests {
 
     assert_eq!(optimizer.effort_level(), EffortFlags::RESTRICT_VERTEX_RANGE);
     assert!(optimizer.constraints().is_empty());
+  }
+
+  // -----------------------------------------------------------------
+  // Pads and breakouts
+  // -----------------------------------------------------------------
+
+  /// A pad centred on a point, on one layer and one net.
+  fn pad(world: &mut World, shape: Shape, at: Vec2, layer: i32) -> ItemId {
+    let body = ItemBody::Solid(Solid::new(shape, at));
+    let mut item = world.make_item(body);
+
+    item.set_layers_and_flash_all(LayerRange::single(layer));
+    item.set_net(Some(NetId(1)));
+
+    let root = world.root();
+
+    world.add_solid(root, item, None)
+  }
+
+  /// The endpoints of a breakout list, which is what the hand computed
+  /// tables below pin.
+  fn ends(breakouts: &BreakoutList) -> Vec<Vec2> {
+    breakouts
+      .iter()
+      .map(|chain| chain.last_point().expect("a breakout has points"))
+      .collect()
+  }
+
+  #[test]
+  fn rotate_point_reproduces_kicads_four_exact_quadrants() {
+    let point = Vec2::new(1000, 0);
+
+    assert_eq!(rotate_point(point, 0.0), Vec2::new(1000, 0));
+    assert_eq!(rotate_point(point, -0.0), Vec2::new(1000, 0));
+    assert_eq!(rotate_point(point, 90.0), Vec2::new(0, -1000));
+    assert_eq!(rotate_point(point, 180.0), Vec2::new(-1000, 0));
+    assert_eq!(rotate_point(point, 270.0), Vec2::new(0, 1000));
+    // A full turn normalizes back onto the "no rotation" branch.
+    assert_eq!(rotate_point(point, 360.0), Vec2::new(1000, 0));
+    // And the 45 degree cases go through the exact sine table.
+    assert_eq!(rotate_point(point, -45.0), Vec2::new(707, 707));
+    assert_eq!(rotate_point(point, 45.0), Vec2::new(707, -707));
+  }
+
+  #[test]
+  fn rotate_point_about_a_centre_translates_first() {
+    let center = Vec2::new(5000, 5000);
+    let point = Vec2::new(6000, 5000);
+
+    assert_eq!(
+      rotate_point_about(point, center, -90.0),
+      Vec2::new(5000, 6000)
+    );
+    assert_eq!(
+      rotate_point_about(point, center, 180.0),
+      Vec2::new(4000, 5000)
+    );
+  }
+
+  /// The eight rays of a circle of radius 100000, hand computed from
+  /// `pcbnew/router/pns_optimizer.cpp:929`: the ray is
+  /// `trunc(100000 * sqrt(2)) = 141421` long, so the four axis aligned
+  /// exits end at 141421 and the four diagonal ones at
+  /// `round(141421 / sqrt(2)) = 100000` in each axis, which is the corner
+  /// of the circle's bounding box.
+  #[test]
+  fn circle_breakouts_are_eight_rays_of_radius_root_two() {
+    let shape = Shape::circle(Vec2::new(0, 0), 100_000);
+    let breakouts = circle_breakouts(100_000, &shape, true);
+
+    assert_eq!(breakouts.len(), CIRCLE_BREAKOUT_COUNT);
+    assert_eq!(
+      ends(&breakouts),
+      vec![
+        Vec2::new(141_421, 0),
+        Vec2::new(100_000, 100_000),
+        Vec2::new(0, 141_421),
+        Vec2::new(-100_000, 100_000),
+        Vec2::new(-141_421, 0),
+        Vec2::new(-100_000, -100_000),
+        Vec2::new(0, -141_421),
+        Vec2::new(100_000, -100_000),
+      ]
+    );
+
+    // Every one of them starts at the centre and is a single segment.
+    for breakout in &breakouts {
+      assert_eq!(breakout.point(0), Vec2::new(0, 0));
+      assert_eq!(breakout.segment_count(), 1);
+    }
+  }
+
+  /// `circleBreakouts` has no branch on `aPermitDiagonal`
+  /// (`pcbnew/router/pns_optimizer.cpp:924`), so a round pad always
+  /// offers all eight.
+  #[test]
+  fn circle_breakouts_ignore_the_diagonal_flag() {
+    let shape = Shape::circle(Vec2::new(0, 0), 100_000);
+
+    assert_eq!(
+      circle_breakouts(100_000, &shape, false),
+      circle_breakouts(100_000, &shape, true)
+    );
+  }
+
+  /// A 600000 by 200000 pad centred on the origin with a 100000 wide
+  /// track, hand computed from `pcbnew/router/pns_optimizer.cpp:1003`.
+  ///
+  /// The orthogonal exits are `size / 2 + width` long, so 400000 along x
+  /// and 200000 along y. The diagonals first run `d_offset = 200000`
+  /// along the long axis and then turn 45 degrees for
+  /// `width + min(size) / 2 = 200000` in each axis.
+  #[test]
+  fn rect_breakouts_are_four_axis_exits_and_four_diagonals() {
+    let shape =
+      Shape::rect(Vec2::new(-300_000, -100_000), Vec2::new(600_000, 200_000));
+    let breakouts = rect_breakouts(100_000, &shape, true);
+
+    assert_eq!(breakouts.len(), 8);
+    assert_eq!(
+      ends(&breakouts),
+      vec![
+        Vec2::new(400_000, 0),
+        Vec2::new(-400_000, 0),
+        Vec2::new(0, 200_000),
+        Vec2::new(0, -200_000),
+        Vec2::new(400_000, 200_000),
+        Vec2::new(400_000, -200_000),
+        Vec2::new(-400_000, 200_000),
+        Vec2::new(-400_000, -200_000),
+      ]
+    );
+
+    // The four orthogonal exits are single segments from the centre and
+    // the four diagonals are two, with the elbow out along the long axis.
+    for breakout in &breakouts[0..4] {
+      assert_eq!(breakout.point(0), Vec2::new(0, 0));
+      assert_eq!(breakout.segment_count(), 1);
+    }
+
+    for breakout in &breakouts[4..8] {
+      assert_eq!(breakout.point(0), Vec2::new(0, 0));
+      assert_eq!(breakout.segment_count(), 2);
+      assert_eq!(breakout.point(1).x.abs(), 200_000);
+      assert_eq!(breakout.point(1).y, 0);
+    }
+  }
+
+  /// The tall branch at `pcbnew/router/pns_optimizer.cpp:1029` emits the
+  /// same four diagonals as the wide one with the middle two swapped, and
+  /// the elbow runs along y rather than x. The order is observable
+  /// because it breaks a tie between two equal cost, equal length
+  /// candidates.
+  #[test]
+  fn rect_breakouts_swap_two_diagonals_on_a_tall_pad() {
+    let shape =
+      Shape::rect(Vec2::new(-100_000, -300_000), Vec2::new(200_000, 600_000));
+    let breakouts = rect_breakouts(100_000, &shape, true);
+
+    assert_eq!(
+      ends(&breakouts),
+      vec![
+        Vec2::new(200_000, 0),
+        Vec2::new(-200_000, 0),
+        Vec2::new(0, 400_000),
+        Vec2::new(0, -400_000),
+        Vec2::new(200_000, 400_000),
+        Vec2::new(200_000, -400_000),
+        Vec2::new(-200_000, 400_000),
+        Vec2::new(-200_000, -400_000),
+      ]
+    );
+
+    for breakout in &breakouts[4..8] {
+      assert_eq!(breakout.point(1).x, 0);
+      assert_eq!(breakout.point(1).y.abs(), 200_000);
+    }
+  }
+
+  #[test]
+  fn rect_breakouts_drop_the_diagonals_when_they_are_not_permitted() {
+    let shape =
+      Shape::rect(Vec2::new(-300_000, -100_000), Vec2::new(600_000, 200_000));
+    let breakouts = rect_breakouts(100_000, &shape, false);
+
+    assert_eq!(breakouts.len(), 4);
+    assert_eq!(
+      ends(&breakouts),
+      vec![
+        Vec2::new(400_000, 0),
+        Vec2::new(-400_000, 0),
+        Vec2::new(0, 200_000),
+        Vec2::new(0, -200_000),
+      ]
+    );
+  }
+
+  /// A diamond of half diagonal 200000 centred on the origin. Every ray
+  /// is `max(bbox side) / 2 + 5 = 200005` long, which reaches the four
+  /// vertices and crosses the four edges half way, so all eight land on
+  /// the outline.
+  #[test]
+  fn custom_breakouts_land_on_the_polygon_edge() {
+    let mut world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let diamond = Shape::simple(LineChain::from_slice(
+      &[
+        Vec2::new(0, -200_000),
+        Vec2::new(200_000, 0),
+        Vec2::new(0, 200_000),
+        Vec2::new(-200_000, 0),
+      ],
+      true,
+    ));
+    let id = pad(&mut world, diamond, Vec2::new(0, 0), 0);
+    let item = world.item(id).expect("the pad was just added");
+    let breakouts = custom_breakouts(100_000, item, true);
+
+    assert_eq!(
+      ends(&breakouts),
+      vec![
+        Vec2::new(200_000, 0),
+        Vec2::new(100_000, 100_000),
+        Vec2::new(0, 200_000),
+        Vec2::new(-100_000, 100_000),
+        Vec2::new(-200_000, 0),
+        Vec2::new(-100_000, -100_000),
+        Vec2::new(0, -200_000),
+        Vec2::new(100_000, -100_000),
+      ]
+    );
+
+    // Without diagonals the step is 90 degrees, so only the four
+    // vertices survive.
+    assert_eq!(
+      ends(&custom_breakouts(100_000, item, false)),
+      vec![
+        Vec2::new(200_000, 0),
+        Vec2::new(0, 200_000),
+        Vec2::new(-200_000, 0),
+        Vec2::new(0, -200_000),
+      ]
+    );
+  }
+
+  /// KiCad's ray length is half the **bounding box side**, not half its
+  /// diagonal (`pcbnew/router/pns_optimizer.cpp:951`), so on an axis
+  /// aligned square the four diagonal rays stop inside the polygon and
+  /// contribute nothing, whatever the comment at `:950` says. Pinned
+  /// because it silently halves the exits of a square polygonal pad.
+  #[test]
+  fn custom_breakouts_diagonal_rays_fall_short_on_a_square() {
+    let mut world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let square = Shape::simple(LineChain::from_slice(
+      &[
+        Vec2::new(-200_000, -200_000),
+        Vec2::new(200_000, -200_000),
+        Vec2::new(200_000, 200_000),
+        Vec2::new(-200_000, 200_000),
+      ],
+      true,
+    ));
+    let id = pad(&mut world, square, Vec2::new(0, 0), 0);
+    let item = world.item(id).expect("the pad was just added");
+
+    assert_eq!(
+      ends(&custom_breakouts(100_000, item, true)),
+      vec![
+        Vec2::new(200_000, 0),
+        Vec2::new(0, 200_000),
+        Vec2::new(-200_000, 0),
+        Vec2::new(0, -200_000),
+      ]
+    );
+  }
+
+  #[test]
+  fn compute_breakouts_dispatches_on_the_body_and_the_shape() {
+    let mut world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let root = world.root();
+
+    // A via: the circle of its layer 0 padstack diameter.
+    let body = ItemBody::Via(Via::new(
+      Vec2::new(0, 0),
+      200_000,
+      100_000,
+      ViaType::Through,
+    ));
+    let mut item = world.make_item(body);
+
+    item.set_layers_and_flash_all(LayerRange::new(0, 1));
+    item.set_net(Some(NetId(1)));
+
+    let via = world.add_via(root, item);
+    let via_item = world.item(via).expect("the via was just added");
+
+    assert_eq!(
+      ends(&compute_breakouts(100_000, via_item, true)),
+      ends(&circle_breakouts(
+        100_000,
+        &Shape::circle(Vec2::new(0, 0), 100_000),
+        true
+      ))
+    );
+
+    // A capsule shaped pad goes through `ApproximateSegmentAsRect`, and
+    // this one approximates to exactly the rectangle above.
+    let capsule =
+      Shape::segment(Seg::from_coords(-200_000, 0, 200_000, 0), 200_000);
+    let oblong = pad(&mut world, capsule, Vec2::new(0, 0), 0);
+    let oblong_item = world.item(oblong).expect("the pad was just added");
+    let rect =
+      Shape::rect(Vec2::new(-300_000, -100_000), Vec2::new(600_000, 200_000));
+
+    assert_eq!(
+      compute_breakouts(100_000, oblong_item, true),
+      rect_breakouts(100_000, &rect, true)
+    );
+
+    // A compound pad has no case in KiCad's switch and gets no exits.
+    let compound = Shape::compound(vec![
+      Shape::rect(Vec2::new(-100_000, -100_000), Vec2::new(200_000, 200_000)),
+      Shape::circle(Vec2::new(100_000, 0), 100_000),
+    ]);
+    let complex = pad(&mut world, compound, Vec2::new(2_000_000, 0), 0);
+    let complex_item = world.item(complex).expect("the pad was just added");
+
+    assert!(compute_breakouts(100_000, complex_item, true).is_empty());
+  }
+
+  #[test]
+  fn find_pad_or_via_answers_the_first_link_of_the_right_kind() {
+    let mut world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let root = world.root();
+    let at = Vec2::new(1_000_000, 0);
+    let id = pad(&mut world, Shape::circle(at, 100_000), at, 0);
+
+    assert_eq!(
+      find_pad_or_via(&world, root, 0, Some(NetId(1)), at),
+      Some(id)
+    );
+
+    // The wrong layer, the wrong net and a bare point all answer nothing.
+    assert_eq!(find_pad_or_via(&world, root, 1, Some(NetId(1)), at), None);
+    assert_eq!(find_pad_or_via(&world, root, 0, Some(NetId(2)), at), None);
+    assert_eq!(
+      find_pad_or_via(&world, root, 0, Some(NetId(1)), Vec2::new(0, 0)),
+      None
+    );
+
+    // A joint that holds only track ends is not a pad.
+    let seg = Seg::from_coords(0, 0, 500_000, 0);
+    let body = ItemBody::Segment(Segment::new(seg, 100_000));
+    let mut item = world.make_item(body);
+
+    item.set_layers_and_flash_all(LayerRange::single(0));
+    item.set_net(Some(NetId(1)));
+    world
+      .add_segment(root, item, false)
+      .expect("the segment is neither degenerate nor redundant");
+
+    assert_eq!(
+      find_pad_or_via(&world, root, 0, Some(NetId(1)), Vec2::new(0, 0)),
+      None
+    );
+  }
+
+  #[test]
+  fn the_forbidden_angle_mask_is_kicads() {
+    assert!(FORBIDDEN_ANGLES.contains(AngleType::ACUTE));
+    assert!(FORBIDDEN_ANGLES.contains(AngleType::RIGHT));
+    assert!(FORBIDDEN_ANGLES.contains(AngleType::HALF_FULL));
+    assert!(FORBIDDEN_ANGLES.contains(AngleType::UNDEFINED));
+    assert!(!FORBIDDEN_ANGLES.intersects(AngleType::OBTUSE));
+    assert!(!FORBIDDEN_ANGLES.intersects(AngleType::STRAIGHT));
+  }
+
+  /// A via is refused one step before the breakouts are even built
+  /// (`pcbnew/router/pns_optimizer.cpp:1128`), so a line leaving a via
+  /// keeps the exit posture the placer gave it.
+  #[test]
+  fn smart_pads_single_refuses_a_via() {
+    let mut world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let root = world.root();
+    let at = Vec2::new(0, 0);
+    let body = ItemBody::Via(Via::new(at, 200_000, 100_000, ViaType::Through));
+    let mut item = world.make_item(body);
+
+    item.set_layers_and_flash_all(LayerRange::new(0, 1));
+    item.set_net(Some(NetId(1)));
+
+    let via = world.add_via(root, item);
+    let rules = FixedClearance::uniform(50_000);
+    let settings = RoutingSettings::default();
+    let context = AlgoContext::new(&rules, &settings);
+    let optimizer = Optimizer::new(root);
+    let mut line = Line::new();
+
+    line.set_width(100_000);
+    line.set_layer(0);
+    line.set_net(Some(NetId(1)));
+    line.set_shape(LineChain::from_slice(
+      &[at, Vec2::new(0, 600_000), Vec2::new(1_000_000, 600_000)],
+      false,
+    ));
+
+    let before = line.shape().clone();
+
+    assert_eq!(
+      optimizer.smart_pads_single(&world, &context, &mut line, via, false, 3),
+      None
+    );
+    assert_eq!(*line.shape(), before);
+  }
+
+  /// An offset pad is refused for the same reason a via is: every
+  /// breakout starts at the centre, which is not where the copper is
+  /// (`pcbnew/router/pns_optimizer.cpp:1123`).
+  #[test]
+  fn smart_pads_single_refuses_an_offset_pad() {
+    let mut world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let root = world.root();
+    let at = Vec2::new(0, 0);
+    let mut solid = Solid::new(Shape::circle(at, 100_000), at);
+
+    solid.set_offset(Vec2::new(10_000, 0));
+
+    let mut item = world.make_item(ItemBody::Solid(solid));
+
+    item.set_layers_and_flash_all(LayerRange::single(0));
+    item.set_net(Some(NetId(1)));
+
+    let id = world.add_solid(root, item, None);
+    let rules = FixedClearance::uniform(50_000);
+    let settings = RoutingSettings::default();
+    let context = AlgoContext::new(&rules, &settings);
+    let optimizer = Optimizer::new(root);
+    let mut line = Line::new();
+
+    line.set_width(100_000);
+    line.set_layer(0);
+    line.set_net(Some(NetId(1)));
+    line.set_shape(LineChain::from_slice(
+      &[at, Vec2::new(0, 600_000), Vec2::new(1_000_000, 600_000)],
+      false,
+    ));
+
+    assert_eq!(
+      optimizer.smart_pads_single(&world, &context, &mut line, id, false, 3),
+      None
+    );
+  }
+
+  /// A line of two points has nothing between its ends to rewrite, so
+  /// both pad passes decline it (`pcbnew/router/pns_optimizer.cpp:1235`,
+  /// `:1275`).
+  #[test]
+  fn the_pad_passes_decline_a_two_point_line() {
+    let world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let root = world.root();
+    let rules = FixedClearance::uniform(50_000);
+    let settings = RoutingSettings::default();
+    let context = AlgoContext::new(&rules, &settings);
+    let optimizer = Optimizer::new(root);
+    let mut line = Line::new();
+
+    line.set_width(100_000);
+    line.set_shape(LineChain::from_slice(
+      &[Vec2::new(0, 0), Vec2::new(1_000_000, 0)],
+      false,
+    ));
+
+    assert!(!optimizer.run_smart_pads(&world, &context, &mut line));
+    assert!(!optimizer.fanout_cleanup(&world, &context, &mut line));
+  }
+
+  /// The `return true` at `pcbnew/router/pns_optimizer.cpp:1254` is
+  /// unconditional, so a line whose ends carry no pad at all still
+  /// reports "changed".
+  #[test]
+  fn run_smart_pads_reports_changed_even_with_nothing_to_do() {
+    let world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let root = world.root();
+    let rules = FixedClearance::uniform(50_000);
+    let settings = RoutingSettings::default();
+    let context = AlgoContext::new(&rules, &settings);
+    let optimizer = Optimizer::new(root);
+    let mut line = Line::new();
+
+    line.set_width(100_000);
+    line.set_shape(LineChain::from_slice(
+      &[
+        Vec2::new(0, 0),
+        Vec2::new(0, 600_000),
+        Vec2::new(1_000_000, 600_000),
+      ],
+      false,
+    ));
+
+    let before = line.shape().clone();
+
+    assert!(optimizer.run_smart_pads(&world, &context, &mut line));
+    assert_eq!(*line.shape(), before);
   }
 }

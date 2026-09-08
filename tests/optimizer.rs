@@ -25,10 +25,15 @@ use pnsrouter::geometry::line_chain::LineChain;
 use pnsrouter::geometry::seg::Seg;
 use pnsrouter::geometry::shape::Shape;
 use pnsrouter::geometry::vec2::{Vec2, Vec2L};
-use pnsrouter::item::{ItemBody, LayerRange, NetId, Segment, Solid};
+use pnsrouter::item::{
+  ItemBody, LayerRange, NetId, Segment, Solid, Via, ViaType,
+};
 use pnsrouter::line::Line;
 use pnsrouter::node::World;
-use pnsrouter::optimizer::{Candidate, Constraint, EffortFlags, Optimizer};
+use pnsrouter::optimizer::{
+  Candidate, Constraint, CostEstimator, EffortFlags, Optimizer,
+  compute_breakouts, find_pad_or_via, rect_breakouts,
+};
 use pnsrouter::rules::FixedClearance;
 use pnsrouter::settings::RoutingSettings;
 
@@ -113,10 +118,92 @@ const ELBOW: [Vec2; 4] = [
   Vec2::new(5000000, -10000000),
 ];
 
+// -----------------------------------------------------------------
+// The pad pass fixtures
+//
+// Everything below sits at a positive y, well away from the four merge
+// scenarios above, which all live at y <= 0. The heads that use it are
+// on `BOARD_NET` rather than on `HEAD_NET`, because both pad passes
+// start from a joint lookup keyed on the line's own net: a head on a net
+// nothing on the board belongs to has no pad at either end, which is
+// what `the_pad_passes_leave_a_head_with_no_pads_alone` covers.
+// -----------------------------------------------------------------
+
+/// The net the obstacle that blocks a breakout is on, so that it is not
+/// exempt from the head the way the pads are.
+const BLOCKER_NET: Option<NetId> = Some(NetId(3));
+
+/// The rectangular pad the unobstructed smart pads scenario leaves from:
+/// the copper centre and the copper size, on layer 0.
+const RECT_PAD: (Vec2, Vec2) =
+  (Vec2::new(0, 5000000), Vec2::new(600000, 200000));
+
+/// The same pad again for the obstructed scenario, three millimetres
+/// east so that the blocker cannot reach the first one.
+const BLOCKED_RECT_PAD: (Vec2, Vec2) =
+  (Vec2::new(3000000, 5000000), Vec2::new(600000, 200000));
+
+/// The obstacle that rules out the two cheapest exits of
+/// [`BLOCKED_RECT_PAD`]: it sits exactly on the east breakout's diagonal
+/// and 141421 nanometres from the south east one's, both inside the
+/// 200000 nanometre keep out, while the exit that wins passes no closer
+/// than 300000.
+const BREAKOUT_BLOCKER: (Vec2, i32) = (Vec2::new(3700000, 5300000), 100000);
+
+/// The round pad the second smart pads scenario leaves from, on layer 0.
+const ROUND_PAD: (Vec2, i32) = (Vec2::new(0, 8000000), PAD_RADIUS);
+
+/// The two pads the fanout scenario runs between, on layer 0. They are
+/// close enough that the line between them is under ten track widths
+/// long, which is what arms the cleanup.
+const FANOUT_PADS: [(Vec2, i32); 2] = [
+  (Vec2::new(0, 11000000), PAD_RADIUS),
+  (Vec2::new(500000, 11300000), PAD_RADIUS),
+];
+
+/// The via the third smart pads scenario leaves from: position, copper
+/// diameter and drill. It spans both layers.
+const SMART_PADS_VIA: (Vec2, i32, i32) =
+  (Vec2::new(0, 14000000), 2 * PAD_RADIUS, PAD_RADIUS);
+
 /// Turn the plain data into a world.
 fn build() -> World {
   let mut world = World::new(World::DEFAULT_MAX_CLEARANCE);
   let root = world.root();
+
+  for (centre, size) in [RECT_PAD, BLOCKED_RECT_PAD] {
+    let origin = centre - Vec2::new(size.x / 2, size.y / 2);
+    let body = ItemBody::Solid(Solid::new(Shape::rect(origin, size), centre));
+    let mut item = world.make_item(body);
+
+    item.set_layers_and_flash_all(LayerRange::single(0));
+    item.set_net(BOARD_NET);
+    world.add_solid(root, item, None);
+  }
+
+  for (centre, radius) in
+    [ROUND_PAD, FANOUT_PADS[0], FANOUT_PADS[1], BREAKOUT_BLOCKER]
+  {
+    let body =
+      ItemBody::Solid(Solid::new(Shape::circle(centre, radius), centre));
+    let mut item = world.make_item(body);
+
+    item.set_layers_and_flash_all(LayerRange::single(0));
+    item.set_net(if (centre, radius) == BREAKOUT_BLOCKER {
+      BLOCKER_NET
+    } else {
+      BOARD_NET
+    });
+    world.add_solid(root, item, None);
+  }
+
+  let (at, diameter, drill) = SMART_PADS_VIA;
+  let body = ItemBody::Via(Via::new(at, diameter, drill, ViaType::Through));
+  let mut item = world.make_item(body);
+
+  item.set_layers_and_flash_all(LayerRange::new(0, 1));
+  item.set_net(BOARD_NET);
+  world.add_via(root, item);
 
   for (x, y, layer) in PADS {
     let at = Vec2::new(x, y);
@@ -151,6 +238,16 @@ fn head_on(layer: i32, points: &[Vec2]) -> Line {
   line.set_net(HEAD_NET);
   line.set_shape(LineChain::from_slice(points, false));
 
+  line
+}
+
+/// A head on the board's own net, which is what a trace leaving one of
+/// the board's pads is. The pads it touches are then exempt from it, as
+/// they are for any real route.
+fn head_on_board_net(layer: i32, points: &[Vec2]) -> Line {
+  let mut line = head_on(layer, points);
+
+  line.set_net(BOARD_NET);
   line
 }
 
@@ -589,10 +686,15 @@ fn the_static_overload_optimizes_in_place() {
   assert!(is_clear(&world, &line));
 }
 
-/// A caller that asks for the two pad passes still gets the others,
-/// because they are accepted and skipped rather than refused.
+/// A head whose ends carry no pad passes through both pad passes
+/// untouched, and the two inert flags change nothing either.
+///
+/// The staircase is on the head's own net, which no joint on the board
+/// belongs to, so [`find_pad_or_via`] answers nothing at both ends. That
+/// is the common case for a head in flight and it has to be a no
+/// operation on the geometry.
 #[test]
-fn the_unimplemented_pad_passes_do_not_block_the_others() {
+fn the_pad_passes_leave_a_head_with_no_pads_alone() {
   let world = build();
   let settings = RoutingSettings::default();
   let line = head_on(1, &STAIRCASE);
@@ -614,6 +716,15 @@ fn the_unimplemented_pad_passes_do_not_block_the_others() {
   assert!(changed);
   assert_eq!(points(&optimized), points(&plain));
   assert!(is_clear(&world, &optimized));
+
+  // And `SMART_PADS` alone reports "changed" over a line it did not
+  // touch, because `runSmartPads` returns true unconditionally
+  // (`pcbnew/router/pns_optimizer.cpp:1254`).
+  let (smart_changed, untouched) =
+    optimize(&world, &settings, EffortFlags::SMART_PADS, &line, |_| {});
+
+  assert!(smart_changed);
+  assert_eq!(points(&untouched), STAIRCASE.to_vec());
 }
 
 #[test]
@@ -638,6 +749,443 @@ fn the_scenarios_answer_identically_twice() {
         optimize(&world, &settings, effort, &line, |_| {});
 
       assert!(is_clear(&world, &optimized));
+      answers.push((changed, points(&optimized)));
+    }
+
+    answers
+  };
+
+  assert_eq!(run(), run());
+}
+
+// ---------------------------------------------------------------------
+// The pad passes
+// ---------------------------------------------------------------------
+
+/// A right angle exit from the oblong pad, which is what the smart pads
+/// pass exists to remove.
+///
+/// The line leaves the pad centre straight along the pad's **short**
+/// axis and then turns 90 degrees, which costs `COST_RIGHT`, 30.
+fn awkward_exit_from(centre: Vec2) -> [Vec2; 3] {
+  [
+    centre,
+    centre + Vec2::new(0, 600000),
+    centre + Vec2::new(1000000, 600000),
+  ]
+}
+
+/// The eight exits of the unobstructed rectangular pad, hand computed
+/// from `pcbnew/router/pns_optimizer.cpp:1003` and `:1013` for a 600000
+/// by 200000 pad and a 100000 wide track: `size / 2 + width` along each
+/// axis, then `d_offset = 200000` out along the long axis followed by a
+/// 45 degree leg of `width + min(size) / 2 = 200000`.
+fn rect_pad_breakout_ends(centre: Vec2) -> Vec<Vec2> {
+  [
+    Vec2::new(400000, 0),
+    Vec2::new(-400000, 0),
+    Vec2::new(0, 200000),
+    Vec2::new(0, -200000),
+    Vec2::new(400000, 200000),
+    Vec2::new(400000, -200000),
+    Vec2::new(-400000, 200000),
+    Vec2::new(-400000, -200000),
+  ]
+  .into_iter()
+  .map(|offset| centre + offset)
+  .collect()
+}
+
+/// The breakout list the world's own rectangular pad offers, through the
+/// public entry point.
+fn breakouts_of(world: &World, at: Vec2, layer: i32) -> Vec<Vec2> {
+  let id = find_pad_or_via(world, world.root(), layer, BOARD_NET, at)
+    .expect("the fixture puts a pad here");
+  let item = world.item(id).expect("the joint's link is a live item");
+
+  compute_breakouts(TRACK_WIDTH, item, true)
+    .iter()
+    .map(|chain| chain.last_point().expect("a breakout has points"))
+    .collect()
+}
+
+/// What a chain of points costs in corners, for comparing candidates.
+fn cost_of(points: &[Vec2]) -> i32 {
+  CostEstimator::corner_cost_of_chain(&LineChain::from_slice(points, false))
+}
+
+/// The exits the fixture's rectangular pad offers are the hand computed
+/// eight, and the joint lookup that finds the pad answers the pad.
+#[test]
+fn a_rectangular_pad_offers_the_hand_computed_breakouts() {
+  let world = build();
+  let (centre, _) = RECT_PAD;
+
+  assert_eq!(
+    breakouts_of(&world, centre, 0),
+    rect_pad_breakout_ends(centre)
+  );
+
+  // The pad is on layer 0 only, so the same lookup on layer 1 finds
+  // nothing and the pass would decline the line.
+  assert_eq!(
+    find_pad_or_via(&world, world.root(), 1, BOARD_NET, centre),
+    None
+  );
+}
+
+/// The unobstructed rectangular pad: the right angle exit is replaced by
+/// the cheapest collision free candidate, which leaves along the pad's
+/// long axis.
+///
+/// The winner is breakout 0, the east exit, joined to the line's last
+/// point by a single 45 degree segment: cost 10 against the 30 the user
+/// drew. Every other candidate that survives the forbidden angle filter
+/// costs 20 or more, and the two nearest ones are checked below.
+#[test]
+fn a_rectangular_pad_gets_the_cheapest_collision_free_breakout() {
+  let world = build();
+  let settings = RoutingSettings::default();
+  let (centre, _) = RECT_PAD;
+  let path = awkward_exit_from(centre);
+  let line = head_on_board_net(0, &path);
+
+  assert!(is_clear(&world, &line));
+  assert_eq!(cost_of(&path), 30);
+
+  let (changed, optimized) =
+    optimize(&world, &settings, EffortFlags::SMART_PADS, &line, |_| {});
+
+  let winner = vec![
+    centre,
+    centre + Vec2::new(400000, 0),
+    centre + Vec2::new(1000000, 600000),
+  ];
+
+  assert!(changed);
+  assert_eq!(points(&optimized), winner);
+  assert_eq!(cost_of(&winner), 10);
+  assert!(is_clear(&world, &optimized));
+
+  // The winner starts on the pad's own east breakout.
+  assert_eq!(optimized.point(1), rect_pad_breakout_ends(centre)[0]);
+  // And the pass never moves either end of the line.
+  assert_eq!(optimized.point(0), line.point(0));
+  assert_eq!(optimized.last_point(), line.last_point());
+
+  // The two runner up candidates are clear as well, so the pass really
+  // did pick on cost and not on availability. They come from breakout 2
+  // (the short axis exit) and breakout 4 (the south east diagonal).
+  for runner_up in [
+    vec![
+      centre,
+      centre + Vec2::new(0, 200000),
+      centre + Vec2::new(400000, 600000),
+      centre + Vec2::new(1000000, 600000),
+    ],
+    vec![
+      centre,
+      centre + Vec2::new(200000, 0),
+      centre + Vec2::new(800000, 600000),
+      centre + Vec2::new(1000000, 600000),
+    ],
+  ] {
+    assert_eq!(cost_of(&runner_up), 20);
+    assert!(is_clear(&world, &head_on_board_net(0, &runner_up)));
+  }
+}
+
+/// The same pad with an obstacle across its two cheapest exits: the pass
+/// settles for the short axis exit instead of taking the blocked one.
+#[test]
+fn a_blocked_breakout_is_not_chosen() {
+  let world = build();
+  let settings = RoutingSettings::default();
+  let (centre, _) = BLOCKED_RECT_PAD;
+  let path = awkward_exit_from(centre);
+  let line = head_on_board_net(0, &path);
+
+  assert!(is_clear(&world, &line), "the awkward exit itself is clear");
+
+  // What won on the unobstructed pad, and the diagonal behind it, both
+  // run into the blocker here.
+  let east_exit = vec![
+    centre,
+    centre + Vec2::new(400000, 0),
+    centre + Vec2::new(1000000, 600000),
+  ];
+  let diagonal_exit = vec![
+    centre,
+    centre + Vec2::new(200000, 0),
+    centre + Vec2::new(800000, 600000),
+    centre + Vec2::new(1000000, 600000),
+  ];
+
+  assert_eq!(cost_of(&east_exit), 10);
+  assert!(!is_clear(&world, &head_on_board_net(0, &east_exit)));
+  assert!(!is_clear(&world, &head_on_board_net(0, &diagonal_exit)));
+
+  let (changed, optimized) =
+    optimize(&world, &settings, EffortFlags::SMART_PADS, &line, |_| {});
+
+  let winner = vec![
+    centre,
+    centre + Vec2::new(0, 200000),
+    centre + Vec2::new(400000, 600000),
+    centre + Vec2::new(1000000, 600000),
+  ];
+
+  assert!(changed);
+  assert_eq!(points(&optimized), winner);
+  assert_eq!(cost_of(&winner), 20);
+  assert!(is_clear(&world, &optimized));
+  assert_eq!(optimized.point(1), centre + Vec2::new(0, 200000));
+  assert_eq!(optimized.point(0), line.point(0));
+  assert_eq!(optimized.last_point(), line.last_point());
+}
+
+/// The round pad. Its eight exits are the hand computed rays of
+/// `radius * sqrt(2)`, and the winner is the east one followed by a
+/// straight run and a 45 degree turn, which the candidate's own
+/// `Simplify2` folds into two segments.
+#[test]
+fn a_round_pad_gets_a_breakout_too() {
+  let world = build();
+  let settings = RoutingSettings::default();
+  let (centre, _) = ROUND_PAD;
+  let path = awkward_exit_from(centre);
+  let line = head_on_board_net(0, &path);
+
+  assert!(is_clear(&world, &line));
+  assert_eq!(
+    breakouts_of(&world, centre, 0),
+    vec![
+      centre + Vec2::new(141421, 0),
+      centre + Vec2::new(100000, 100000),
+      centre + Vec2::new(0, 141421),
+      centre + Vec2::new(-100000, 100000),
+      centre + Vec2::new(-141421, 0),
+      centre + Vec2::new(-100000, -100000),
+      centre + Vec2::new(0, -141421),
+      centre + Vec2::new(100000, -100000),
+    ]
+  );
+
+  let (changed, optimized) =
+    optimize(&world, &settings, EffortFlags::SMART_PADS, &line, |_| {});
+
+  // Breakout 0 runs east to (141421, 0); the straight first connection
+  // to the far point continues east to (400000, 0) and then turns 45
+  // degrees, so the breakout's own endpoint is collinear and `Simplify2`
+  // drops it.
+  let winner = vec![
+    centre,
+    centre + Vec2::new(400000, 0),
+    centre + Vec2::new(1000000, 600000),
+  ];
+
+  assert!(changed);
+  assert_eq!(points(&optimized), winner);
+  assert_eq!(cost_of(&winner), 10);
+  assert!(is_clear(&world, &optimized));
+  assert_eq!(optimized.point(0), line.point(0));
+  assert_eq!(optimized.last_point(), line.last_point());
+}
+
+/// A via offers the same eight exits as a round pad of its copper
+/// radius, and the pass refuses to use any of them.
+///
+/// `smartPadsSingle` returns before it looks at the breakouts when the
+/// item is a via (`pcbnew/router/pns_optimizer.cpp:1128`), with the
+/// reason written out there: a via is round, so no exit is better than
+/// another, and rewriting one would only destroy the posture the placer
+/// chose. The pass still reports "changed", which is the unconditional
+/// `return true` at `:1254`.
+#[test]
+fn a_via_offers_breakouts_and_the_pass_refuses_them() {
+  let world = build();
+  let settings = RoutingSettings::default();
+  let (centre, diameter, _) = SMART_PADS_VIA;
+  let path = awkward_exit_from(centre);
+  let line = head_on_board_net(0, &path);
+  let radius = diameter / 2;
+
+  assert!(is_clear(&world, &line));
+  assert_eq!(
+    breakouts_of(&world, centre, 0),
+    vec![
+      centre + Vec2::new(141421, 0),
+      centre + Vec2::new(radius, radius),
+      centre + Vec2::new(0, 141421),
+      centre + Vec2::new(-radius, radius),
+      centre + Vec2::new(-141421, 0),
+      centre + Vec2::new(-radius, -radius),
+      centre + Vec2::new(0, -141421),
+      centre + Vec2::new(radius, -radius),
+    ]
+  );
+
+  let (changed, optimized) =
+    optimize(&world, &settings, EffortFlags::SMART_PADS, &line, |_| {});
+
+  assert!(changed);
+  assert_eq!(points(&optimized), path.to_vec());
+  assert!(is_clear(&world, &optimized));
+}
+
+/// No caller in KiCad's tree ever passes `aPermitDiagonal = false`:
+/// `smartPadsSingle` is the only caller of `computeBreakouts` and it
+/// hard codes `true` (`pcbnew/router/pns_optimizer.cpp:1131`). The
+/// parameter is still ported and still works, so a host that wants
+/// orthogonal only exits has it.
+#[test]
+fn the_diagonal_breakouts_are_dropped_when_they_are_not_permitted() {
+  let world = build();
+  let (centre, size) = RECT_PAD;
+  let id = find_pad_or_via(&world, world.root(), 0, BOARD_NET, centre)
+    .expect("the fixture puts a pad here");
+  let item = world.item(id).expect("the joint's link is a live item");
+  let origin = centre - Vec2::new(size.x / 2, size.y / 2);
+  let shape = Shape::rect(origin, size);
+
+  assert_eq!(compute_breakouts(TRACK_WIDTH, item, true).len(), 8);
+
+  let orthogonal = rect_breakouts(TRACK_WIDTH, &shape, false);
+
+  assert_eq!(orthogonal.len(), 4);
+  assert_eq!(
+    orthogonal
+      .iter()
+      .map(|chain| chain.last_point().expect("a breakout has points"))
+      .collect::<Vec<_>>(),
+    rect_pad_breakout_ends(centre)[0..4].to_vec()
+  );
+
+  // Every orthogonal exit is a single segment; the diagonals are the
+  // only two segment ones.
+  for breakout in &orthogonal {
+    assert_eq!(breakout.segment_count(), 1);
+  }
+}
+
+/// Two pads a short hop apart, joined by a right angle: the cleanup
+/// redraws the whole thing as the straight leg first posture.
+#[test]
+fn fanout_cleanup_straightens_a_two_segment_fanout() {
+  let world = build();
+  let settings = RoutingSettings::default();
+  let (start, _) = FANOUT_PADS[0];
+  let (end, _) = FANOUT_PADS[1];
+  let path = [start, Vec2::new(start.x, end.y), end];
+  let line = head_on_board_net(0, &path);
+
+  assert!(is_clear(&world, &line));
+  assert_eq!(cost_of(&path), 30);
+  // The guard is `length < 10 * width`, so the fixture has to be short.
+  assert!(line.shape().length() < i64::from(TRACK_WIDTH) * 10);
+
+  let (changed, optimized) = optimize(
+    &world,
+    &settings,
+    EffortFlags::FANOUT_CLEANUP,
+    &line,
+    |_| {},
+  );
+
+  // `BuildInitialTrace` with the straight leg first: 500000 across and
+  // 300000 down means 200000 of straight run and then the diagonal.
+  let winner = vec![start, Vec2::new(start.x + 200000, start.y), end];
+
+  assert!(changed);
+  assert_eq!(points(&optimized), winner);
+  assert_eq!(cost_of(&winner), 10);
+  assert!(is_clear(&world, &optimized));
+  assert_eq!(optimized.point(0), line.point(0));
+  assert_eq!(optimized.last_point(), line.last_point());
+}
+
+/// The cleanup declines a line that is too long, and one whose start is
+/// not on a pad at all.
+#[test]
+fn fanout_cleanup_declines_what_it_is_not_for() {
+  let world = build();
+  let settings = RoutingSettings::default();
+  let (start, _) = FANOUT_PADS[0];
+  let (end, _) = FANOUT_PADS[1];
+
+  // A route between the same two pads that wanders far enough to break
+  // the `10 * width` budget is left alone.
+  let long_way = [
+    start,
+    Vec2::new(start.x, start.y + 900000),
+    Vec2::new(end.x, start.y + 900000),
+    end,
+  ];
+  let wandering = head_on_board_net(0, &long_way);
+
+  assert!(wandering.shape().length() >= i64::from(TRACK_WIDTH) * 10);
+
+  let (changed, untouched) = optimize(
+    &world,
+    &settings,
+    EffortFlags::FANOUT_CLEANUP,
+    &wandering,
+    |_| {},
+  );
+
+  assert!(!changed);
+  assert_eq!(points(&untouched), long_way.to_vec());
+
+  // And a line whose far end is on a pad but whose near end is in open
+  // copper is refused at `pcbnew/router/pns_optimizer.cpp:1288`, even
+  // though the reverse case falls back to `EndsWithVia`.
+  let backwards =
+    [Vec2::new(300000, 11100000), Vec2::new(end.x, 11100000), end];
+  let from_nowhere = head_on_board_net(0, &backwards);
+
+  let (changed, untouched) = optimize(
+    &world,
+    &settings,
+    EffortFlags::FANOUT_CLEANUP,
+    &from_nowhere,
+    |_| {},
+  );
+
+  assert!(!changed);
+  assert_eq!(points(&untouched), backwards.to_vec());
+}
+
+/// Both pad passes at once over every pad fixture, twice, with the same
+/// answers and no clearance violation either time.
+#[test]
+fn the_pad_scenarios_answer_identically_twice() {
+  let settings = RoutingSettings::default();
+  let effort = EffortFlags::MERGE_SEGMENTS
+    | EffortFlags::MERGE_OBTUSE
+    | EffortFlags::MERGE_COLINEAR
+    | EffortFlags::SMART_PADS
+    | EffortFlags::FANOUT_CLEANUP;
+
+  let run = || {
+    let world = build();
+    let mut answers = Vec::new();
+    let (start, _) = FANOUT_PADS[0];
+    let (end, _) = FANOUT_PADS[1];
+
+    for path in [
+      awkward_exit_from(RECT_PAD.0).to_vec(),
+      awkward_exit_from(BLOCKED_RECT_PAD.0).to_vec(),
+      awkward_exit_from(ROUND_PAD.0).to_vec(),
+      awkward_exit_from(SMART_PADS_VIA.0).to_vec(),
+      vec![start, Vec2::new(start.x, end.y), end],
+    ] {
+      let line = head_on_board_net(0, &path);
+      let (changed, optimized) =
+        optimize(&world, &settings, effort, &line, |_| {});
+
+      assert!(is_clear(&world, &optimized));
+      assert_eq!(optimized.point(0), line.point(0));
+      assert_eq!(optimized.last_point(), line.last_point());
       answers.push((changed, points(&optimized)));
     }
 

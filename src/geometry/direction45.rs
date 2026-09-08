@@ -190,6 +190,17 @@ impl AngleType {
     self.0
   }
 
+  /// Every bit of both, as a `const fn`.
+  ///
+  /// The same value the [`BitOr`] implementation below produces. It
+  /// exists because a trait method cannot be called while building a
+  /// `const`, and the one mask KiCad spells inline is worth naming once:
+  /// `pcbnew/router/pns_optimizer.cpp:1114` builds
+  /// [`crate::optimizer::FORBIDDEN_ANGLES`] this way.
+  pub const fn union(self, other: AngleType) -> AngleType {
+    AngleType(self.0 | other.0)
+  }
+
   /// Whether every bit of `other` is set here.
   pub const fn contains(self, other: AngleType) -> bool {
     (self.0 & other.0) == other.0
@@ -892,6 +903,15 @@ mod tests {
     // A single angle does not contain a multi bit mask, which is why the
     // router's `angle & mask` test is `intersects`.
     assert!(!AngleType::RIGHT.contains(forbidden));
+
+    // The `const fn` form answers the same as the operator, which is the
+    // whole reason it exists.
+    const CONST_FORBIDDEN: AngleType = AngleType::ACUTE
+      .union(AngleType::RIGHT)
+      .union(AngleType::HALF_FULL)
+      .union(AngleType::UNDEFINED);
+
+    assert_eq!(CONST_FORBIDDEN, forbidden);
   }
 
   /// The eight exact octant vectors, at unit length and scaled,
