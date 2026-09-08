@@ -142,6 +142,7 @@
 //! is, and marked at each of the three sites.
 
 use std::borrow::Cow;
+use std::collections::BTreeSet;
 
 use crate::arena::Arena;
 use crate::geometry::collision::{self, ShapeCollision};
@@ -165,19 +166,16 @@ use crate::rules::{ItemRef, Keepout, RuleResolver};
 /// (`pcbnew/router/pns_item.cpp:179`),
 /// [`CollisionSearchOptions::override_clearance`] (`:214`) and
 /// [`CollisionSearchOptions::use_clearance_epsilon`] (`:220`). The other
-/// two are read by the obstacle visitor one level up
-/// (`pcbnew/router/pns_node.cpp:243`, `:259`) and are carried here so
-/// that the node module does not have to invent a second options struct.
+/// three are read by the obstacle visitor one level up
+/// (`pcbnew/router/pns_node.cpp:243`, `:249`, `:259`) and are carried
+/// here so that the node module does not have to invent a second options
+/// struct.
 ///
-/// Two members are not ported. `m_filter`, a
-/// `std::function<bool(const ITEM*)>` the visitor calls
-/// (`pcbnew/router/pns_node.h:121`, consumed at
-/// `pcbnew/router/pns_node.cpp:249`), belongs with the visitor and needs
-/// the node to say what a candidate is. `m_layer`
-/// (`pcbnew/router/pns_node.h:122`) is dead in this revision: it is
-/// declared, defaulted to `-1`, and read nowhere in KiCad's tree.
+/// `m_layer` (`pcbnew/router/pns_node.h:122`) is not ported: it is dead
+/// in this revision, declared, defaulted to `-1`, and read nowhere in
+/// KiCad's tree.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub struct CollisionSearchOptions {
+pub struct CollisionSearchOptions<'a> {
   /// Whether items of the same net are exempt.
   ///
   /// Port of `m_differentNetsOnly`, default true
@@ -213,9 +211,29 @@ pub struct CollisionSearchOptions {
   /// (`pcbnew/router/pns_walkaround.cpp:156`) turn it off because they
   /// need the strict rule.
   pub use_clearance_epsilon: bool,
+  /// The only items that may be an obstacle, when the search is confined.
+  ///
+  /// Port of `m_filter`, a `std::function<bool(const ITEM*)>` the visitor
+  /// calls (`pcbnew/router/pns_node.h:121`, consumed at
+  /// `pcbnew/router/pns_node.cpp:249`), narrowed to its one shape in
+  /// KiCad's tree: `WALKAROUND::nearestObstacle` installs a closure that
+  /// tests membership of `m_restrictedSet`
+  /// (`pcbnew/router/pns_walkaround.cpp:56` to `:64`) and nothing else
+  /// ever sets the field. A set is therefore enough, and it keeps the
+  /// options struct comparable and copyable.
+  ///
+  /// [`None`] is KiCad's empty `std::function`, which leaves every
+  /// candidate eligible. An empty set is **not** the same thing: it
+  /// excludes everything, where KiCad's walkaround guards against that by
+  /// only installing the closure when the set is non empty
+  /// (`pcbnew/router/pns_walkaround.cpp:56`).
+  ///
+  /// The set is a [`BTreeSet`] because it is a member of a struct
+  /// something may iterate; see `DESIGN.md` section 8.
+  pub restricted_set: Option<&'a BTreeSet<ItemId>>,
 }
 
-impl Default for CollisionSearchOptions {
+impl Default for CollisionSearchOptions<'_> {
   /// KiCad's member initialisers, `pcbnew/router/pns_node.h:115` to
   /// `:122`.
   fn default() -> Self {
@@ -225,6 +243,7 @@ impl Default for CollisionSearchOptions {
       limit_count: None,
       kind_mask: Kind::ANY,
       use_clearance_epsilon: true,
+      restricted_set: None,
     }
   }
 }

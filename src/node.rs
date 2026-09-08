@@ -113,6 +113,7 @@ use crate::arena::{Arena, ArenaId};
 use crate::collide::{CollisionSearchOptions, Obstacle, collide_into};
 use crate::geometry::box2::Box2;
 use crate::geometry::collision;
+use crate::geometry::direction45::CornerMode;
 use crate::geometry::hull::hull_intersection;
 use crate::geometry::line_chain::LineChain;
 use crate::geometry::shape::Shape;
@@ -1452,10 +1453,10 @@ impl World {
   /// Port of `NODE::QueryColliding` (`pcbnew/router/pns_node.cpp:267`)
   /// and the `DEFAULT_OBSTACLE_VISITOR` it drives (`:241`). The visitor's
   /// filters, in KiCad's order: the kind mask (`:243`), the self identity
-  /// test (`:247`), the user filter (`:249`, not ported, see
-  /// [`CollisionSearchOptions`]), the override test (`:252`, inside
-  /// `World::visit_candidates`), then the item level collision through
-  /// [`collide_into`], then the limit (`:259`).
+  /// test (`:247`), the user filter (`:249`, which is
+  /// [`CollisionSearchOptions::restricted_set`] here), the override test
+  /// (`:252`, inside `World::visit_candidates`), then the item level
+  /// collision through [`collide_into`], then the limit (`:259`).
   ///
   /// A virtual head collides with nothing and returns immediately
   /// (`:272`, "by default, virtual items cannot collide").
@@ -1544,6 +1545,13 @@ impl World {
 
       // :247. Collisions with self are not a thing.
       if candidate.is_same_as(head) {
+        return true;
+      }
+
+      // :249, the caller's filter. See
+      // `CollisionSearchOptions::restricted_set` for why an empty set is
+      // not spelled `None`.
+      if options.restricted_set.is_some_and(|set| !set.contains(&id)) {
         return true;
       }
 
@@ -1800,20 +1808,29 @@ impl World {
   ///   rather than the lowest address. See
   ///   [`NearestObstacle::found_intersection`] for what that result means.
   ///
+  /// # The corner mode
+  ///
+  /// `corner_mode` is the `makeHull` lambda's only input (`:330`): in the
+  /// two 90 degree modes every hull is replaced by its axis aligned
+  /// bounding box, so that a head made of horizontal and vertical
+  /// segments is measured against a boundary of the same kind. KiCad
+  /// reads it off the router singleton at `:301`; it is a parameter here
+  /// for the reason `DESIGN.md` section 8 gives, and the walkaround
+  /// passes the same value into [`simplified_hull`] for the hull it walks
+  /// around.
+  ///
   /// # Not ported
   ///
   /// The thread pool (`:437`) and, with it, the sequential hull copy that
   /// only exists to feed it (`:346` to `:376`); [`Rc`] hulls are shared
-  /// instead. The `makeHull` lambda (`:330`), which replaces a hull by its
-  /// bounding box in the two 90 degree corner modes, needs the routing
-  /// settings this crate does not have yet; the walkaround and the placer
-  /// carry the same simplification, so it lands with them.
+  /// instead.
   pub fn nearest_obstacle(
     &mut self,
     node: NodeId,
     line: &Line,
     resolver: &dyn RuleResolver,
     options: &CollisionSearchOptions,
+    corner_mode: CornerMode,
   ) -> Option<NearestObstacle> {
     // :302 to :318
     let obstacles = self.query_colliding_line(node, line, resolver, options);
@@ -1872,10 +1889,14 @@ impl World {
         continue;
       };
 
+      // :330, `makeHull` applied to both of them.
       hulls.push(ObstacleHulls {
-        line: self.hull_of(id, *line_clearance, 0, layer),
+        line: self
+          .hull_of(id, *line_clearance, 0, layer)
+          .map(|hull| simplified_hull(hull, corner_mode)),
         via: via_clearance
-          .and_then(|clearance| self.hull_of(id, clearance, 0, layer)),
+          .and_then(|clearance| self.hull_of(id, clearance, 0, layer))
+          .map(|hull| simplified_hull(hull, corner_mode)),
       });
     }
 
@@ -2876,6 +2897,198 @@ impl World {
     Some(hull)
   }
 
+  /// The clearance a stored item needs from a line.
+  ///
+  /// `NODE::GetClearance( const ITEM*, const ITEM*, bool )`
+  /// (`pcbnew/router/pns_node.cpp:143`) for the one call shape that
+  /// cannot go through [`World::clearance_between`], because a [`Line`]
+  /// has no [`ItemId`] to key the cache on:
+  /// `WALKAROUND::processCluster` asks for it once per cluster member
+  /// (`pcbnew/router/pns_walkaround.cpp:156`) with the epsilon turned
+  /// off, because the hull it sizes has to be the strict rule.
+  ///
+  /// KiCad caches this one too, on the address of a stack temporary; the
+  /// answer here is recomputed instead, which is the same number.
+  ///
+  /// `-1` for a pair the resolver exempts and for a stale handle, which
+  /// is KiCad's "these two can never collide" arriving in an `int`. The
+  /// hull builders take it as it is, as the private `clearance_of` this
+  /// forwards to documents.
+  pub fn clearance_for_line(
+    &self,
+    item: ItemId,
+    line: &Line,
+    use_epsilon: bool,
+    resolver: &dyn RuleResolver,
+  ) -> i32 {
+    let Some(stored) = self.items.get(item) else {
+      return -1;
+    };
+
+    let probe = line.rule_item(self, PROBE_UID);
+
+    clearance_of(
+      resolver,
+      ItemRef::stored(item, stored),
+      ItemRef::unstored(&probe),
+      use_epsilon,
+    )
+  }
+
+  /// Everything that touches an item, transitively.
+  ///
+  /// Port of `TOPOLOGY::AssembleCluster`,
+  /// `pcbnew/router/pns_topology.cpp:1187`. It is a breadth first walk
+  /// from `start` over [`World::query_colliding`] with the clearance
+  /// forced to zero and the same net exemption turned off, so that what
+  /// it finds is what physically touches, and it is what lets the
+  /// walkaround clear a whole pad row or via group in one pass rather
+  /// than one obstacle per iteration.
+  ///
+  /// It lives on [`World`] rather than in a topology module because
+  /// KiCad's `TOPOLOGY` is a one field wrapper over a node
+  /// (`pcbnew/router/pns_topology.h:54`) and this is the only member of
+  /// it the walkaround needs. `DESIGN.md` section 9 gives cluster
+  /// assembly its own module; it should move there when the rest of
+  /// `TOPOLOGY` arrives.
+  ///
+  /// The four parameters are KiCad's. `layer` restricts the walk to items
+  /// that reach the line's layer, `area_expansion_limit` is the ratio at
+  /// which a growing cluster is abandoned ([`None`] for KiCad's `0.0`,
+  /// which disables the test; the walkaround passes that and the shove
+  /// passes `10.0`), and `excluded_net` drops the routed net's own
+  /// copper, which is how a head does not gather the track it is
+  /// extending.
+  ///
+  /// # Order
+  ///
+  /// The result is in discovery order, which is deterministic because
+  /// [`World::query_colliding`] is: KiCad's is the address order of its
+  /// obstacle set (note 02 section 11 entry 3). The membership set is a
+  /// [`BTreeSet`] where KiCad's is an `unordered_set`, which changes
+  /// nothing because neither is iterated.
+  pub fn assemble_cluster(
+    &self,
+    node: NodeId,
+    start: ItemId,
+    layer: i32,
+    area_expansion_limit: Option<f64>,
+    excluded_net: Option<NetId>,
+    resolver: &dyn RuleResolver,
+  ) -> Vec<ItemId> {
+    let mut cluster: Vec<ItemId> = Vec::new();
+    let Some(seed) = self.items.get(start) else {
+      return cluster;
+    };
+
+    // :1192 to :1195. Touching, not "closer than a rule allows".
+    let options = CollisionSearchOptions {
+      different_nets_only: false,
+      override_clearance: Some(0),
+      ..CollisionSearchOptions::default()
+    };
+
+    // :1199 to :1201
+    let Some(mut cluster_bbox) =
+      seed.shape(layer).and_then(|shape| shape.bbox(0))
+    else {
+      return cluster;
+    };
+    let initial_area = cluster_bbox.area();
+    let mut pending: VecDeque<ItemId> = VecDeque::new();
+    let mut processed: BTreeSet<ItemId> = BTreeSet::new();
+
+    pending.push_back(start);
+
+    // :1203
+    while let Some(top) = pending.pop_front() {
+      // :1210. The seed is the only item that can reach here unprocessed,
+      // because every other one is inserted as it is queued.
+      if !processed.contains(&top) {
+        cluster.push(top);
+      }
+
+      processed.insert(top);
+
+      let Some(item) = self.items.get(top) else {
+        continue;
+      };
+
+      let obstacles = self.query_colliding(
+        node,
+        ItemRef::stored(top, item),
+        resolver,
+        &options,
+      );
+
+      for obstacle in obstacles {
+        let Some(id) = obstacle.item else {
+          continue;
+        };
+        let Some(found) = self.items.get(id) else {
+          continue;
+        };
+        let Some(item) = self.items.get(top) else {
+          continue;
+        };
+
+        // :1221. Two tracks of different nets crossing are not one
+        // cluster, however close they run.
+        if found.net() != item.net()
+          && found.of_kind(Kind::SEGMENT)
+          && item.of_kind(Kind::SEGMENT)
+        {
+          continue;
+        }
+
+        // :1226
+        if excluded_net.is_some() && found.net() == excluded_net {
+          continue;
+        }
+
+        let overlaps = found.layers().overlaps(LayerRange::single(layer));
+
+        // :1229. A track contributes the box of the whole line it belongs
+        // to, not of the one segment that was hit.
+        let grown = if found.of_kind(Kind::SEGMENT | Kind::ARC) && overlaps {
+          self
+            .assemble_line(node, id, None, false, false, true)
+            .shape()
+            .bbox(0)
+        } else {
+          found.shape(layer).and_then(|shape| shape.bbox(0))
+        };
+
+        if let Some(grown) = grown {
+          cluster_bbox = cluster_bbox.merge(grown);
+        }
+
+        // :1239 to :1243. The `+ 1` is KiCad's guard against a zero area
+        // seed, and the limit is off when it is not positive.
+        let area_ratio =
+          cluster_bbox.area() as f64 / (initial_area as f64 + 1.0);
+
+        if area_expansion_limit
+          .is_some_and(|limit| limit > 0.0 && area_ratio > limit)
+        {
+          break;
+        }
+
+        // :1245
+        if !processed.contains(&id)
+          && overlaps
+          && !found.marker().intersects(MarkerFlags::HEAD)
+        {
+          processed.insert(id);
+          cluster.push(id);
+          pending.push_back(id);
+        }
+      }
+    }
+
+    cluster
+  }
+
   /// Drop every cache entry that mentions an item.
   ///
   /// Port of `RULE_RESOLVER::ClearCacheForItems`
@@ -2900,6 +3113,75 @@ impl World {
 /// `World::uid_of` answers `u64::MAX` for the missing handle anyway, so
 /// this is the same number by a different route.
 const PROBE_UID: u64 = u64::MAX;
+
+/// A hull as the corner mode wants it seen.
+///
+/// Port of the `makeHull` lambda of `NODE::NearestObstacle`
+/// (`pcbnew/router/pns_node.cpp:330` to `:344`) and of the identical
+/// block in `WALKAROUND::processCluster`
+/// (`pcbnew/router/pns_walkaround.cpp:162` to `:173`). In the two 90
+/// degree corner modes the hull is replaced by its axis aligned bounding
+/// box, in the corner order left top, right top, right bottom, left
+/// bottom, which is clockwise on screen and therefore keeps the winding
+/// invariant `crate::geometry::hull` states. In every other mode the hull
+/// is returned untouched, which is why this takes and returns an [`Rc`]:
+/// the common path costs a reference count and no copy.
+///
+/// # Deviation: the box is closed
+///
+/// KiCad builds the box into a default constructed
+/// `SHAPE_LINE_CHAIN` and appends four points without ever calling
+/// `SetClosed( true )`, so the chain it hands on is **open**. That is not
+/// a cosmetic difference. `SHAPE_LINE_CHAIN::PointInside` returns false
+/// for any open chain (`libs/kimath/src/geometry/shape_line_chain.cpp:1994`),
+/// so an open box hull has no inside: `LINE::Walkaround` classifies every
+/// path vertex as outside, never leaves the path, and the walkaround is a
+/// no op in the two 90 degree corner modes, running to its iteration
+/// limit and reporting almost done. Every real hull builder closes its
+/// chain (`pcbnew/router/pns_utils.cpp:45`, `:91`, `:270`, `:341`) and
+/// `LINE::Walkaround` documents that a hull is a closed clockwise polygon
+/// by construction (`pcbnew/router/pns_line.cpp:397`), so the open chain
+/// is a KiCad defect and not a behaviour to pin. This port closes it, and
+/// the 90 degree walkaround therefore does bend around obstacles where
+/// KiCad's does not.
+///
+/// A hull of fewer than two points has no bounding box; it is returned as
+/// it is, which is what KiCad's `BBox()` of an empty chain would produce
+/// anyway.
+pub fn simplified_hull(
+  hull: Rc<LineChain>,
+  corner_mode: CornerMode,
+) -> Rc<LineChain> {
+  // :326. KiCad tests `MITERED_90 || ROUNDED_90`; this crate has no
+  // rounded modes yet, see `CornerMode`.
+  if corner_mode != CornerMode::Mitered90 {
+    return hull;
+  }
+
+  let Some(bbox) = hull.bbox(0) else {
+    return hull;
+  };
+
+  let left = bbox.left() as i32;
+  let right = bbox.right() as i32;
+  let top = bbox.top() as i32;
+  let bottom = bbox.bottom() as i32;
+
+  // :336 to :339
+  let mut box_hull = LineChain::from_slice(
+    &[
+      Vec2::new(left, top),
+      Vec2::new(right, top),
+      Vec2::new(right, bottom),
+      Vec2::new(left, bottom),
+    ],
+    true,
+  );
+
+  box_hull.set_width(hull.width());
+
+  Rc::new(box_hull)
+}
 
 /// What [`World::nearest_obstacle`] found, and where.
 ///
@@ -3085,6 +3367,11 @@ mod tests {
 
   /// The clearance every scenario test uses.
   const CLEARANCE: i32 = 2000;
+
+  /// The corner mode every scenario test routes in, which is KiCad's
+  /// default (`pcbnew/router/pns_routing_settings.cpp:53`) and the one
+  /// that leaves a hull alone; see [`simplified_hull`].
+  const CORNERS: CornerMode = CornerMode::Mitered45;
 
   /// The net every item of the fixture is on.
   const NET: Option<NetId> = Some(NetId(1));
@@ -4549,7 +4836,7 @@ mod tests {
 
     assert!(
       world
-        .nearest_obstacle(root, &clear, &rules(), &options)
+        .nearest_obstacle(root, &clear, &rules(), &options, CORNERS)
         .is_none()
     );
   }
@@ -4563,7 +4850,7 @@ mod tests {
     let options = CollisionSearchOptions::default();
 
     let found = world
-      .nearest_obstacle(root, &head, &rules(), &options)
+      .nearest_obstacle(root, &head, &rules(), &options, CORNERS)
       .expect("the line crosses the track");
 
     assert_eq!(found.item, Some(near));
@@ -4602,7 +4889,7 @@ mod tests {
     );
 
     let found = world
-      .nearest_obstacle(root, &head, &rules(), &options)
+      .nearest_obstacle(root, &head, &rules(), &options, CORNERS)
       .expect("the line crosses both tracks");
 
     assert_eq!(found.item, Some(near));
@@ -4624,7 +4911,7 @@ mod tests {
     assert!(world.item(far).map(Item::uid) < world.item(near).map(Item::uid));
 
     let found = world
-      .nearest_obstacle(root, &head, &rules(), &options)
+      .nearest_obstacle(root, &head, &rules(), &options, CORNERS)
       .expect("the line crosses both tracks");
 
     assert_eq!(found.item, Some(near));
@@ -4669,6 +4956,7 @@ mod tests {
           &head,
           &rules(),
           &CollisionSearchOptions::default(),
+          CORNERS,
         )
         .expect("the line crosses both hulls");
 
@@ -4699,7 +4987,7 @@ mod tests {
     // line never cross.
     let head = head_line(&[Vec2::new(0, 0), Vec2::new(1000, 0)]);
     let found = world
-      .nearest_obstacle(root, &head, &rules(), &options)
+      .nearest_obstacle(root, &head, &rules(), &options, CORNERS)
       .expect("the line is inside the pad's clearance");
 
     assert_eq!(found.item, Some(disc));
@@ -4731,7 +5019,7 @@ mod tests {
     let head = head_line(&[start, Vec2::new(0, 0)]);
 
     let found = world
-      .nearest_obstacle(root, &head, &rules(), &options)
+      .nearest_obstacle(root, &head, &rules(), &options, CORNERS)
       .expect("the line starts on the pad's hull");
 
     assert_eq!(found.item, Some(disc));
@@ -5081,10 +5369,250 @@ mod tests {
         first: world
           .check_colliding_line(root, &head, &rules(), &options)
           .map(|found| found.item),
-        nearest: world.nearest_obstacle(root, &head, &rules(), &options),
+        nearest: world.nearest_obstacle(
+          root,
+          &head,
+          &rules(),
+          &options,
+          CORNERS,
+        ),
       }
     }
 
     assert_eq!(run(), run());
+  }
+
+  // -----------------------------------------------------------------
+  // The hull simplification, the filter and the cluster
+  // -----------------------------------------------------------------
+
+  #[test]
+  fn a_45_degree_corner_mode_leaves_a_hull_alone() {
+    let (mut world, ids) = fixture();
+    let hull = world
+      .hull_of(ids.pad_bottom, CLEARANCE, 1000, 0)
+      .expect("the pad is live");
+    let same = simplified_hull(Rc::clone(&hull), CornerMode::Mitered45);
+
+    assert!(
+      Rc::ptr_eq(&hull, &same),
+      "no copy is made and none is needed"
+    );
+  }
+
+  #[test]
+  fn a_90_degree_corner_mode_squares_a_hull_off() {
+    let (mut world, ids) = fixture();
+    let hull = world
+      .hull_of(ids.pad_bottom, CLEARANCE, 1000, 0)
+      .expect("the pad is live");
+    let squared = simplified_hull(Rc::clone(&hull), CornerMode::Mitered90);
+    let bbox = hull.bbox(0).expect("an octagon has a bounding box");
+
+    // The four corners, in the order `makeHull` appends them
+    // (`pcbnew/router/pns_node.cpp:336`).
+    assert_eq!(
+      squared.points(),
+      [
+        Vec2::new(bbox.left() as i32, bbox.top() as i32),
+        Vec2::new(bbox.right() as i32, bbox.top() as i32),
+        Vec2::new(bbox.right() as i32, bbox.bottom() as i32),
+        Vec2::new(bbox.left() as i32, bbox.bottom() as i32),
+      ]
+    );
+    // The deviation this port makes: KiCad leaves the chain open, which
+    // gives it no inside at all. See `simplified_hull`.
+    assert!(squared.is_closed());
+    let centre = bbox.center();
+    assert!(
+      squared.point_inside(Vec2::new(centre.x as i32, centre.y as i32), 0)
+    );
+    // The box contains the octagon it came from.
+    assert_eq!(squared.bbox(0), Some(bbox));
+  }
+
+  #[test]
+  fn the_nearest_obstacle_measures_against_the_squared_hull() {
+    let mut world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let root = world.root();
+    // A diagonal track, so that its hull and the box around that hull
+    // are visibly different shapes; a vertical one is close enough to
+    // its own box that a head along the x axis enters both at the same
+    // point.
+    let item = track(
+      &mut world,
+      Vec2::new(NEAR_X - 50000, -50000),
+      Vec2::new(NEAR_X + 50000, 50000),
+      0,
+      NET,
+    );
+    let obstacle = world
+      .add_segment(root, item, false)
+      .expect("the diagonal track is neither degenerate nor redundant");
+    let head = crossing_head();
+    let options = CollisionSearchOptions::default();
+
+    let mitered = world
+      .nearest_obstacle(root, &head, &rules(), &options, CornerMode::Mitered45)
+      .expect("the head crosses the track");
+    let squared = world
+      .nearest_obstacle(root, &head, &rules(), &options, CornerMode::Mitered90)
+      .expect("the head crosses the track");
+
+    assert_eq!(mitered.item, Some(obstacle));
+    assert_eq!(squared.item, Some(obstacle));
+    // A bounding box reaches further along the head than the hull it
+    // encloses, so the line enters it sooner and the reported distance
+    // is smaller.
+    assert!(squared.dist_first < mitered.dist_first);
+    // And what comes back is the box, not the hull it was made from.
+    let boxed = squared.hull.as_ref().expect("a live obstacle has a hull");
+    let hull = mitered.hull.as_ref().expect("a live obstacle has a hull");
+
+    assert_eq!(boxed.point_count(), 4);
+    assert!(hull.point_count() > 4);
+    assert_eq!(boxed.bbox(0), hull.bbox(0));
+  }
+
+  #[test]
+  fn a_restricted_search_only_reports_what_the_filter_allows() {
+    let mut world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let root = world.root();
+    let near = crossing_track(&mut world, root, NEAR_X);
+    let far = crossing_track(&mut world, root, FAR_X);
+    let head = crossing_head();
+
+    let unfiltered = CollisionSearchOptions::default();
+    let mut allowed = BTreeSet::new();
+    allowed.insert(far);
+
+    let restricted = CollisionSearchOptions {
+      restricted_set: Some(&allowed),
+      ..CollisionSearchOptions::default()
+    };
+
+    let all: Vec<Option<ItemId>> = world
+      .query_colliding_line(root, &head, &rules(), &unfiltered)
+      .into_iter()
+      .map(|found| found.item)
+      .collect();
+    let some: Vec<Option<ItemId>> = world
+      .query_colliding_line(root, &head, &rules(), &restricted)
+      .into_iter()
+      .map(|found| found.item)
+      .collect();
+
+    assert_eq!(all, [Some(near), Some(far)]);
+    assert_eq!(some, [Some(far)]);
+
+    // And the nearest obstacle is the nearest **allowed** one, not the
+    // nearest one filtered out afterwards.
+    let nearest = world
+      .nearest_obstacle(root, &head, &rules(), &restricted, CORNERS)
+      .expect("the far track is still in the way");
+
+    assert_eq!(nearest.item, Some(far));
+
+    // An empty set excludes everything, which is why the walkaround
+    // spells "no restriction" as `None`.
+    let empty = BTreeSet::new();
+    let nothing = CollisionSearchOptions {
+      restricted_set: Some(&empty),
+      ..CollisionSearchOptions::default()
+    };
+
+    assert!(
+      world
+        .query_colliding_line(root, &head, &rules(), &nothing)
+        .is_empty()
+    );
+  }
+
+  #[test]
+  fn a_cluster_gathers_what_touches_and_stops_there() {
+    let (world, ids) = fixture();
+    let root = world.root();
+
+    // The via at the middle touches both segments and, through them, the
+    // two pads. Every one of them is on `NET`, so a head on another net
+    // excludes nothing.
+    let whole = world.assemble_cluster(root, ids.via, 0, None, None, &rules());
+
+    assert_eq!(whole[0], ids.via, "the seed comes first");
+    assert!(whole.contains(&ids.lower));
+    assert!(whole.contains(&ids.pad_bottom));
+    // The upper segment and the top pad are on layer 1, so a cluster
+    // assembled for a layer 0 head does not take them.
+    assert!(!whole.contains(&ids.upper));
+    assert!(!whole.contains(&ids.pad_top));
+
+    // Excluding the net the cluster is on leaves only the seed.
+    let excluded =
+      world.assemble_cluster(root, ids.via, 0, None, NET, &rules());
+
+    assert_eq!(excluded, [ids.via]);
+
+    // A lone item is its own cluster.
+    let alone =
+      world.assemble_cluster(root, ids.pad_top, 1, None, None, &rules());
+
+    assert_eq!(alone[0], ids.pad_top);
+
+    // A stale handle has no shape and therefore no cluster.
+    let mut copy = world;
+    let root = copy.root();
+    copy.remove(root, ids.via);
+    assert!(
+      copy
+        .assemble_cluster(root, ids.via, 0, None, None, &rules())
+        .is_empty()
+    );
+  }
+
+  #[test]
+  fn a_cluster_is_abandoned_when_it_grows_too_far() {
+    let (world, ids) = fixture();
+    let root = world.root();
+
+    // The seed is a via of diameter 3000, so any neighbour blows the
+    // bounding box up by far more than this ratio and the walk stops
+    // after the round that found it.
+    let tight =
+      world.assemble_cluster(root, ids.via, 0, Some(1.0), None, &rules());
+    let loose = world.assemble_cluster(root, ids.via, 0, None, None, &rules());
+
+    assert!(tight.len() < loose.len());
+    assert_eq!(tight[0], ids.via);
+  }
+
+  #[test]
+  fn the_clearance_for_a_line_is_the_rule_and_nothing_else() {
+    let (world, ids) = fixture();
+    let head = head_line(&[Vec2::new(0, 0), Vec2::new(HEAD_END, 0)]);
+
+    assert_eq!(
+      world.clearance_for_line(ids.pad_bottom, &head, false, &rules()),
+      CLEARANCE
+    );
+
+    // The epsilon comes off a positive answer when it is asked for.
+    let slack = FixedClearance {
+      clearance_epsilon: 10,
+      ..FixedClearance::uniform(CLEARANCE)
+    };
+
+    assert_eq!(
+      world.clearance_for_line(ids.pad_bottom, &head, true, &slack),
+      CLEARANCE - 10
+    );
+
+    // A stale handle is KiCad's "these two can never collide".
+    let mut copy = world;
+    let root = copy.root();
+    copy.remove(root, ids.pad_bottom);
+    assert_eq!(
+      copy.clearance_for_line(ids.pad_bottom, &head, false, &rules()),
+      -1
+    );
   }
 }

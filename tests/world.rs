@@ -16,6 +16,7 @@
 #![forbid(unsafe_code)]
 
 use pnsrouter::collide::CollisionSearchOptions;
+use pnsrouter::geometry::direction45::CornerMode;
 use pnsrouter::geometry::line_chain::LineChain;
 use pnsrouter::geometry::seg::Seg;
 use pnsrouter::geometry::shape::Shape;
@@ -268,7 +269,7 @@ fn a_world_survives_a_branch_a_commit_and_every_query_in_between() {
   assert_eq!(in_root, [board.tracks[1]]);
 
   let nearest = world
-    .nearest_obstacle(branch, &head, &rules, &options)
+    .nearest_obstacle(branch, &head, &rules, &options, CornerMode::Mitered45)
     .expect("the head crosses the detour");
 
   assert!(added.contains(&nearest.item.expect("a live obstacle")));
@@ -367,7 +368,7 @@ fn the_scenario_answers_identically_twice() {
     let assembled =
       world.assemble_line(root, added[0], None, false, false, true);
     let nearest = world
-      .nearest_obstacle(root, &head, &rules, &options)
+      .nearest_obstacle(root, &head, &rules, &options, CornerMode::Mitered45)
       .map(|found| (found.item, found.dist_first, found.ip_first));
 
     Answers {

@@ -11,8 +11,10 @@
 #![warn(missing_docs)]
 #![warn(clippy::missing_docs_in_private_items)]
 
+pub mod algo_base;
 pub mod arena;
 pub mod collide;
+pub mod debug;
 pub mod geometry;
 pub mod index;
 pub mod item;
@@ -20,3 +22,5 @@ pub mod joint;
 pub mod line;
 pub mod node;
 pub mod rules;
+pub mod settings;
+pub mod walkaround;

@@ -1,6 +1,6 @@
 # 003 Walkaround router
 
-Status: todo
+Status: in progress (started 2026-09-08)
 
 ## Goal
 
@@ -8,9 +8,9 @@ Interactive single net routing in mark obstacles and walkaround modes with the o
 
 ## Tasks
 
-- [ ] `RoutingSettings` and `Sizes` structs with KiCad's defaults, without the host only snap flags and the source strings.
+- [x] `RoutingSettings` and `Sizes` structs with KiCad's defaults, without the host only snap flags and the source strings.
 - [ ] `MouseTrailTracer` posture solver with the area comparison heuristic and its thresholds.
-- [ ] `Walkaround` with the two windings plus shortest policy and iteration limits, without the dead setters.
+- [x] `Walkaround` with the two windings plus shortest policy and iteration limits, without the dead setters.
 - [ ] `Optimizer`: merge obtuse, merge step, merge full, merge colinear, area and preserve vertex constraints, corner cost. Skip the dead cache and the no-op constraints.
 - [ ] `LinePlacer` as an enum state machine: start, move, route step with head and tail negotiation, fix route, fixed tail stages, undo, via placement, layer switch, finish, continue from end.
 - [ ] Scenario tests on a two layer board with pads and existing traces: route around obstacles, place a via, undo, finish on a pad.

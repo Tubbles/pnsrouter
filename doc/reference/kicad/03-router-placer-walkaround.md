@@ -1002,6 +1002,8 @@ The area test is the core: it closes the polygon formed by the candidate two-seg
 
 ## 5. WALKAROUND
 
+Erratum (2026-09-08, found while porting): in the `MITERED_90` and `ROUNDED_90` corner modes both `WALKAROUND::processCluster` (`pns_walkaround.cpp:160`) and `NODE::NearestObstacle`'s `makeHull` (`pns_node.cpp:335`) build the box hull by appending four points to a default `SHAPE_LINE_CHAIN` and never call `SetClosed( true )`. `SHAPE_LINE_CHAIN::PointInside` answers false for any open chain, and `LINE::Walkaround` relies on it (`pns_line.cpp:308`, `:409`, `:478`), so the box hull has no inside in KiCad. The port closes the box (`src/walkaround.rs`, `src/node.rs`); it is the one place milestone 3 routes differently from KiCad on purpose.
+
 Declared `pcbnew/router/pns_walkaround.h:36`, implemented in `pcbnew/router/pns_walkaround.cpp`. It is an `ALGO_BASE`, so it reads settings and the debug decorator through the router.
 
 ### 5.1 Policies, statuses, result
