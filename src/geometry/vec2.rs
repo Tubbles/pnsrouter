@@ -34,7 +34,7 @@
 //! - Scalar `+` and `-` on a whole vector (`vector2d.h:452`, `:481`) are
 //!   not ported, nothing in the ported code needs them.
 
-use crate::geometry::math::{kiround, rescale, sign};
+use crate::geometry::math::{kiround, kiround_i64, rescale, sign};
 use std::f64::consts::{FRAC_1_SQRT_2, SQRT_2};
 use std::ops::{Add, AddAssign, Div, Mul, Neg, Sub, SubAssign};
 
@@ -376,6 +376,43 @@ impl Vec2L {
     self.x * self.x + self.y * self.y
   }
 
+  /// The length, rounded to the nearest nanometre.
+  ///
+  /// Port of `EuclideanNorm`,
+  /// `libs/kimath/include/math/vector2d.h:279` instantiated over
+  /// `int64_t`, with the same three special cases as
+  /// [`Vec2::euclidean_norm`]: an exact diagonal takes `|x| * sqrt(2)`, an
+  /// axis aligned vector takes the absolute value of its one non zero
+  /// component without touching `hypot`, and everything else goes through
+  /// `hypot`. The rounding is half away from zero.
+  ///
+  /// `CIRCLE::IntersectLine` (`libs/kimath/src/geometry/circle.cpp:349`)
+  /// is the collision routine that needs the `i64` width: the vector it
+  /// measures is the difference of two `i32` points, which KiCad widens
+  /// before measuring.
+  ///
+  /// Deviation: KiCad calls `std::abs` on the coordinate, which is
+  /// undefined for `INT64_MIN`. The absolute values here saturate at
+  /// `i64::MAX`.
+  pub fn euclidean_norm(self) -> i64 {
+    let abs_x = self.x.saturating_abs();
+    let abs_y = self.y.saturating_abs();
+
+    if abs_x == abs_y {
+      return kiround_i64(abs_x as f64 * SQRT_2);
+    }
+
+    if self.x == 0 {
+      return abs_y;
+    }
+
+    if self.y == 0 {
+      return abs_x;
+    }
+
+    kiround_i64((self.x as f64).hypot(self.y as f64))
+  }
+
   /// The vector rotated by 90 degrees, `(-y, x)`.
   ///
   /// Port of `Perpendicular`,
@@ -695,5 +732,40 @@ mod tests {
     accumulator += b;
     accumulator -= Vec2L::new(1, 2);
     assert_eq!(accumulator, Vec2L::new(0, 10));
+  }
+
+  /// The widened `EuclideanNorm` keeps the three special cases of the
+  /// narrow one and rounds half away from zero,
+  /// `libs/kimath/include/math/vector2d.h:279`. `CIRCLE::IntersectLine`
+  /// is the collision routine that needs it
+  /// (`libs/kimath/src/geometry/circle.cpp:349`).
+  #[test]
+  fn vec2l_euclidean_norm() {
+    assert_eq!(Vec2L::new(0, 0).euclidean_norm(), 0);
+    assert_eq!(Vec2L::new(0, -17).euclidean_norm(), 17);
+    assert_eq!(Vec2L::new(-17, 0).euclidean_norm(), 17);
+    assert_eq!(Vec2L::new(3, 4).euclidean_norm(), 5);
+
+    // The exact diagonal takes |x| * sqrt(2), rounded.
+    assert_eq!(Vec2L::new(100, -100).euclidean_norm(), 141);
+    assert_eq!(Vec2L::new(-1, 1).euclidean_norm(), 1);
+
+    // Half away from zero: 4 * sqrt(2) is 5.657.
+    assert_eq!(Vec2L::new(4, 4).euclidean_norm(), 6);
+
+    // The width is what makes it worth having: this overflows an i32.
+    assert_eq!(
+      Vec2L::new(3_000_000_000, 4_000_000_000).euclidean_norm(),
+      5_000_000_000
+    );
+
+    // The two Vec2 widths agree wherever both can represent the answer.
+    for (x, y) in [(0, 0), (7, 0), (0, -7), (5, 5), (-5, 5), (3, 4), (11, 37)] {
+      assert_eq!(
+        Vec2L::new(i64::from(x), i64::from(y)).euclidean_norm(),
+        i64::from(Vec2::new(x, y).euclidean_norm()),
+        "at ({x}, {y})"
+      );
+    }
   }
 }

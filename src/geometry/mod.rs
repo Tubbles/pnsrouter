@@ -23,16 +23,28 @@
 //!   with the intersection, collision, distance, nearest point,
 //!   containment and self intersection queries the walkaround, the shove
 //!   and the optimizer ask of them.
+//! - [`shape`]: the enum that replaces KiCad's `SHAPE` hierarchy, with
+//!   the bounding box, centre and translation each variant needs, and the
+//!   accessors the hull builders read off it.
+//! - [`collision`]: the dispatch between two shapes, as an exhaustive
+//!   `match` over the pair, with one minimum translation vector sign
+//!   convention: the vector displaces the second argument.
 
 pub mod box2;
+pub mod collision;
 pub mod direction45;
 pub mod line_chain;
 pub mod math;
 pub mod seg;
+pub mod shape;
 pub mod vec2;
 
 pub use box2::Box2;
+pub use collision::{
+  ShapeCollision, collide, collide_mtv, collide_point, collide_seg, collides,
+};
 pub use direction45::{AngleType, CornerMode, Direction45, Octant};
 pub use line_chain::{Collision, Hit, Intersection, LineChain, SliceError};
 pub use seg::{NearestPoints, Seg, SegCollision};
+pub use shape::{Shape, ShapeKind, SimplePolygon};
 pub use vec2::{Vec2, Vec2L};
