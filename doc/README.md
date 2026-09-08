@@ -4,4 +4,5 @@
 - [../DESIGN.md](../DESIGN.md): crate architecture.
 - [log/](log/): decision log, one file per day, write once. Entries carry tags for grepping (for example `#license`, `#architecture`).
 - [work/](work/): work items with status. Finished items stay in place.
+- [librepcb-integration.md](librepcb-integration.md): design note for milestone 6, the LibrePCB board editor integration (FFI marshalling, rule resolver, session driving, commit applier, task breakdown, open questions for upstream).
 - [reference/kicad/](reference/kicad/): architecture notes on KiCad's PNS router with file:line citations, produced while studying the source. They are the primary input to DESIGN.md and to each porting work item.
