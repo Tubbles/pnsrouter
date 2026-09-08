@@ -1,6 +1,6 @@
 # 003 Walkaround router
 
-Status: in progress (started 2026-09-08)
+Status: implemented (2026-09-08)
 
 ## Goal
 
@@ -12,8 +12,8 @@ Interactive single net routing in mark obstacles and walkaround modes with the o
 - [x] `MouseTrailTracer` posture solver with the area comparison heuristic and its thresholds.
 - [x] `Walkaround` with the two windings plus shortest policy and iteration limits, without the dead setters.
 - [x] `Optimizer`: merge obtuse, merge step, merge full, merge colinear, area and preserve vertex constraints, corner cost. Skip the dead cache and the no-op constraints.
-- [ ] `LinePlacer` as an enum state machine: start, move, route step with head and tail negotiation, fix route, fixed tail stages, undo, via placement, layer switch, finish, continue from end.
-- [ ] Scenario tests on a two layer board with pads and existing traces: route around obstacles, place a via, undo, finish on a pad.
+- [x] `LinePlacer` as an enum state machine: start, move, route step with head and tail negotiation, fix route, fixed tail stages, undo, via placement, layer switch, finish, continue from end.
+- [x] Scenario tests on a two layer board with pads and existing traces: route around obstacles, place a via, undo, finish on a pad.
 
 ## Acceptance
 

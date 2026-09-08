@@ -42,13 +42,27 @@
 //! (`pcbnew/router/pns_line_placer.cpp:1492`) made explicit as note 03
 //! section 9.3 asks.
 //!
+//! # Vias and the fixed tail
+//!
+//! A via is never a separate command. [`LinePlacer::toggle_via`] only
+//! arms a flag, and the via itself is built, pushed out of whatever it
+//! lands in and attached to the head inside
+//! [`Placing::build_initial_line`] and [`Placing::rh_walk_only`], so
+//! every mouse move re decides where it can sit. Only
+//! [`LinePlacer::fix_route`] writes one into a node.
+//!
+//! The fixed tail ([`crate::placer::fixed_tail::FixedTail`]) is the undo
+//! stack: [`LinePlacer::start`] pushes one stage, every intermediate fix
+//! pushes another, and [`LinePlacer::undo_last_segment`] pops one and
+//! rolls the placement back to it, node included.
+//!
 //! # What is not here yet
 //!
-//! This is part 1 of the line placer work: placement without vias and
-//! without the fixed tail. Every site KiCad places, pushes out or commits
-//! a via, every fixed tail stage and `UnfixRoute`, `ContinueFromEnd`,
-//! `Finish` and the leading ratline carry a `TODO(part 2)` marker with
-//! the KiCad line it stands in for. Shove mode falls back to the
+//! `ContinueFromEnd` and `Finish` are host level commands that live on
+//! KiCad's router rather than on its placer
+//! (`pcbnew/router/pns_router.cpp:579`, `:624`), so they arrive with the
+//! session facade of milestone 5, and so does the leading ratline, which
+//! needs `TOPOLOGY::NearestUnconnectedItem`. Shove mode falls back to the
 //! walkaround with a `TODO(milestone 4)`, because
 //! [`crate::settings::RouterMode::Shove`] needs the shove engine that
 //! milestone 4 brings.
@@ -56,16 +70,20 @@
 use std::collections::BTreeSet;
 
 use crate::algo_base::AlgoContext;
-use crate::collide::CollisionSearchOptions;
+use crate::collide::{CollisionSearchOptions, Obstacle};
 use crate::geometry::direction45::{AngleType, CornerMode, Direction45};
 use crate::geometry::line_chain::LineChain;
 use crate::geometry::seg::Seg;
 use crate::geometry::vec2::Vec2;
-use crate::item::{Item, ItemBody, ItemId, Kind, LayerRange, NetId, Segment};
-use crate::line::Line;
+use crate::item::{
+  Item, ItemBody, ItemId, Kind, LayerRange, NetId, Segment, Via,
+};
+use crate::line::{Line, LineVia};
 use crate::mouse_trail::MouseTrailTracer;
 use crate::node::{JointRef, NodeId, World};
 use crate::optimizer::{EffortFlags, Optimizer};
+use crate::placer::fixed_tail::FixedTail;
+use crate::rules::ItemRef;
 use crate::settings::{OptimizerEffort, RouterMode, RoutingSettings, Sizes};
 use crate::walkaround::{WalkPolicy, Walkaround, WalkaroundStatus};
 
@@ -109,9 +127,20 @@ pub const SELF_INTERSECTION_RESTART_INDEX: usize = 2;
 
 /// How many rounds [`Placing::rh_walk_base`] runs while placing a via.
 ///
-/// The `round < 2` of `pcbnew/router/pns_line_placer.cpp:713`. Part 1
-/// never places a via, so the loop always runs exactly once.
+/// The `round < 2` of `pcbnew/router/pns_line_placer.cpp:713`. Without a
+/// via the loop runs exactly once; with one it walks again from the point
+/// the first walk ended at, so the via is pushed out of the way of what
+/// the walk actually produced rather than of the straight guess.
 pub const WALK_ROUNDS_WITH_VIA: u32 = 2;
+
+/// How many leads [`Placing::build_initial_line`] tries to push a via
+/// along.
+///
+/// The `attempt < 2` of `pcbnew/router/pns_line_placer.cpp:2117`: first
+/// the vector from the leg's start to the cursor, then the vector from
+/// the previous cursor position, which is roughly "back the way the
+/// mouse came".
+pub const VIA_PUSHOUT_ATTEMPTS: u32 = 2;
 
 /// How much longer than the direct path a complete walkaround may be.
 ///
@@ -155,29 +184,6 @@ fn collision_options(kind_mask: Kind) -> CollisionSearchOptions<'static> {
     kind_mask,
     ..CollisionSearchOptions::default()
   }
-}
-
-// ---------------------------------------------------------------------
-// The fixed tail placeholder
-// ---------------------------------------------------------------------
-
-/// One undo stage of the fixed tail.
-///
-/// Placeholder for `FIXED_TAIL::STAGE`
-/// (`pcbnew/router/pns_line_placer.h:62`), which carries the node a fix
-/// committed into and the fix point (layer, via flag, position and
-/// direction) the placement rolls back to.
-///
-/// `TODO(part 2)`: fill it in together with `UnfixRoute`
-/// (`pcbnew/router/pns_line_placer.cpp:1759`) and the `AddStage` calls at
-/// `:1436` and `:1720`. It exists now so that
-/// `Placing::fixed_tail` has its final type and part 2 does not have to
-/// change the shape of the state.
-#[derive(Clone, Debug)]
-pub struct FixStage {
-  /// The node the fix committed into. Port of `STAGE::commit`
-  /// (`pcbnew/router/pns_line_placer.h:93`).
-  pub node: NodeId,
 }
 
 // ---------------------------------------------------------------------
@@ -276,8 +282,10 @@ pub struct Placing {
   end_item: Option<ItemId>,
   /// Whether the next fix places a via. Port of `m_placingVia` (`:398`).
   ///
-  /// Always false in part 1; the field exists so that part 2 does not
-  /// change the shape of the state.
+  /// Only [`LinePlacer::toggle_via`] and a fix write it. It gates the via
+  /// branch of [`Placing::build_initial_line`], the second walk round of
+  /// [`Placing::rh_walk_base`] and two of the rules in
+  /// [`LinePlacer::fix_route`].
   placing_via: bool,
   /// Whether the head is forced to a single 90 or 45 degree segment.
   /// Port of `m_orthoMode` (`:412`).
@@ -298,10 +306,9 @@ pub struct Placing {
   posture: MouseTrailTracer,
   /// The undo stack. Port of `m_fixedTail` (`:415`).
   ///
-  /// `TODO(part 2)`: nothing pushes to it yet, so it is always empty; the
-  /// stages belong with `UnfixRoute`
-  /// (`pcbnew/router/pns_line_placer.cpp:1759`).
-  fixed_tail: Vec<FixStage>,
+  /// [`LinePlacer::start`] pushes one stage and every intermediate fix
+  /// pushes another; [`LinePlacer::undo_last_segment`] pops them.
+  fixed_tail: FixedTail,
 }
 
 impl Placing {
@@ -328,13 +335,45 @@ impl Placing {
 
   /// The geometry this placement uses.
   ///
-  /// Port of `m_sizes`, `pcbnew/router/pns_line_placer.h:396`. Nothing in
-  /// part 1 reads more than the track width, which
-  /// [`LinePlacer::start`] has already pushed into the head and the tail;
-  /// `makeVia` (`pcbnew/router/pns_line_placer.cpp:76`) reads the via
-  /// diameter, the drill and the via type off it in part 2.
+  /// Port of `m_sizes`, `pcbnew/router/pns_line_placer.h:396`. The track
+  /// width is pushed into the head and the tail by
+  /// [`LinePlacer::start`]; the via diameter, the drill, the type and the
+  /// layer pair are read on every via by [`Placing::make_via`].
   pub const fn sizes(&self) -> &Sizes {
     &self.sizes
+  }
+
+  /// The via a fix would place at a point.
+  ///
+  /// Port of `makeVia`, `pcbnew/router/pns_line_placer.cpp:76`. The
+  /// diameter, the drill and the type come off [`Placing::sizes`]; the
+  /// layer span comes off [`Sizes::via_layer_range`], the port of the one
+  /// non virtual host helper (`pcbnew/router/pns_router.h:144`), and
+  /// falls back to the layer being routed when the sizes carry no layer
+  /// pair.
+  ///
+  /// KiCad's `makeVia` leaves the net null and lets each of its three
+  /// callers set it (`:1506`, `:2106`) or lets `LINE::AppendVia` do it
+  /// (`pcbnew/router/pns_line.cpp:1424`). It is set here as well, so that
+  /// the via only commit of [`LinePlacer::fix_route`], which stores a via
+  /// no line ever adopted, still puts it on the routed net.
+  pub fn make_via(&self, world: &mut World, at: Vec2) -> Item {
+    let layers = self
+      .sizes
+      .via_layer_range()
+      .unwrap_or_else(|| LayerRange::single(self.layer));
+    let body = ItemBody::Via(Via::new(
+      at,
+      self.sizes.via_diameter,
+      self.sizes.via_drill,
+      self.sizes.via_type,
+    ));
+    let mut item = world.make_item(body);
+
+    item.set_layers_and_flash_all(layers);
+    item.set_net(self.net);
+
+    item
   }
 
   /// The whole routed line, tail followed by head.
@@ -809,23 +848,36 @@ impl Placing {
   /// only consulted while the tail is empty (`:2081`), and the current
   /// routing direction takes over once there is one.
   ///
-  /// `TODO(part 2)`: the via, `pcbnew/router/pns_line_placer.cpp:2102` to
-  /// `:2140`, which is the `makeVia` plus the two `PushoutForce`
-  /// attempts. `force_no_via` and `mode` exist for it; see
-  /// [`Placing::rh_walk_base`] for why `force_no_via` is always false.
+  /// # The via
   ///
-  /// Returns KiCad's `aViaOk`, which is false only when a via could not
-  /// be pushed out of the way, so it is always true in part 1.
+  /// While a via is armed ([`LinePlacer::is_placing_via`]) and
+  /// `force_no_via` is not set, the head is given a via at `at` (`:2102`
+  /// to `:2140`). Mark obstacles mode attaches it as it is and lets the
+  /// user see the collision; the other two modes push it clear with the
+  /// port of `VIA::PushoutForce`
+  /// (`pcbnew/router/pns_via.cpp:143`), retrace the head to the pushed
+  /// out position and attach it there. Two leads are tried, the leg's own direction and the
+  /// direction the cursor came from, and a via that neither lead can free
+  /// makes the routine answer false. See [`Placing::rh_walk_base`] for
+  /// why `force_no_via` never actually arrives set.
+  ///
+  /// Note the asymmetry KiCad has here too: the retrace after a pushout
+  /// always uses the guessed posture (`:2127`), where the plain trace
+  /// above uses the current routing direction as soon as there is a tail.
+  ///
+  /// Returns KiCad's `aViaOk`, false only when a via could not be pushed
+  /// out of the way.
+  #[allow(clippy::too_many_arguments)]
   pub fn build_initial_line(
     &mut self,
+    world: &mut World,
     context: &AlgoContext<'_>,
+    node: NodeId,
     at: Vec2,
     head: &mut Line,
     mode: RouterMode,
     force_no_via: bool,
   ) -> bool {
-    let _ = (mode, force_no_via);
-
     let guessed_direction = self.posture.get_posture(context, at);
     let mut corner_mode = context.settings.corner_mode;
 
@@ -898,7 +950,85 @@ impl Placing {
     head.set_layer(self.layer);
     head.set_shape(chain);
 
-    true
+    // :2102
+    if !self.placing_via || force_no_via {
+      return true;
+    }
+
+    // :2105
+    let mut via = self.make_via(world, at);
+
+    // :2106
+    via.set_net(head.net());
+
+    // :2108, the manual mode shows the via where the user asked for it,
+    // collision and all.
+    if mode == RouterMode::MarkObstacles {
+      head.append_via(via);
+
+      return true;
+    }
+
+    // :2114
+    let collision_mask = if mode == RouterMode::Walkaround {
+      Kind::ANY
+    } else {
+      Kind::SOLID
+    };
+    let iteration_limit = context.settings.via_force_prop_iteration_limit;
+
+    // :2117
+    for attempt in 0..VIA_PUSHOUT_ATTEMPTS {
+      // :2119
+      let mut lead = at - p_start;
+
+      // :2122
+      if attempt == 1
+        && let Some(previous) = self.last_p_end
+      {
+        lead = at - previous;
+      }
+
+      let Some(force) = via_pushout_force(
+        world,
+        context,
+        node,
+        &via,
+        lead,
+        collision_mask,
+        iteration_limit,
+      ) else {
+        continue;
+      };
+
+      // :2127
+      let corrected = LineChain::from_points(
+        guessed_direction.build_initial_trace(
+          p_start,
+          at + force,
+          false,
+          corner_mode,
+        ),
+        false,
+      );
+
+      // :2128. `LINE( aHead, line )` keeps the width, layers, net and
+      // rank of the head and nulls its via
+      // (`pcbnew/router/pns_line.h:81`), which is why the via is
+      // attached after the retrace and not before it.
+      *head = Line::with_chain(head, corrected);
+
+      // :2130
+      move_via_by(&mut via, force);
+
+      // :2132
+      head.append_via(via);
+
+      return true;
+    }
+
+    // :2140
+    false
   }
 
   /// Walk the tail and head around everything in the way.
@@ -929,10 +1059,19 @@ impl Placing {
   /// it would move the via on every second round. The argument is passed
   /// through so that part 2 inherits the same expression.
   ///
-  /// `TODO(part 2)`: the second round and the via transfer at `:716` to
-  /// `:721`, both of which only run while a via is being placed.
+  /// # The via
   ///
-  /// Returns the walked line and KiCad's `aViaOk`.
+  /// While a via is being placed the loop runs twice (`:713`): the second
+  /// round rebuilds the head, and with it the via, from the point the
+  /// first walk actually ended at. Afterwards the via the last
+  /// `buildInitialLine` produced is moved to the end of the walked line
+  /// (`:716` to `:721`), because the walk itself never carries one: the
+  /// line handed to the walkaround is `tail ++ l1.CLine()`, a chain
+  /// without a via, so a via is never an obstacle the walk avoids.
+  ///
+  /// Returns the walked line and KiCad's `aViaOk`. `None` covers both of
+  /// KiCad's false returns: no usable candidate (`:709`) and a walked
+  /// line that ends with a via the pushout could not free (`:733`).
   pub fn rh_walk_base(
     &mut self,
     world: &mut World,
@@ -957,17 +1096,25 @@ impl Placing {
 
     let mut round: u32 = 0;
     let mut via_ok;
+    // :553. KiCad declares `l1` outside the loop, which is what lets the
+    // via transfer below read the via of the **last** round.
+    let mut l1 = self.head.clone();
 
     loop {
-      let mut l1 = self.head.clone();
-
       l1.clear();
 
       // :576, the increment that makes the `round == 0` test below dead.
       round += 1;
 
-      via_ok =
-        self.build_initial_line(context, walk_point, &mut l1, mode, round == 0);
+      via_ok = self.build_initial_line(
+        world,
+        context,
+        node,
+        walk_point,
+        &mut l1,
+        mode,
+        round == 0,
+      );
 
       // :584
       let mut initial_track = self.tail.clone();
@@ -1108,11 +1255,23 @@ impl Placing {
       }
     }
 
-    // TODO(part 2): the via transfer of
-    // `pcbnew/router/pns_line_placer.cpp:716` to `:721`, which moves the
-    // via built by `buildInitialLine` to the end of the walked line.
+    // :716. KiCad reads `walkFull.CLastPoint()` unchecked; a walked line
+    // with no points has nowhere to put a via, so the transfer is
+    // skipped rather than reading out of range.
+    if let Some(LineVia::Owned(item)) = l1.via()
+      && let Some(last) = walk_full.last_point()
+    {
+      let mut moved = item.clone();
+
+      move_via_to(&mut moved, last);
+      walk_full.append_via(moved);
+    }
 
     // :733
+    if walk_full.ends_with_via() && !via_ok {
+      return None;
+    }
+
     Some((walk_full, via_ok))
   }
 
@@ -1173,8 +1332,11 @@ impl Placing {
   /// passes of `src/optimizer.rs` build their breakouts in 45 degree
   /// corners only, which is the same guard seen from the other side.
   ///
-  /// `TODO(part 2)`: the via append at
-  /// `pcbnew/router/pns_line_placer.cpp:792`.
+  /// The via at `:792` is a **fresh** one at the new head's last point
+  /// rather than the one [`Placing::rh_walk_base`] carried:
+  /// [`split_head_tail`] drops the via whenever the old tail survived,
+  /// and the two positions agree anyway because the head ends where the
+  /// walk did.
   pub fn rh_walk_only(
     &mut self,
     world: &mut World,
@@ -1183,7 +1345,7 @@ impl Placing {
     at: Vec2,
   ) -> Option<(Line, Line)> {
     // :744
-    let (walk_full, _via_ok) = self.rh_walk_base(
+    let (walk_full, via_ok) = self.rh_walk_base(
       world,
       context,
       node,
@@ -1209,6 +1371,16 @@ impl Placing {
     // :789
     let (mut new_head, new_tail) = split_head_tail(&walk_full, &self.tail);
 
+    // :792
+    if self.placing_via
+      && via_ok
+      && let Some(last) = new_head.last_point()
+    {
+      let via = self.make_via(world, last);
+
+      new_head.append_via(via);
+    }
+
     // :799
     Optimizer::optimize_line(
       world,
@@ -1232,6 +1404,11 @@ impl Placing {
   /// as tightly as possible without turning on shove or walkaround. The
   /// routine never fails, so mark obstacles mode never gets stuck.
   ///
+  /// A via needs no handling of its own here: `buildInitialLine` attaches
+  /// one directly in this mode (`:2108`), collision and all, and the
+  /// second call below rebuilds both the trace and the via at the snapped
+  /// point.
+  ///
   /// The blocking obstacle of the head is cleared (`:811`) and never set:
   /// the only code that would set it is the `#if 0` "stop at first
   /// obstacle" sketch at `:840`, which note 03 section 9.5 lists as not
@@ -1250,7 +1427,9 @@ impl Placing {
     let mut head = self.head.clone();
 
     self.build_initial_line(
+      world,
       context,
+      node,
       at,
       &mut head,
       RouterMode::MarkObstacles,
@@ -1295,7 +1474,9 @@ impl Placing {
           && (nearest - at).euclidean_norm() < head.width() / 2
         {
           self.build_initial_line(
+            world,
             context,
+            node,
             nearest,
             &mut head,
             RouterMode::MarkObstacles,
@@ -1659,6 +1840,219 @@ impl Placing {
 }
 
 // ---------------------------------------------------------------------
+// The via helpers
+// ---------------------------------------------------------------------
+
+/// Move a via item to a point.
+///
+/// The `v.SetPos( walkFull.CLastPoint() )` of
+/// `pcbnew/router/pns_line_placer.cpp:719`. KiCad's `VIA::SetPos` also
+/// recentres the hole the via owns (`pcbnew/router/pns_via.h:208`); a
+/// preview via is not in a node and therefore has no hole item, which is
+/// what [`via_pushout_force`] documents. A non via item is left alone,
+/// where KiCad's typed `VIA&` makes the case unrepresentable.
+fn move_via_to(item: &mut Item, pos: Vec2) {
+  if let ItemBody::Via(body) = item.body_mut() {
+    body.set_pos(pos);
+  }
+}
+
+/// Move a via item by a vector.
+///
+/// The `mv.SetPos( mv.Pos() + force )` of
+/// `pcbnew/router/pns_via.cpp:196` and `:216`, and the
+/// `v.SetPos( v.Pos() + force )` of
+/// `pcbnew/router/pns_line_placer.cpp:2130`.
+fn move_via_by(item: &mut Item, delta: Vec2) {
+  if let ItemBody::Via(body) = item.body_mut() {
+    let pos = body.pos();
+
+    body.set_pos(pos + delta);
+  }
+}
+
+/// The translation vector that frees a via from one obstacle.
+///
+/// The `mv.PushoutForce( aNode, obs->m_item, force )` of
+/// `pcbnew/router/pns_via.cpp:166`, which is the three argument overload
+/// at `:126`; the geometry of it is
+/// [`crate::item::Via::pushout_force`].
+///
+/// KiCad asks the node for `GetClearance( this, aOther, false )`
+/// (`:128`). That cannot go through [`World::clearance_between`] here,
+/// because a preview via has no [`ItemId`] to key the cache on, so the
+/// resolver is asked directly with the virtual item rule of
+/// `pcbnew/router/pns_node.cpp:148` in front of it.
+///
+/// `None` when the obstacle handle is stale, when the moving item is not
+/// a via, and when the two shapes give a zero translation vector.
+fn single_step_force(
+  world: &World,
+  context: &AlgoContext<'_>,
+  moving: &Item,
+  obstacle: &Obstacle,
+) -> Option<Vec2> {
+  let other_id = obstacle.item?;
+  let other = world.item(other_id)?;
+  let ItemBody::Via(body) = moving.body() else {
+    return None;
+  };
+
+  // :128, `NODE::GetClearance`.
+  let clearance = if moving.is_virtual() || other.is_virtual() {
+    0
+  } else {
+    context
+      .resolver
+      .clearance(
+        ItemRef::unstored(moving),
+        Some(ItemRef::stored(other_id, other)),
+        false,
+      )
+      .unwrap_or(-1)
+  };
+
+  body.pushout_force(moving.layers(), other, clearance)
+}
+
+/// Walk a via out of everything it collides with.
+///
+/// Port of `VIA::PushoutForce( NODE*, const VECTOR2I&, VECTOR2I&, int,
+/// int )`, `pcbnew/router/pns_via.cpp:143`, the iterative overload the
+/// line placer needs. A copy of the via is stepped along the minimum
+/// translation vector of the first obstacle it meets until nothing is in
+/// the way; the answer is the accumulated displacement. Past half the
+/// iteration budget an oversized force is taken as a sign that the
+/// barycentric direction is wrong, and the step follows `direction`, the
+/// lead vector, instead.
+///
+/// `None` is KiCad's `false`: either the budget ran out (`:224`), or an
+/// obstacle was reported whose translation vector came out zero (`:174`),
+/// which the comment there calls a failure of force propagation.
+///
+/// # A KiCad no op, reproduced
+///
+/// The cap on the translation vector at `pcbnew/router/pns_via.cpp:207`
+/// reads `force.Resize( threshold )`, and `VECTOR2::Resize` is `const`
+/// (`libs/kimath/include/math/vector2d.h:186`), so its result is thrown
+/// away and the step is **not** capped on that branch. Only the lead
+/// vector branch, which assigns, really limits its step. Note 03 section
+/// 9.6 asks for the code to be reproduced rather than the comment's
+/// intent, because a regression suite built from KiCad logs pins the
+/// code, so the cap is left out here as well and the `threshold` only
+/// decides which of the two branches runs.
+///
+/// # No hole
+///
+/// The via handed in is the placer's preview via: an [`Item`] that is in
+/// no node, so it carries no hole item and the pushout resolves copper
+/// clearances only. KiCad's `VIA` always owns a hole, so its pushout also
+/// answers to hole to hole and copper to hole rules. Giving a preview via
+/// a hole needs an arena item for it, which is a change to
+/// [`crate::line::LineVia`] and belongs with the shove.
+#[allow(clippy::too_many_arguments)]
+fn via_pushout_force(
+  world: &World,
+  context: &AlgoContext<'_>,
+  node: NodeId,
+  via: &Item,
+  direction: Vec2,
+  collision_mask: Kind,
+  max_iterations: u32,
+) -> Option<Vec2> {
+  let layers = via.layers();
+  let ItemBody::Via(body) = via.body() else {
+    return None;
+  };
+
+  // :181. KiCad calls it "another stupid heuristic": a quarter of the
+  // via's own copper diameter.
+  let threshold = body.diameter(layers, body.effective_layer(layers, 0)) / 4;
+  let mut moving = via.clone();
+  let mut total = Vec2::new(0, 0);
+  let mut iteration: u32 = 0;
+
+  // :155
+  let options = CollisionSearchOptions {
+    limit_count: Some(1),
+    kind_mask: collision_mask,
+    use_clearance_epsilon: false,
+    ..CollisionSearchOptions::default()
+  };
+
+  // :153
+  while iteration < max_iterations {
+    // :160
+    let Some(obstacle) = world.check_colliding(
+      node,
+      ItemRef::unstored(&moving),
+      context.resolver,
+      &options,
+    ) else {
+      break;
+    };
+
+    // :166
+    let Some(force) = single_step_force(world, context, &moving, &obstacle)
+    else {
+      // :174
+      return None;
+    };
+
+    let magnitude = force.euclidean_norm();
+
+    // :187
+    let step = if iteration > max_iterations / 2 && magnitude > threshold {
+      direction.resize(threshold)
+    } else {
+      // :200, whose cap at `:207` is the no op the doc comment says
+      // KiCad throws away.
+      force
+    };
+
+    total += step;
+
+    move_via_by(&mut moving, step);
+
+    iteration += 1;
+  }
+
+  // :224
+  if iteration == max_iterations {
+    return None;
+  }
+
+  Some(total)
+}
+
+/// Put the via a trace ends with into a node.
+///
+/// The `Clone( pl.Via() ); newVia->ResetUid(); m_lastNode->Add(...)` of
+/// `pcbnew/router/pns_line_placer.cpp:1621` and `:1704`. `ResetUid`
+/// becomes a fresh uid from the world: the preview via's uid belongs to
+/// the item the placer was dragging, and the stored one is a new object
+/// whose uid orders it against the rest of the node (`DESIGN.md`
+/// section 8).
+///
+/// `None` when the trace ends with no via, and when the via it ends with
+/// already lives in a node, which the placer's head never produces.
+fn store_trace_via(
+  world: &mut World,
+  node: NodeId,
+  trace: &Line,
+) -> Option<ItemId> {
+  let LineVia::Owned(item) = trace.via()? else {
+    return None;
+  };
+  let mut stored = item.clone();
+  let uid = world.next_uid();
+
+  stored.set_uid(uid);
+
+  Some(world.add_via(node, stored))
+}
+
+// ---------------------------------------------------------------------
 // splitHeadTail
 // ---------------------------------------------------------------------
 
@@ -1750,7 +2144,7 @@ pub fn split_head_tail(new_line: &Line, old_tail: &Line) -> (Line, Line) {
 ///
 /// Port of `PNS::LINE_PLACER` (`pcbnew/router/pns_line_placer.h:113`).
 /// See the module documentation for the shape of the state and for what
-/// part 1 leaves out.
+/// is left to later milestones.
 ///
 /// The methods below are the port of `PLACEMENT_ALGO`
 /// (`pcbnew/router/pns_placement_algo.h:44`) as a plain `impl`; note 03
@@ -1880,6 +2274,11 @@ impl LinePlacer {
   /// Where the head ends, which is not the cursor when something is in
   /// the way. Port of `CurrentEnd()`,
   /// `pcbnew/router/pns_line_placer.h:192`.
+  ///
+  /// A trace that is nothing but a via has no points, so
+  /// [`LinePlacer::move_to`] leaves this at `Placing::p_start`
+  /// (`pcbnew/router/pns_line_placer.cpp:1529`), which is where that via
+  /// sits.
   pub fn current_end(&self) -> Option<Vec2> {
     self.state.placing().map(|placing| placing.current_end)
   }
@@ -1930,7 +2329,11 @@ impl LinePlacer {
   /// Whether a via is pending. Port of `IsPlacingVia()`,
   /// `pcbnew/router/pns_line_placer.h:233`.
   ///
-  /// Always false in part 1; see [`LinePlacer::toggle_via`].
+  /// "Pending" and not "present": the flag says the next fix will place
+  /// one, and whether the head actually carries one right now is
+  /// `head().is_some_and(Line::ends_with_via)`, which the pushout can
+  /// refuse. An idle or finished placer answers false, where KiCad
+  /// answers with a stale flag.
   pub fn is_placing_via(&self) -> bool {
     self
       .state
@@ -1948,14 +2351,15 @@ impl LinePlacer {
   /// # Deviation
   ///
   /// Note 03 section 9.1 suggests collapsing both halves into one
-  /// computed answer. The stage half is empty until part 2 fills the
-  /// fixed tail in, so `Placing::placement_correct` is kept as a field
-  /// and the expression stays KiCad's.
+  /// computed answer. They are not the same predicate once
+  /// [`LinePlacer::undo_last_segment`] exists: an undo pops a stage but
+  /// deliberately leaves `Placing::placement_correct` alone, so the field
+  /// is kept and the expression stays KiCad's.
   pub fn has_placed_anything(&self) -> bool {
     match &self.state {
       PlacerState::Idle { .. } => false,
       PlacerState::Placing(placing) => {
-        placing.placement_correct || placing.fixed_tail.len() > 1
+        placing.placement_correct || placing.fixed_tail.stage_count() > 1
       }
       PlacerState::Finished { placed_anything } => *placed_anything,
     }
@@ -2015,18 +2419,37 @@ impl LinePlacer {
 
   /// Enable or disable a via at the end of the trace.
   ///
-  /// Port of `ToggleVia`, `pcbnew/router/pns_line_placer.cpp:84`.
+  /// Port of `ToggleVia`, `pcbnew/router/pns_line_placer.cpp:84`, which
+  /// sets the flag and, when disabling, drops the via the head is
+  /// carrying. It never builds one: the via is materialised inside
+  /// [`Placing::build_initial_line`] (`:2105`) and
+  /// [`Placing::rh_walk_only`] (`:792`) on the next move, so the caller
+  /// has to move before the change is visible in the preview. It touches
+  /// nothing else, the posture solver included.
   ///
-  /// `TODO(part 2)`: the whole method. KiCad sets `m_placingVia` and
-  /// removes the head's via when disabling; the via itself is
-  /// materialised inside `buildInitialLine` (`:2105`), `rhWalkOnly`
-  /// (`:796`) and `rhShoveOnly` (`:954`), none of which place one yet.
-  /// Answering false, where KiCad always answers true, is what tells a
-  /// host that the request was not honoured.
-  pub const fn toggle_via(&mut self, enabled: bool) -> bool {
-    let _ = enabled;
+  /// # Deviation
+  ///
+  /// KiCad always answers true and writes `m_placingVia` even on an idle
+  /// placer. The flag lives inside [`Placing`] here, so there is nowhere
+  /// to record it before a placement starts; an idle or finished placer
+  /// answers false instead, which tells a host the request was not
+  /// honoured. `ROUTER::ToggleViaPlacement`
+  /// (`pcbnew/router/pns_router.cpp:1019`) only calls it while routing, so
+  /// the case does not arise there.
+  pub fn toggle_via(&mut self, enabled: bool) -> bool {
+    let Some(placing) = self.state.placing_mut() else {
+      return false;
+    };
 
-    false
+    // :86
+    placing.placing_via = enabled;
+
+    // :88
+    if !enabled {
+      placing.head.remove_via();
+    }
+
+    true
   }
 
   /// Change the routing layer.
@@ -2039,11 +2462,19 @@ impl LinePlacer {
   /// is a via or a solid that reaches the requested layer, and the live
   /// state is reset and the preview regenerated on the new layer.
   ///
-  /// `TODO(part 2)`: nothing here places a via, so a layer change during
-  /// a placement leaves the already fixed part unconnected to the new
-  /// layer. KiCad has the same hole; it is the via that closes it, and
-  /// `m_chainedPlacement` is what stops a user falling into it after a
-  /// fix (`:1354`).
+  /// There is no via handling in this method, and there is none in
+  /// KiCad's either. A layer change mid placement is legal exactly while
+  /// `Placing::chained` is false, and the only thing that clears that
+  /// flag after a fix is having ended the fixed leg with a via
+  /// (`:1725`), so "switch layers" and "leave a via behind" are one
+  /// decision made at the fix and not two. A host that wants KiCad's key
+  /// binding drives [`LinePlacer::toggle_via`], then
+  /// [`LinePlacer::fix_route`], then this
+  /// (`pcbnew/router/pns_router.cpp:1010`).
+  ///
+  /// The layer pair of [`Sizes`] does not gate the change either: it only
+  /// decides the span of the via a fix places, through
+  /// [`Sizes::via_layer_range`].
   ///
   /// A finished placer refuses, where KiCad's idle flag lets it record a
   /// layer for a next placement on the same object; its router builds a
@@ -2215,9 +2646,10 @@ impl LinePlacer {
   /// the routing. Wiring them up is a behaviour change that belongs in a
   /// fixture backed decision of its own, not in a port.
   ///
-  /// `TODO(part 2)`: the first fixed tail stage,
-  /// `pcbnew/router/pns_line_placer.cpp:1436`, which is what makes
-  /// `HasPlacedAnything`'s `StageCount() > 1` mean "a fix happened".
+  /// The first fixed tail stage (`:1436`) is pushed at the end, which is
+  /// what makes `HasPlacedAnything`'s `StageCount() > 1` mean "a fix
+  /// happened" and what gives [`LinePlacer::undo_last_segment`] a floor
+  /// to stop at.
   ///
   /// `TODO(milestone 4)`: the shove engine over a branch of the placement
   /// node, `pcbnew/router/pns_line_placer.cpp:1478`.
@@ -2284,7 +2716,7 @@ impl LinePlacer {
       layer,
       sizes: self.sizes.clone(),
       posture: MouseTrailTracer::new(),
-      fixed_tail: Vec::new(),
+      fixed_tail: FixedTail::new(),
     };
 
     // :1423 to :1427, in KiCad's order.
@@ -2298,6 +2730,17 @@ impl LinePlacer {
     placing
       .posture
       .set_mouse_disabled(!context.settings.auto_posture);
+
+    // :1436. KiCad takes the shove's node in shove mode (`:1431`);
+    // `TODO(milestone 4)` for that, the placement node is right for the
+    // other two.
+    placing.fixed_tail.add_stage(
+      placing.fix_start,
+      placing.layer,
+      placing.placing_via,
+      placing.direction,
+      branch,
+    );
 
     self.state = PlacerState::Placing(Box::new(placing));
 
@@ -2321,10 +2764,13 @@ impl LinePlacer {
   /// node shallower than the one the end item lives in, that is, into a
   /// node the end item does not exist in.
   ///
-  /// `TODO(part 2)`: the zero length via fallback at `:1505`, which
-  /// attaches a via when the user presses the via key without moving the
-  /// mouse, and `updateLeadingRatLine` at `:1549`, which needs
-  /// `TOPOLOGY::LeadingRatLine`.
+  /// The zero length via fallback at `:1505` covers the user pressing the
+  /// via key without moving the mouse: the lead vector is then zero, the
+  /// pushout of [`Placing::build_initial_line`] cannot resolve anything,
+  /// and the head would carry no via for the next fix to commit.
+  ///
+  /// `updateLeadingRatLine` (`:1549`) is
+  /// [`LinePlacer::update_leading_ratline`], a stub; see there.
   ///
   /// Always answers true while a placement is running, as KiCad does; the
   /// "did the head reach the cursor" answer is internal and a host reads
@@ -2366,6 +2812,16 @@ impl LinePlacer {
 
       // :1498
       reaches_end = placing.route(world, context, node, at);
+
+      // :1505
+      if placing.placing_via
+        && at == placing.p_start()
+        && !placing.head.ends_with_via()
+      {
+        let fallback = placing.make_via(world, at);
+
+        placing.head.append_via(fallback);
+      }
 
       // :1512
       current = placing.trace();
@@ -2501,9 +2957,20 @@ impl LinePlacer {
   /// when the caller forces it; that is the answer returned, and a host
   /// uses it to decide whether the interactive loop is over.
   ///
-  /// `TODO(part 2)`: the via only commit at `:1603` to `:1634`, the via
-  /// append at `:1704`, the fixed tail stage at `:1720`, and the arc
-  /// branches at `:1650` and `:1671` which arrive with the arcs.
+  /// # The via
+  ///
+  /// A trace of no segments that ends with a via is the via only commit
+  /// (`:1616` to `:1633`): the via is stored on its own and the placement
+  /// ends. Otherwise the via, when there is one, is stored after the
+  /// segments (`:1704`), and it changes three of the rules around it: the
+  /// last segment is always emitted (`:1659`), the next leg starts at the
+  /// trace's end rather than one point back (`:1717`), and
+  /// `Placing::chained` stays false so the layer may still change
+  /// (`:1725`).
+  ///
+  /// `TODO(arcs)`: the arc branches at `:1650` and `:1671`, together with
+  /// the "rollback is broken for arcs" override that forces `fix_all` on
+  /// (`:1652`).
   ///
   /// `TODO(milestone 4)`: the shove node as the collision node (`:1589`)
   /// and the locked springback nodes at `:1737` and `:1750`.
@@ -2533,6 +3000,7 @@ impl LinePlacer {
     let mut trace;
     let net;
     let layer;
+    let placing_via;
 
     {
       let placing = self
@@ -2564,6 +3032,7 @@ impl LinePlacer {
 
       net = placing.net;
       layer = placing.layer;
+      placing_via = placing.placing_via;
     }
 
     // :1587
@@ -2584,10 +3053,24 @@ impl LinePlacer {
         Self::simplify_new_line(world, context, last, id);
       }
 
-      // TODO(part 2): the via only commit,
-      // `pcbnew/router/pns_line_placer.cpp:1616` to `:1633`. Without a
-      // via there is nothing to commit, which is KiCad's `:1617`.
-      return false;
+      // :1617
+      if !trace.ends_with_via() {
+        return false;
+      }
+
+      // :1623
+      store_trace_via(world, last, &trace);
+
+      // :1629. KiCad nulls `m_currentNode` and keeps `m_lastNode`, so a
+      // following `CommitPlacement` still folds the via into the board;
+      // the node handles are not optional here, so only the state
+      // changes. `TODO(milestone 4)`: the locked springback node at
+      // `:1626`.
+      self.state = PlacerState::Finished {
+        placed_anything: true,
+      };
+
+      return true;
     }
 
     // :1636
@@ -2619,8 +3102,10 @@ impl LinePlacer {
     };
     let last_direction = Direction45::from_seg(&direction_segment, false);
 
-    // :1659
-    let last_vertex = if real_end || fix_all {
+    // :1659. A pending via pins the last segment: the via sits at the
+    // trace's end, so leaving that segment rubber banded would leave the
+    // via hanging off nothing.
+    let last_vertex = if real_end || placing_via || fix_all {
       trace.segment_count()
     } else {
       1.max(trace.segment_count() - 1)
@@ -2641,6 +3126,9 @@ impl LinePlacer {
       last_item = world.add_segment(last, item, false);
     }
 
+    // :1704
+    store_trace_via(world, last, &trace);
+
     // :1712
     if let Some(id) = last_item {
       Self::simplify_new_line(world, context, last, id);
@@ -2656,7 +3144,15 @@ impl LinePlacer {
     }
 
     // :1715, the intermediate click.
-    let next_start = if fix_all { last_point } else { pre_last_point };
+    let next_start = if placing_via || fix_all {
+      last_point
+    } else {
+      pre_last_point
+    };
+    // :1720 records the node the placement stood on **before** this fix,
+    // which is the node an undo has to come back to.
+    let stage_node = self.current_node;
+    let ends_with_via = trace.ends_with_via();
     let next_node = world.branch(last);
 
     self.current_node = last;
@@ -2671,33 +3167,162 @@ impl LinePlacer {
     placing.set_initial_direction(last_direction);
     placing.current_start = next_start;
 
-    // TODO(part 2): the fixed tail stage,
-    // `pcbnew/router/pns_line_placer.cpp:1720`, which records
-    // `fix_start`, the layer, the via flag, the direction and the node
-    // the fix committed into.
+    // :1720. Every field is read before the resets below overwrite it.
+    placing.fixed_tail.add_stage(
+      placing.fix_start,
+      placing.layer,
+      placing.placing_via,
+      placing.direction,
+      stage_node,
+    );
 
     placing.fix_start = next_start;
     placing.start_item = None;
     placing.placing_via = false;
 
-    // :1725. Without a via the layer is pinned from here on.
-    placing.chained = true;
+    // :1725. Without a via the layer is pinned from here on; with one the
+    // trace can carry on wherever the via reaches.
+    placing.chained = !ends_with_via;
 
     placing.direction = placing.initial_direction;
     placing.head.clear();
     placing.tail.clear();
 
-    // :1739
+    // :1739. A fix that ended on a via gives the posture solver nothing
+    // to continue from, because the next leg leaves the via in whatever
+    // direction the user takes it.
+    let last_seg_dir = if ends_with_via {
+      Direction45::default()
+    } else {
+      last_direction
+    };
+
+    // :1741
     placing.posture.clear();
     placing.posture.set_tolerance(placing.head.width());
     placing.posture.add_trail_point(context, next_start);
     placing
       .posture
-      .set_default_directions(last_direction, last_direction);
+      .set_default_directions(last_seg_dir, last_seg_dir);
 
     placing.placement_correct = true;
 
     false
+  }
+
+  // -----------------------------------------------------------------
+  // Undo
+  // -----------------------------------------------------------------
+
+  /// Roll the placement back to the previous fix.
+  ///
+  /// Port of `UnfixRoute`,
+  /// `pcbnew/router/pns_line_placer.cpp:1759`. One stage comes off the
+  /// fixed tail and the whole live state is restored from it: the start
+  /// point, the layer, the routing direction, the via flag and the node
+  /// the placement stood on before the fix that stage recorded. Because
+  /// [`FixedTail::pop_stage`] never removes the bottom stage, undoing
+  /// past the first fix keeps answering with the point the placement
+  /// started at instead of failing.
+  ///
+  /// The answer is the head's first point **before** the undo, which
+  /// KiCad's host uses to put the cursor back where the undone leg began
+  /// (note 03 section 3.11).
+  ///
+  /// # Deviation
+  ///
+  /// KiCad leaves the nodes above the restored one alive and lets the
+  /// parent's destructor collect them. This crate owns its node tree
+  /// explicitly (note 03 section 9.3), so the subtree above the stage's
+  /// node is dropped before the fresh scratch branch is taken. Nothing
+  /// observable changes: those nodes were already unreachable from the
+  /// restored one.
+  ///
+  /// Two of KiCad's fields are deliberately **not** restored, because
+  /// KiCad does not restore them either: `m_chainedPlacement` and
+  /// `m_placementCorrect` keep whatever the last fix left them at. That
+  /// means an undo back to the very start still reports
+  /// [`LinePlacer::has_placed_anything`] as true, which is what lets a
+  /// host tell "nothing was ever placed" from "everything was undone".
+  ///
+  /// `TODO(milestone 4)`: the springback rewind and unlock at `:1789`,
+  /// and the shove branch at `:1792`.
+  ///
+  /// `None` when nothing is being placed.
+  pub fn undo_last_segment(
+    &mut self,
+    world: &mut World,
+    context: &AlgoContext<'_>,
+  ) -> Option<Vec2> {
+    let (stage, head_start) = {
+      let placing = self.state.placing_mut()?;
+      // :1764
+      let stage = placing.fixed_tail.pop_stage()?;
+
+      // :1767
+      let head_start =
+        (placing.head.point_count() > 0).then(|| placing.head.point(0));
+
+      // :1770
+      placing.head.chain_mut().clear();
+      placing.tail.chain_mut().clear();
+      placing.start_item = None;
+
+      // :1773. `m_p_start` is derived here, and an empty tail makes it
+      // `current_start`, so writing that one covers all three of KiCad's
+      // assignments.
+      placing.current_start = stage.pos;
+      placing.fix_start = stage.pos;
+      placing.direction = stage.direction;
+      placing.placing_via = stage.placing_via;
+      placing.layer = stage.layer;
+
+      // :1780
+      placing.head.set_layer(stage.layer);
+      placing.tail.set_layer(stage.layer);
+      placing.head.remove_via();
+      placing.tail.remove_via();
+
+      // :1785
+      placing.posture.clear();
+      placing
+        .posture
+        .set_default_directions(placing.initial_direction, stage.direction);
+      placing.posture.add_trail_point(context, stage.pos);
+
+      (stage, head_start)
+    };
+
+    // :1777
+    self.current_node = stage.node;
+
+    // See the deviation above.
+    world.kill_children(stage.node);
+
+    // :1798
+    self.last_node = Some(world.branch(stage.node));
+
+    head_start
+  }
+
+  /// The rat line from the end of the trace to what it still has to
+  /// reach.
+  ///
+  /// Port of `updateLeadingRatLine`,
+  /// `pcbnew/router/pns_line_placer.cpp:2021`, whose body is
+  /// `TOPOLOGY( m_lastNode ).LeadingRatLine( &Trace(), ratLine )` followed
+  /// by a call into the host's `DisplayRatline`.
+  ///
+  /// `TODO(milestone 5)`: `TOPOLOGY::LeadingRatLine`
+  /// (`pcbnew/router/pns_topology.cpp:168`) rests on
+  /// `NearestUnconnectedItem`, which needs the connectivity view of the
+  /// board that only the session facade has. The stub answers [`None`],
+  /// the same thing KiCad's does when nothing unconnected is left, and
+  /// the host draws nothing. `Move` calls it at `:1549`; the call is left
+  /// out until there is something to draw, because the answer is pure and
+  /// nothing else reads it.
+  pub const fn update_leading_ratline(&self) -> Option<LineChain> {
+    None
   }
 
   /// Fold the placed geometry into the root.
@@ -2708,8 +3333,19 @@ impl LinePlacer {
   /// commit itself is [`World::commit`], which also drops every branch of
   /// the root, so the placer's nodes are gone afterwards.
   ///
+  /// A via needs nothing of its own here. Both places that store one,
+  /// the via only commit and the append after the segments, put it in the
+  /// scratch branch (`:1621`, `:1704`), and [`World::commit`] folds the
+  /// branch whole, hole included.
+  ///
   /// `TODO(milestone 4)`: the shove rewind at `:1814`, which adopts the
   /// last locked springback node as the node to commit.
+  ///
+  /// `AbortPlacement` (`pcbnew/router/pns_line_placer.cpp:2150`) is not
+  /// ported: note 03 section 9.5 lists it among the routines with no
+  /// caller in this revision, and its body is
+  /// `m_world->KillChildren(); m_lastNode = nullptr;`, which a host can
+  /// spell for itself.
   ///
   /// KiCad leaves both node pointers null; this leaves the placer
   /// pointing at the root, see [`LinePlacer::current_node`].
@@ -3048,7 +3684,7 @@ mod tests {
       layer: 0,
       sizes: Sizes::default(),
       posture: MouseTrailTracer::new(),
-      fixed_tail: Vec::new(),
+      fixed_tail: FixedTail::new(),
     }
   }
 
@@ -3371,6 +4007,121 @@ mod tests {
     assert!(!placer.is_placing_via());
     assert!(placer.head().is_none());
     assert!(placer.traces().is_empty());
+  }
+
+  #[test]
+  fn undoing_restores_the_direction_and_the_via_flag_of_the_stage() {
+    // Two legs at right angles over an empty world, so that the fixes
+    // leave `direction` and `initial_direction` pointing somewhere other
+    // than where `start` put them, and the undo has something to
+    // restore.
+    let mut world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let root = world.root();
+    let rules = FixedClearance::uniform(1000);
+    let settings = RoutingSettings::default();
+    let context = AlgoContext::new(&rules, &settings);
+    let mut placer = LinePlacer::new(&world, root, &settings, Sizes::default());
+    let seeded = settings.initial_direction();
+
+    assert!(placer.start(&mut world, &context, at(0, 0), None));
+
+    // The first stage carries exactly what `start` set up.
+    let placing = placer.state.placing().expect("a placement is running");
+
+    assert_eq!(placing.fixed_tail.stage_count(), 1);
+    assert_eq!(placing.direction, seeded);
+    assert!(!placing.placing_via);
+
+    // Leg one runs east, leg two north, and the second fix arms a via so
+    // that the stage it pushes differs from the first one in every
+    // field an undo restores.
+    assert!(placer.move_to(&mut world, &context, at(4_000_000, 0), None));
+    assert!(!placer.fix_route(
+      &mut world,
+      &context,
+      at(4_000_000, 0),
+      None,
+      false
+    ));
+    assert!(placer.toggle_via(true));
+    assert!(placer.move_to(
+      &mut world,
+      &context,
+      at(4_000_000, -4_000_000),
+      None
+    ));
+    assert!(!placer.fix_route(
+      &mut world,
+      &context,
+      at(4_000_000, -4_000_000),
+      None,
+      false
+    ));
+
+    let placing = placer.state.placing().expect("a placement is running");
+
+    assert_eq!(placing.fixed_tail.stage_count(), 3);
+    // Both fixes rewrote the initial direction from the leg they ended.
+    assert_ne!(placing.initial_direction, seeded);
+
+    // Three undos come back past both fixes to the stage `start` pushed,
+    // whose contents are known exactly: two pops take the two fixes off
+    // and the third hands out the bottom stage without removing it.
+    for _ in 0..3 {
+      placer.undo_last_segment(&mut world, &context);
+    }
+
+    let placing = placer.state.placing().expect("a placement is running");
+
+    assert_eq!(placing.direction, seeded, "the direction was not restored");
+    assert_eq!(placing.current_start, at(0, 0));
+    assert_eq!(placing.fix_start, at(0, 0));
+    assert_eq!(placing.layer, 0);
+    assert!(!placing.placing_via, "the via flag was not restored");
+    assert_eq!(placing.head.point_count(), 0);
+    assert_eq!(placing.tail.point_count(), 0);
+    // The bottom stage stays, so `has_placed_anything` still remembers
+    // that something was fixed, which KiCad's undo does not clear either.
+    assert_eq!(placing.fixed_tail.stage_count(), 1);
+    assert!(placer.has_placed_anything());
+  }
+
+  #[test]
+  fn the_stage_before_a_via_fix_remembers_the_armed_via() {
+    // The stage pushed by a fix records the via flag as it was at the
+    // fix, so undoing back over a via fix re arms the via.
+    let mut world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let root = world.root();
+    let rules = FixedClearance::uniform(1000);
+    let settings = RoutingSettings::default();
+    let context = AlgoContext::new(&rules, &settings);
+    let mut placer = LinePlacer::new(&world, root, &settings, Sizes::default());
+
+    assert!(placer.start(&mut world, &context, at(0, 0), None));
+    assert!(placer.toggle_via(true));
+    assert!(placer.move_to(&mut world, &context, at(4_000_000, 0), None));
+    assert!(placer.head().is_some_and(Line::ends_with_via));
+    assert!(!placer.fix_route(
+      &mut world,
+      &context,
+      at(4_000_000, 0),
+      None,
+      false
+    ));
+
+    // The fix consumed the via, so the layer is free and the flag is
+    // down.
+    assert!(!placer.is_placing_via());
+    assert!(placer.set_layer(&mut world, &context, 1));
+    assert_eq!(placer.current_layer(), Some(1));
+
+    // Undoing back over that fix restores the armed via and the layer it
+    // was armed on. The answer is `None` because `set_layer` regenerated
+    // the preview at the point the leg starts, which leaves no head.
+    assert!(placer.undo_last_segment(&mut world, &context).is_none());
+    assert!(placer.is_placing_via());
+    assert_eq!(placer.current_layer(), Some(0));
+    assert_eq!(placer.current_start(), Some(at(0, 0)));
   }
 
   #[test]

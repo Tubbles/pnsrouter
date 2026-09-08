@@ -10,8 +10,9 @@
 //! a route asserts that what reached the node is actually clear, through
 //! `World::check_colliding_line`.
 //!
-//! Vias, the fixed tail and undo are part 2 of the line placer work item
-//! and are not exercised here.
+//! The via scenarios and the undo scenarios run over a second fixture,
+//! [`build_two_layer`], whose pads sit on both copper layers so that a
+//! via has something to connect and something to be pushed out of.
 
 #![forbid(unsafe_code)]
 
@@ -24,7 +25,7 @@ use pnsrouter::item::{ItemBody, ItemId, Kind, LayerRange, NetId, Solid};
 use pnsrouter::line::Line;
 use pnsrouter::node::{NodeId, World};
 use pnsrouter::placer::line_placer::{LinePlacer, PlacerState};
-use pnsrouter::rules::FixedClearance;
+use pnsrouter::rules::{FixedClearance, ItemRef};
 use pnsrouter::settings::{RouterMode, RoutingSettings, Sizes};
 
 /// The clearance every scenario routes to, in nanometres.
@@ -109,11 +110,17 @@ fn rules() -> FixedClearance {
 }
 
 /// The sizes every scenario places with.
+///
+/// The layer pair is what `Sizes::via_layer_range` answers from, so a via
+/// placed here spans both copper layers of the fixtures.
 fn sizes() -> Sizes {
-  Sizes {
+  let mut sizes = Sizes {
     track_width: TRACK_WIDTH,
     ..Sizes::default()
-  }
+  };
+
+  sizes.add_layer_pair(0, 1);
+  sizes
 }
 
 /// Settings in one routing mode, with everything else at KiCad's
@@ -677,4 +684,637 @@ fn a_track_under_the_cursor_is_split_at_the_start_point() {
   assert!(world.item(board.obstacle_pad).is_some());
   assert!(world.item(board.start_pad).is_some());
   assert!(world.item(board.target_pad).is_some());
+}
+
+// ---------------------------------------------------------------------
+// The two layer fixture
+// ---------------------------------------------------------------------
+
+/// The copper radius of a via placed by these scenarios.
+const VIA_RADIUS: i32 = 300_000;
+
+/// How far a via's centre has to stay from a pad's centre it may not
+/// touch: the pad's copper, the clearance and the via's own copper.
+const VIA_KEEP_OUT: i32 = PAD_RADIUS + CLEARANCE + VIA_RADIUS;
+
+/// Where the two layer route starts, on a pad of layer 0.
+const DEEP_START: Vec2 = Vec2::new(0, 0);
+
+/// The first thing in the way, on layer 0.
+const FIRST_OBSTACLE: Vec2 = Vec2::new(2_000_000, 0);
+
+/// The second thing in the way, on layer 0.
+const SECOND_OBSTACLE: Vec2 = Vec2::new(4_000_000, 0);
+
+/// Where the layer change happens, clear of everything on both layers.
+const VIA_POINT: Vec2 = Vec2::new(6_000_000, 0);
+
+/// The third thing in the way, on layer 1 only.
+const THIRD_OBSTACLE: Vec2 = Vec2::new(8_000_000, 0);
+
+/// Where the two layer route ends, on a pad of layer 1.
+const DEEP_TARGET: Vec2 = Vec2::new(10_000_000, 0);
+
+/// A pad on layer 1 that only a via can collide with, well away from the
+/// route above.
+const BURIED_PAD: Vec2 = Vec2::new(3_000_000, -4_000_000);
+
+/// A cursor position that overlaps [`BURIED_PAD`] without sitting on its
+/// centre.
+///
+/// Two concentric circles have no minimum translation vector, so a via
+/// dropped exactly on a round pad's centre cannot be pushed anywhere;
+/// `Via::pushout_force` answers `None` for that pair and the placer would
+/// report the via as unplaceable rather than move it.
+const OVER_BURIED_PAD: Vec2 = Vec2::new(3_200_000, -4_000_000);
+
+/// The pads of the two layer fixture.
+struct TwoLayerBoard {
+  /// The pad the route starts on, layer 0, routed net.
+  start_pad: ItemId,
+  /// The pad the route ends on, layer 1, routed net.
+  target_pad: ItemId,
+  /// A pad of another net on layer 1 that a layer 0 track walks straight
+  /// past and a via cannot.
+  buried_pad: ItemId,
+}
+
+/// A board with copper on both layers and three obstacles.
+///
+/// Layer 0 carries the start pad and two obstacles between it and
+/// [`VIA_POINT`]; layer 1 carries one obstacle between [`VIA_POINT`] and
+/// the target pad, plus [`BURIED_PAD`], which is the one a via pushout
+/// has to notice.
+fn build_two_layer() -> (World, TwoLayerBoard) {
+  let mut world = World::new(World::DEFAULT_MAX_CLEARANCE);
+  let root = world.root();
+  let add_pad = |world: &mut World, at: Vec2, layer: i32, net| {
+    let body = ItemBody::Solid(Solid::new(Shape::circle(at, PAD_RADIUS), at));
+    let mut item = world.make_item(body);
+
+    item.set_layers_and_flash_all(LayerRange::single(layer));
+    item.set_net(net);
+
+    world.add_solid(root, item, None)
+  };
+
+  let start_pad = add_pad(&mut world, DEEP_START, 0, TRACE_NET);
+
+  add_pad(&mut world, FIRST_OBSTACLE, 0, OBSTACLE_NET);
+  add_pad(&mut world, SECOND_OBSTACLE, 0, OBSTACLE_NET);
+  add_pad(&mut world, THIRD_OBSTACLE, 1, OBSTACLE_NET);
+
+  let buried_pad = add_pad(&mut world, BURIED_PAD, 1, OBSTACLE_NET);
+  let target_pad = add_pad(&mut world, DEEP_TARGET, 1, TRACE_NET);
+
+  (
+    world,
+    TwoLayerBoard {
+      start_pad,
+      target_pad,
+      buried_pad,
+    },
+  )
+}
+
+/// Every via of one net in a node.
+fn stored_vias(world: &World, node: NodeId, net: Option<NetId>) -> Vec<ItemId> {
+  world.all_items_in_net(node, net, Kind::VIA)
+}
+
+/// Fail when a stored item collides with anything in its node.
+fn assert_item_is_clear(
+  world: &World,
+  node: NodeId,
+  id: ItemId,
+  rules: &FixedClearance,
+) {
+  let item = world.item(id).expect("the item is still in the arena");
+
+  assert!(
+    world
+      .check_colliding(
+        node,
+        ItemRef::stored(id, item),
+        rules,
+        &CollisionSearchOptions::default()
+      )
+      .is_none(),
+    "a stored item collides"
+  );
+}
+
+/// Route from the start pad to [`VIA_POINT`] with a via armed, and fix
+/// there.
+///
+/// The shared prelude of the via scenarios: it leaves the placer running,
+/// on layer 0, with one leg fixed and a via at its end.
+fn route_to_the_via_point(
+  world: &mut World,
+  context: &AlgoContext<'_>,
+  placer: &mut LinePlacer,
+  board: &TwoLayerBoard,
+) {
+  assert!(placer.start(world, context, DEEP_START, Some(board.start_pad)));
+  assert!(placer.move_to(world, context, VIA_POINT, None));
+  assert!(placer.toggle_via(true));
+  assert!(placer.is_placing_via());
+  assert!(placer.move_to(world, context, VIA_POINT, None));
+
+  // An intermediate fix: no end item, so the placement carries on.
+  assert!(!placer.fix_route(world, context, VIA_POINT, None, false));
+}
+
+#[test]
+fn a_via_is_stored_at_the_fix_and_frees_the_layer() {
+  let (mut world, board) = build_two_layer();
+  let rules = rules();
+  let settings = settings_for(RouterMode::Walkaround);
+  let context = AlgoContext::new(&rules, &settings);
+  let mut placer = placer_for(&world, &settings);
+
+  route_to_the_via_point(&mut world, &context, &mut placer, &board);
+
+  let node = placer.current_node(false);
+  let vias = stored_vias(&world, node, TRACE_NET);
+
+  assert_eq!(vias.len(), 1, "the fix did not store exactly one via");
+
+  let via = world.item(vias[0]).expect("the via is in the arena");
+
+  // The via spans both layers, which is what makes the layer change
+  // legal, and it sits where the leg ended.
+  assert!(via.layers().contains(0) && via.layers().contains(1));
+  assert_eq!(via.anchor(0), VIA_POINT);
+  assert_item_is_clear(&world, node, vias[0], &rules);
+
+  // A fix that ended on a via leaves the placement unchained, so the
+  // layer may still change, which a fix without one refuses.
+  assert!(!placer.is_placing_via(), "the via flag survived the fix");
+  assert!(placer.set_layer(&mut world, &context, 1));
+  assert_eq!(placer.current_layer(), Some(1));
+  assert_eq!(placer.head().map(Line::layer), Some(1));
+}
+
+#[test]
+fn a_layer_change_is_refused_after_a_fix_without_a_via() {
+  let (mut world, board) = build_two_layer();
+  let rules = rules();
+  let settings = settings_for(RouterMode::Walkaround);
+  let context = AlgoContext::new(&rules, &settings);
+  let mut placer = placer_for(&world, &settings);
+  let corner = Vec2::new(1_000_000, -1_500_000);
+
+  assert!(placer.start(
+    &mut world,
+    &context,
+    DEEP_START,
+    Some(board.start_pad)
+  ));
+  assert!(placer.move_to(&mut world, &context, corner, None));
+  assert!(!placer.fix_route(&mut world, &context, corner, None, false));
+
+  // No via at the fix, so the layer is pinned for the rest of the
+  // placement.
+  assert!(!placer.set_layer(&mut world, &context, 1));
+  assert_eq!(placer.current_layer(), Some(0));
+}
+
+#[test]
+fn a_via_over_a_pad_of_another_layer_is_pushed_clear() {
+  let (mut world, board) = build_two_layer();
+  let rules = rules();
+  let settings = settings_for(RouterMode::Walkaround);
+  let context = AlgoContext::new(&rules, &settings);
+  let mut placer = placer_for(&world, &settings);
+
+  assert!(placer.start(
+    &mut world,
+    &context,
+    DEEP_START,
+    Some(board.start_pad)
+  ));
+  assert!(placer.toggle_via(true));
+  assert!(placer.move_to(&mut world, &context, OVER_BURIED_PAD, None));
+
+  let head = placer.head().expect("a placement is running");
+
+  assert!(head.ends_with_via(), "the head carries no via");
+
+  let via_pos = head.via_pos(&world).expect("the via has a position");
+  let node = placer.current_node(false);
+
+  // The track itself runs on layer 0 and never sees the pad, so nothing
+  // but the via can have moved the end of the trace.
+  assert_ne!(
+    via_pos, OVER_BURIED_PAD,
+    "the via stayed on top of a pad of the other layer"
+  );
+
+  let delta = via_pos - BURIED_PAD;
+
+  assert!(
+    i64::from(delta.x) * i64::from(delta.x)
+      + i64::from(delta.y) * i64::from(delta.y)
+      >= i64::from(VIA_KEEP_OUT) * i64::from(VIA_KEEP_OUT),
+    "the pushed out via is still inside the pad's keep out"
+  );
+  assert!(
+    world
+      .check_colliding(
+        node,
+        head.via_item(&world).expect("the head has a via"),
+        &rules,
+        &CollisionSearchOptions::default()
+      )
+      .is_none(),
+    "the pushed out via still collides"
+  );
+  assert!(world.item(board.buried_pad).is_some());
+}
+
+#[test]
+fn a_via_only_commit_stores_the_via_and_ends_the_placement() {
+  let (mut world, board) = build_two_layer();
+  let rules = rules();
+  let settings = settings_for(RouterMode::MarkObstacles);
+  let context = AlgoContext::new(&rules, &settings);
+  let mut placer = placer_for(&world, &settings);
+  let root = world.root();
+
+  assert!(placer.start(
+    &mut world,
+    &context,
+    DEEP_START,
+    Some(board.start_pad)
+  ));
+  assert!(placer.toggle_via(true));
+
+  // The cursor never leaves the start point, so the trace is a via and
+  // nothing else.
+  assert!(placer.move_to(&mut world, &context, DEEP_START, None));
+
+  let trace = placer.trace().expect("a placement is running");
+
+  assert_eq!(trace.segment_count(), 0, "the trace grew a segment");
+  assert!(trace.ends_with_via());
+  assert_eq!(placer.current_end(), Some(DEEP_START));
+
+  // The via only commit ends the placement, where a fix on an empty
+  // trace without a via would answer false.
+  assert!(placer.fix_route(&mut world, &context, DEEP_START, None, false));
+  assert!(matches!(
+    placer.state(),
+    PlacerState::Finished {
+      placed_anything: true
+    }
+  ));
+  assert!(placer.commit_placement(&mut world));
+
+  let vias = stored_vias(&world, root, TRACE_NET);
+
+  assert_eq!(vias.len(), 1, "the via only commit stored no via");
+  assert_eq!(
+    world
+      .item(vias[0])
+      .expect("the via is in the arena")
+      .anchor(0),
+    DEEP_START
+  );
+}
+
+// ---------------------------------------------------------------------
+// Undo
+// ---------------------------------------------------------------------
+
+/// Route the two layer board as far as a second fix, leaving three
+/// stages on the fixed tail.
+///
+/// Leg one runs on layer 0 and ends on a via at [`VIA_POINT`], the layer
+/// changes, and leg two runs on layer 1 as far as `corner`.
+fn route_two_legs(
+  world: &mut World,
+  context: &AlgoContext<'_>,
+  placer: &mut LinePlacer,
+  board: &TwoLayerBoard,
+  corner: Vec2,
+) {
+  route_to_the_via_point(world, context, placer, board);
+
+  assert!(placer.set_layer(world, context, 1));
+  assert!(placer.move_to(world, context, corner, None));
+  assert!(!placer.fix_route(world, context, corner, None, false));
+}
+
+#[test]
+fn an_undo_after_two_fixes_comes_back_to_the_second_leg() {
+  let (mut world, board) = build_two_layer();
+  let rules = rules();
+  let settings = settings_for(RouterMode::Walkaround);
+  let context = AlgoContext::new(&rules, &settings);
+  let mut placer = placer_for(&world, &settings);
+  let corner = Vec2::new(7_000_000, -1_000_000);
+
+  route_two_legs(&mut world, &context, &mut placer, &board, corner);
+
+  let after_two = placer.current_node(false);
+  let segments_after_two = stored_segments(&world, after_two, TRACE_NET).len();
+
+  assert!(segments_after_two > 1, "the scenario needs two legs");
+  assert_eq!(placer.current_layer(), Some(1));
+
+  // A move so that the head has something to report back.
+  assert!(placer.move_to(&mut world, &context, DEEP_TARGET, None));
+
+  let back = placer.undo_last_segment(&mut world, &context);
+
+  assert!(back.is_some(), "the undo reported no point");
+
+  // The second leg started at the via, on layer 1.
+  assert_eq!(placer.current_start(), Some(VIA_POINT));
+  assert_eq!(placer.current_layer(), Some(1));
+
+  let after_undo = placer.current_node(false);
+  let segments_after_undo = stored_segments(&world, after_undo, TRACE_NET);
+
+  assert!(
+    segments_after_undo.len() < segments_after_two,
+    "the undo left the second leg's segments in the node"
+  );
+  assert!(
+    segments_after_undo.iter().all(|line| line.layer() == 0),
+    "a segment of the undone layer 1 leg survived"
+  );
+
+  // The via of the first fix is still there: it belongs to the leg that
+  // is still fixed.
+  assert_eq!(stored_vias(&world, after_undo, TRACE_NET).len(), 1);
+}
+
+#[test]
+fn undoing_down_to_the_first_stage_empties_the_placement() {
+  let (mut world, board) = build_two_layer();
+  let rules = rules();
+  let settings = settings_for(RouterMode::Walkaround);
+  let context = AlgoContext::new(&rules, &settings);
+  let mut placer = placer_for(&world, &settings);
+  let corner = Vec2::new(7_000_000, -1_000_000);
+
+  route_two_legs(&mut world, &context, &mut placer, &board, corner);
+
+  // Back over the second leg.
+  placer.undo_last_segment(&mut world, &context);
+
+  // Back over the first leg, which restores layer 0 and the via that was
+  // armed when it was fixed.
+  placer.undo_last_segment(&mut world, &context);
+
+  assert_eq!(placer.current_start(), Some(DEEP_START));
+  assert_eq!(placer.current_layer(), Some(0));
+  assert!(
+    placer.is_placing_via(),
+    "the via flag of the first fix was not restored"
+  );
+
+  let node = placer.current_node(false);
+
+  assert!(stored_segments(&world, node, TRACE_NET).is_empty());
+  assert!(stored_vias(&world, node, TRACE_NET).is_empty());
+
+  // The bottom stage is handed out for ever, so further undos are safe
+  // and keep answering with the point the placement started at.
+  for _ in 0..2 {
+    placer.undo_last_segment(&mut world, &context);
+
+    assert_eq!(placer.current_start(), Some(DEEP_START));
+    assert_eq!(placer.current_layer(), Some(0));
+  }
+
+  // The placement is still live and can be routed again.
+  assert!(placer.move_to(&mut world, &context, VIA_POINT, None));
+  assert_eq!(
+    placer.trace().expect("a placement is running").point(0),
+    DEEP_START
+  );
+}
+
+// ---------------------------------------------------------------------
+// The milestone 3 exit criterion
+// ---------------------------------------------------------------------
+
+/// Where the cursor stops on layer 0 before the via, per mode.
+///
+/// Walkaround mode is handed the via point directly and is expected to
+/// find its own way past the two pads. Mark obstacles mode does not route
+/// around anything by design, so it gets the corners a user would click,
+/// which is the whole difference between the two modes.
+fn stops_before_the_via(mode: RouterMode) -> Vec<Vec2> {
+  match mode {
+    RouterMode::MarkObstacles => vec![
+      Vec2::new(1_000_000, -1_000_000),
+      Vec2::new(5_000_000, -1_000_000),
+      VIA_POINT,
+    ],
+    _ => vec![VIA_POINT],
+  }
+}
+
+/// Where the cursor stops on layer 1 after the via, per mode.
+fn stops_after_the_via(mode: RouterMode) -> Vec<Vec2> {
+  match mode {
+    RouterMode::MarkObstacles => vec![
+      Vec2::new(7_000_000, -1_000_000),
+      Vec2::new(9_000_000, -1_000_000),
+      DEEP_TARGET,
+    ],
+    _ => vec![DEEP_TARGET],
+  }
+}
+
+/// Route the whole two layer board and commit.
+///
+/// Start on a pad of layer 0, get past two obstacles, place a via, change
+/// layer, get past a third obstacle and finish on a pad of the same net.
+/// The last fix is forced, which is what a host does when the user
+/// double clicks rather than landing exactly on the target.
+fn route_across_the_board(mode: RouterMode) -> World {
+  let (mut world, board) = build_two_layer();
+  let rules = rules();
+  let settings = RoutingSettings {
+    fix_all_segments: true,
+    ..settings_for(mode)
+  };
+  let context = AlgoContext::new(&rules, &settings);
+  let mut placer = placer_for(&world, &settings);
+  let before = stops_before_the_via(mode);
+  let after = stops_after_the_via(mode);
+
+  assert!(placer.start(
+    &mut world,
+    &context,
+    DEEP_START,
+    Some(board.start_pad)
+  ));
+
+  // Layer 0, up to the point the via goes.
+  for (index, stop) in before.iter().enumerate() {
+    let last = index + 1 == before.len();
+
+    if last {
+      assert!(placer.toggle_via(true));
+    }
+
+    assert!(placer.move_to(&mut world, &context, *stop, None));
+    assert!(
+      !placer.fix_route(&mut world, &context, *stop, None, false),
+      "an intermediate fix ended the placement"
+    );
+  }
+
+  // The via at the end of the last leg is what unpins the layer.
+  assert!(
+    placer.set_layer(&mut world, &context, 1),
+    "the layer change was refused although the fix left a via"
+  );
+  assert_eq!(placer.current_layer(), Some(1));
+
+  // Layer 1, up to the target pad.
+  for (index, stop) in after.iter().enumerate() {
+    let last = index + 1 == after.len();
+    let end_item = last.then_some(board.target_pad);
+
+    assert!(placer.move_to(&mut world, &context, *stop, end_item));
+
+    let finished =
+      placer.fix_route(&mut world, &context, *stop, end_item, last);
+
+    assert_eq!(finished, last, "the placement ended at the wrong stop");
+  }
+
+  assert!(placer.has_placed_anything());
+  assert!(placer.commit_placement(&mut world));
+
+  world
+}
+
+/// Fail when a corner of any of the lines sits inside a pad's keep out.
+fn assert_corners_are_clear_of(
+  lines: &[&Line],
+  obstacle: Vec2,
+  mode: RouterMode,
+) {
+  for line in lines {
+    for index in 0..line.point_count() {
+      let delta = line.point(index) - obstacle;
+      let squared = i64::from(delta.x) * i64::from(delta.x)
+        + i64::from(delta.y) * i64::from(delta.y);
+
+      assert!(
+        squared >= i64::from(KEEP_OUT) * i64::from(KEEP_OUT),
+        "{mode:?}: a corner sits inside the keep out of ({}, {})",
+        obstacle.x,
+        obstacle.y
+      );
+    }
+  }
+}
+
+/// Whether any of the lines starts or ends at a point.
+fn touches(lines: &[&Line], point: Vec2) -> bool {
+  lines
+    .iter()
+    .any(|line| line.point(0) == point || line.last_point() == Some(point))
+}
+
+/// The committed route as plain comparable data.
+fn committed_route(world: &World) -> (Vec<(Vec2, Vec2, i32)>, Vec<Vec2>) {
+  let root = world.root();
+  let mut segments: Vec<(Vec2, Vec2, i32)> =
+    stored_segments(world, root, TRACE_NET)
+      .iter()
+      .map(|line| (line.point(0), line.point(1), line.layer()))
+      .collect();
+  let mut vias: Vec<Vec2> = stored_vias(world, root, TRACE_NET)
+    .into_iter()
+    .filter_map(|id| world.item(id).map(|item| item.anchor(0)))
+    .collect();
+
+  segments
+    .sort_by_key(|(from, to, layer)| (*layer, from.x, from.y, to.x, to.y));
+  vias.sort_by_key(|point| (point.x, point.y));
+
+  (segments, vias)
+}
+
+#[test]
+fn a_two_layer_route_reaches_the_far_pad_through_a_via() {
+  for mode in [RouterMode::Walkaround, RouterMode::MarkObstacles] {
+    let world = route_across_the_board(mode);
+    let rules = rules();
+    let root = world.root();
+    let segments = stored_segments(&world, root, TRACE_NET);
+    let vias = stored_vias(&world, root, TRACE_NET);
+
+    assert_eq!(vias.len(), 1, "{mode:?}: the route has no single via");
+
+    let via = world.item(vias[0]).expect("the via is in the arena");
+    let via_pos = via.anchor(0);
+
+    assert!(
+      via.layers().contains(0) && via.layers().contains(1),
+      "{mode:?}: the via does not join the two layers"
+    );
+
+    let bottom: Vec<&Line> =
+      segments.iter().filter(|line| line.layer() == 0).collect();
+    let top: Vec<&Line> =
+      segments.iter().filter(|line| line.layer() == 1).collect();
+
+    assert!(
+      !bottom.is_empty(),
+      "{mode:?}: nothing was routed on layer 0"
+    );
+    assert!(!top.is_empty(), "{mode:?}: nothing was routed on layer 1");
+
+    // The route runs pad to via to pad.
+    assert!(
+      touches(&bottom, DEEP_START),
+      "{mode:?}: the route does not start on the start pad"
+    );
+    assert!(
+      touches(&bottom, via_pos),
+      "{mode:?}: the layer 0 leg does not reach the via"
+    );
+    assert!(
+      touches(&top, via_pos),
+      "{mode:?}: the layer 1 leg does not leave the via"
+    );
+    assert!(
+      touches(&top, DEEP_TARGET),
+      "{mode:?}: the route does not end on the target pad"
+    );
+
+    // The detour actually happened: every corner of the layer 0 leg is
+    // outside the keep out of both pads it had to get past, and the same
+    // on layer 1 for the third one.
+    for obstacle in [FIRST_OBSTACLE, SECOND_OBSTACLE] {
+      assert_corners_are_clear_of(&bottom, obstacle, mode);
+    }
+
+    assert_corners_are_clear_of(&top, THIRD_OBSTACLE, mode);
+    assert_stored_segments_are_clear(&world, root, TRACE_NET, &rules);
+    assert_item_is_clear(&world, root, vias[0], &rules);
+  }
+}
+
+#[test]
+fn the_two_layer_route_is_the_same_twice() {
+  for mode in [RouterMode::Walkaround, RouterMode::MarkObstacles] {
+    let first = committed_route(&route_across_the_board(mode));
+    let second = committed_route(&route_across_the_board(mode));
+
+    assert_eq!(first, second, "{mode:?}: two identical runs disagreed");
+    assert!(!first.0.is_empty());
+    assert_eq!(first.1.len(), 1);
+  }
 }

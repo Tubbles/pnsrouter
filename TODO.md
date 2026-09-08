@@ -30,3 +30,12 @@ Deferred during milestone 2 (world model):
 - `check_colliding_items` (`src/node.rs`) takes items only, not lines, for the same reason.
 - The via self collision heuristic was retired (log entry of 2026-09-08). Two distinct stored vias at one position with equal padstack, net and drill now collide hole to hole; revert `consider_hole_to_hole` in `src/collide.rs` if a shove fixture disagrees.
 - The 90 degree corner mode hull simplification in `NearestObstacle` (`pns_node.cpp:330`) needs the routing settings and lands with the walkaround.
+
+Deferred during milestone 3 (walkaround router):
+
+- `update_leading_ratline` (`src/placer/line_placer.rs`) is a stub: it needs `TOPOLOGY::LeadingRatLine` / `NearestUnconnectedItem` (`pns_topology.cpp`), which land with the session facade.
+- The preview via has no hole item, so `via_pushout_force` resolves copper clearances only (`pns_via.cpp:126` gives KiCad's via a hole). Add a synthetic hole to the preview via when hole to copper rules matter for via placement.
+- `Sizes::via_layer_range` and `Sizes::layer_top`/`layer_bottom` need the board's copper layer count for through vias; the crate carries none. Give `Sizes` or the world a layer count when the facade is designed.
+- The dead pad orientation and last segment postures of `LINE_PLACER::Start` (`pns_line_placer.cpp:1408`, `:1415`) are not computed; wiring them into `SetDefaultDirections` is a routing change that needs a fixture.
+- `LINE_PLACER::AbortPlacement` (`pns_line_placer.cpp:2150`) has no caller and is not ported.
+- The via pushout keeps KiCad's discarded `force.Resize( threshold )` (`pns_via.cpp:207`); capping the step is a behaviour change to decide with a shove fixture.

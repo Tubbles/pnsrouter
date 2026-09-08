@@ -47,7 +47,7 @@
 use std::collections::BTreeMap;
 
 use crate::geometry::direction45::{CornerMode, Direction45, Octant};
-use crate::item::ViaType;
+use crate::item::{LayerRange, ViaType};
 
 // ---------------------------------------------------------------------
 // Enums
@@ -552,6 +552,36 @@ impl Sizes {
       .map(|(_, bottom)| *bottom)
   }
 
+  /// The layer span a via placed with these sizes occupies.
+  ///
+  /// Port of `ROUTER_IFACE::GetViaLayerRange`
+  /// (`pcbnew/router/pns_router.h:144`), the one non virtual helper on
+  /// the host interface, which note 05 section 7 says belongs on the
+  /// router side because it is pure logic over the sizes. Its two callers
+  /// are `LINE_PLACER::makeVia`
+  /// (`pcbnew/router/pns_line_placer.cpp:78`) and the differential pair
+  /// placer's (`pcbnew/router/pns_diff_pair_placer.cpp:76`).
+  ///
+  /// # Deviation
+  ///
+  /// KiCad gives a [`ViaType::Through`] via the whole board,
+  /// `F_Cu .. B_Cu`, and only lets the layer pair choose the span of a
+  /// blind, buried or micro via. This crate has no notion of a board or
+  /// of how many copper layers it has, which is the gap
+  /// [`Sizes::layer_top`] already documents, so the layer pair decides
+  /// the span for every via type here. A host that wants KiCad's through
+  /// via rule registers the board's outermost pair.
+  ///
+  /// [`None`] when no layer pair was registered; the caller substitutes
+  /// the span it knows, which for the line placer is the layer it is
+  /// routing on.
+  pub fn via_layer_range(&self) -> Option<LayerRange> {
+    let top = self.layer_top()?;
+    let bottom = self.layer_bottom()?;
+
+    Some(LayerRange::new(top, bottom))
+  }
+
   /// The copper gap between the two vias of a differential pair.
   ///
   /// Port of `DiffPairViaGap`,
@@ -740,6 +770,34 @@ mod tests {
     sizes.clear_layer_pairs();
     assert_eq!(sizes.paired_layer(1), None);
     assert_eq!(sizes.layer_top(), None);
+  }
+
+  /// `ROUTER_IFACE::GetViaLayerRange` (`pcbnew/router/pns_router.h:144`)
+  /// over the layer pair, which is the whole span here whatever the via
+  /// type; see the deviation on [`Sizes::via_layer_range`].
+  #[test]
+  fn the_via_layer_range_comes_from_the_first_layer_pair() {
+    let mut sizes = Sizes::default();
+
+    assert_eq!(sizes.via_layer_range(), None);
+
+    sizes.add_layer_pair(3, 1);
+
+    let range = sizes
+      .via_layer_range()
+      .expect("a registered pair gives a span");
+
+    assert_eq!(range.start(), 1);
+    assert_eq!(range.end(), 3);
+    assert!(range.contains(2));
+
+    // A blind via answers from the same pair, because this crate has no
+    // board layer count to give a through via instead.
+    sizes.via_type = ViaType::Blind;
+    assert_eq!(sizes.via_layer_range(), Some(range));
+
+    sizes.clear_layer_pairs();
+    assert_eq!(sizes.via_layer_range(), None);
   }
 
   /// `DiffPairViaGap` (`pcbnew/router/pns_sizes_settings.h:87`) hands back

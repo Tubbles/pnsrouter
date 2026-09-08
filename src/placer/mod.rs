@@ -13,7 +13,9 @@
 //! `Traces()[0]` (`pcbnew/router/pns_router.cpp:579`, `:624`). The enum
 //! belongs to the session facade of milestone 5.
 //!
-//! `fixed_tail.rs`, the undo stack of note 03 section 3.1, is part 2 of
-//! this work item; [`line_placer::FixStage`] is its placeholder.
+//! [`fixed_tail`] is the undo stack of note 03 section 3.1, which
+//! [`line_placer::LinePlacer::undo_last_segment`] rolls a placement back
+//! through.
 
+pub mod fixed_tail;
 pub mod line_placer;
