@@ -39,9 +39,13 @@
 //! `ByCenter`, `Compute`, `Move` and `Offset`, `GetWithOffset`, every
 //! setter, `Intersects( Vec, Vec )`, `Intersects( BOX2, EDA_ANGLE )`,
 //! `IntersectsCircle`, `IntersectsCircleEdge`, `GetBoundingBoxRotated`,
-//! `Diagonal` and `SquaredDiagonal`, `NearestPoint`, `FarthestPointTo`,
+//! `Diagonal` and `SquaredDiagonal`, `FarthestPointTo`,
 //! `GetSizeMax`, `Format` and `IsValid`. `Normalize` is not a member here
 //! because no constructor can produce a box that needs it.
+//!
+//! `NearestPoint` is here: the line placer's mark obstacles mode snaps
+//! the cursor to the bounding box of an obstacle's hull in the 90 degree
+//! corner modes (`pcbnew/router/pns_line_placer.cpp:828`).
 
 use crate::geometry::math::kiround_i64;
 use crate::geometry::vec2::{Vec2, Vec2L};
@@ -357,6 +361,20 @@ impl Box2 {
   /// `libs/kimath/include/math/box2.h:624` and `:643`.
   pub fn inflate_by(self, delta: i64) -> Self {
     self.inflate(delta, delta)
+  }
+
+  /// The point of the box closest to another point.
+  ///
+  /// Port of `BOX2::NearestPoint`,
+  /// `libs/kimath/include/math/box2.h:856`, which normalises a copy of
+  /// the box and then clamps each coordinate into it. A [`Box2`] is
+  /// always normalised, so only the clamp is left. A point inside the box
+  /// is its own nearest point.
+  pub fn nearest_point(&self, point: Vec2L) -> Vec2L {
+    Vec2L::new(
+      point.x.clamp(self.left(), self.right()),
+      point.y.clamp(self.top(), self.bottom()),
+    )
   }
 
   /// The squared distance from a point to the box, zero inside it.
@@ -781,5 +799,16 @@ mod tests {
     assert_eq!(maximum.distance_to_point(far), 3_037_000_500);
     assert_eq!(maximum.inflate_by(i64::MAX).left(), i64::MIN);
     assert_eq!(maximum.inflate_by(i64::MIN).width(), 0);
+  }
+
+  /// `NearestPoint` clamps into the box and leaves an interior point
+  /// where it is (`libs/kimath/include/math/box2.h:856`).
+  #[test]
+  fn the_nearest_point_of_a_box_is_the_clamped_point() {
+    let box2 = Box2::from_vec2_corners(Vec2::new(0, 0), Vec2::new(100, 50));
+
+    assert_eq!(box2.nearest_point(Vec2L::new(200, 25)), Vec2L::new(100, 25));
+    assert_eq!(box2.nearest_point(Vec2L::new(-10, -10)), Vec2L::new(0, 0));
+    assert_eq!(box2.nearest_point(Vec2L::new(40, 20)), Vec2L::new(40, 20));
   }
 }

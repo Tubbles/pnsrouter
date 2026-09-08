@@ -543,6 +543,40 @@ impl World {
     }
   }
 
+  /// Drop one node, its whole subtree, and everything they own.
+  ///
+  /// The single node form of [`World::kill_children`]: it releases the
+  /// node itself as well as its children and unlinks it from its parent's
+  /// child list. C++ spells it `delete aNode`, whose destructor performs
+  /// the same subtree release (`pcbnew/router/pns_node.cpp:91`); the line
+  /// placer does exactly that to its scratch branch once per mouse move
+  /// (`pcbnew/router/pns_line_placer.cpp:1492`), and note 03 section 9.3
+  /// asks for it under the name `drop_subtree`. Dropping only the
+  /// children would take the placer's siblings with it, which is why
+  /// [`World::kill_children`] is not enough.
+  ///
+  /// Dropping a root is refused: a world without a root has no meaning,
+  /// and KiCad never deletes its own.
+  pub fn drop_node(&mut self, node: NodeId) {
+    let Some(live) = self.nodes.get(node) else {
+      return;
+    };
+
+    if live.is_root() {
+      return;
+    }
+
+    let parent = live.parent;
+
+    self.release_node(node);
+
+    if let Some(parent) = parent
+      && let Some(live) = self.nodes.get_mut(parent)
+    {
+      live.children.retain(|child| *child != node);
+    }
+  }
+
   /// Fold a branch into the root and destroy the branch hierarchy.
   ///
   /// Port of `NODE::Commit`, `pcbnew/router/pns_node.cpp:1622`, called on
@@ -5614,5 +5648,31 @@ mod tests {
       copy.clearance_for_line(ids.pad_bottom, &head, false, &rules()),
       -1
     );
+  }
+
+  /// `drop_node` releases one branch and leaves its siblings alone, which
+  /// is what the line placer's per move scratch branch needs
+  /// (`pcbnew/router/pns_line_placer.cpp:1492`).
+  #[test]
+  fn dropping_one_node_leaves_its_siblings_alone() {
+    let mut world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let root = world.root();
+    let first = world.branch(root);
+    let second = world.branch(root);
+    let grandchild = world.branch(second);
+
+    world.drop_node(second);
+
+    assert!(world.node(first).is_some());
+    assert!(world.node(second).is_none());
+    assert!(world.node(grandchild).is_none());
+    assert_eq!(
+      world.node(root).expect("the root is live").children(),
+      &[first]
+    );
+
+    // The root is never dropped.
+    world.drop_node(root);
+    assert!(world.node(root).is_some());
   }
 }

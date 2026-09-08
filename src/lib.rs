@@ -23,6 +23,7 @@ pub mod line;
 pub mod mouse_trail;
 pub mod node;
 pub mod optimizer;
+pub mod placer;
 pub mod rules;
 pub mod settings;
 pub mod walkaround;
