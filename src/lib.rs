@@ -14,5 +14,7 @@
 pub mod arena;
 pub mod collide;
 pub mod geometry;
+pub mod index;
 pub mod item;
+pub mod joint;
 pub mod rules;

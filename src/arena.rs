@@ -20,6 +20,7 @@
 //!
 //! [`ArenaId<Item>`]: ArenaId
 
+use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
@@ -72,6 +73,32 @@ impl<T> PartialEq for ArenaId<T> {
 }
 
 impl<T> Eq for ArenaId<T> {}
+
+/// Handles order by `(index, generation)`.
+///
+/// The order is arbitrary but total and stable: it exists so that a
+/// handle can key an ordered container. That is what replaces KiCad's
+/// `std::unordered_set<ITEM*>` and `std::unordered_multimap` of joints,
+/// whose iteration order is the address order of the heap and therefore
+/// changes between runs (`DESIGN.md` section 8,
+/// `doc/reference/kicad/02-item-model-and-node.md` section 11 entries 2,
+/// 7 and 15).
+///
+/// It carries no geometric and no temporal meaning. A freed slot is
+/// reused by the next insertion, so a handle made later can sort before
+/// one made earlier. Anywhere a tie has to break on something the user
+/// can see, break it on `Item::uid` instead.
+impl<T> PartialOrd for ArenaId<T> {
+  fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+    Some(self.cmp(other))
+  }
+}
+
+impl<T> Ord for ArenaId<T> {
+  fn cmp(&self, other: &Self) -> Ordering {
+    (self.index, self.generation).cmp(&(other.index, other.generation))
+  }
+}
 
 impl<T> Hash for ArenaId<T> {
   fn hash<H: Hasher>(&self, state: &mut H) {
@@ -371,6 +398,29 @@ mod tests {
 
     assert_eq!(arena.get(id), Some(&"a"));
     assert_eq!(copy.get(id), Some(&"z"));
+  }
+
+  /// The order is slot index first, generation second, which is what
+  /// lets a handle key a `BTreeMap`.
+  #[test]
+  fn handles_order_by_index_then_generation() {
+    let mut arena: Arena<&str> = Arena::new();
+    let first = arena.insert("a");
+    let second = arena.insert("b");
+
+    assert!(first < second);
+
+    arena.remove(first);
+    let reused = arena.insert("c");
+
+    assert_eq!(reused.index(), first.index());
+    assert!(first < reused);
+    assert!(reused < second);
+
+    let mut sorted = vec![second, reused, first];
+    sorted.sort_unstable();
+
+    assert_eq!(sorted, vec![first, reused, second]);
   }
 
   #[test]

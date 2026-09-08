@@ -161,7 +161,7 @@ Modules are added milestone by milestone. A module does not appear in `lib.rs` b
 
 ## 10. Dependencies
 
-Zero runtime dependencies is the preference (the upstream maintainer asked for minimal dependencies). Candidates worth their cost when the module arrives: `rstar` for the R-tree (pure Rust, insertion bbox kept alongside anyway), `indexmap` for ordered maps, `bitflags`, `smallvec`. No `geo`, no clipper binding, no polygon boolean crate. Dev dependencies for property tests are fine.
+Minimal runtime dependencies (the upstream maintainer asked for minimal dependencies). The one runtime dependency so far is `rstar` for the per layer R-trees of the spatial index (pure Rust, the insertion bbox is stored alongside the handle; it pulls in eight small transitive crates). Ordered maps are `BTreeMap`, bit sets are hand rolled newtypes, so `indexmap`, `bitflags` and `smallvec` were not needed. No `geo`, no clipper binding, no polygon boolean crate. Dev dependencies for property tests are fine.
 
 ## 11. Deviations from KiCad
 

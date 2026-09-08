@@ -15,5 +15,8 @@ categories = ["science", "algorithms"]
 fail-on-warnings = []
 
 [dependencies]
+# R*-tree for the per layer spatial sub indices, see DESIGN.md section 10 and
+# doc/reference/kicad/01-geometry.md section 14.5.
+rstar = "0.13"
 
 [dev-dependencies]
