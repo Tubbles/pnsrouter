@@ -29,8 +29,10 @@ A Rust library implementing an interactive push and shove PCB router, ported at 
 
 ## Commands
 
-    cargo build
-    cargo test
-    cargo clippy --all-targets --features fail-on-warnings -- -D warnings
-    cargo fmt --all --check
-    cargo doc --no-deps --document-private-items
+Nothing is installed on the host. Every cargo invocation goes through the podman wrapper (build the image once with `podman build -t pnsrouter-dev -f dev/Containerfile dev`):
+
+    dev/in-container.sh cargo build
+    dev/in-container.sh cargo test
+    dev/in-container.sh cargo clippy --all-targets --features fail-on-warnings -- -D warnings
+    dev/in-container.sh cargo fmt --all --check
+    dev/in-container.sh cargo doc --no-deps --document-private-items

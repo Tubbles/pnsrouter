@@ -1,0 +1,11 @@
+# Development container for pnsrouter.
+#
+# Based on LibrePCB's CI image so that the Rust version matches the first
+# consumer of this crate. That image installs Rust with the minimal profile,
+# which lacks clippy and rustfmt, so they are added here.
+#
+# Build:  podman build -t pnsrouter-dev -f dev/Containerfile dev
+# Use:    dev/in-container.sh cargo test
+FROM docker.io/librepcb/librepcb-dev:ubuntu-24.04-4
+
+RUN rustup component add clippy rustfmt
