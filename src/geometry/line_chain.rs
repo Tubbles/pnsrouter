@@ -1236,6 +1236,50 @@ impl LineChain {
     self.points.push(unique[unique_count - 1]);
   }
 
+  /// Collapse runs of consecutive equal vertices.
+  ///
+  /// Port of `RemoveDuplicatePoints`,
+  /// `libs/kimath/src/geometry/shape_line_chain.cpp:2720`, which is stage
+  /// one of [`LineChain::simplify2`] on its own: no colinear vertex is
+  /// touched, and neither is the closed flag, so a closed chain whose last
+  /// point equals its first keeps both. The three point special case is
+  /// KiCad's: only a duplicate of the first point is removed, and a chain
+  /// of fewer than three points is left alone so that it stays a line.
+  ///
+  /// `NODE::AssembleLine` runs it on every assembled line before handing
+  /// it out, with the comment "do NOT remove colinear segments here"
+  /// (`pcbnew/router/pns_node.cpp:1204`).
+  pub fn remove_duplicate_points(&mut self) {
+    if self.points.len() < 3 {
+      return;
+    }
+
+    if self.points.len() == 3 {
+      if self.points[0] == self.points[1] {
+        self.remove(1);
+      }
+
+      return;
+    }
+
+    let mut unique: Vec<Vec2> = Vec::with_capacity(self.points.len());
+    let mut index = 0usize;
+
+    while index < self.points.len() {
+      let mut next = index + 1;
+
+      while next < self.points.len() && self.points[index] == self.points[next]
+      {
+        next += 1;
+      }
+
+      unique.push(self.points[index]);
+      index = next;
+    }
+
+    self.points = unique;
+  }
+
   /// Whether two chains describe the same simplified geometry.
   ///
   /// Port of `CompareGeometry( const SHAPE_LINE_CHAIN&, bool
@@ -4423,6 +4467,87 @@ mod tests {
     assert_eq!(
       LineChain::new().split_three_way(point(0, 0), point(1, 0)),
       None
+    );
+  }
+
+  // ---------------------------------------------------------------
+  // remove_duplicate_points
+  // ---------------------------------------------------------------
+
+  /// Runs of equal vertices collapse, colinear vertices stay.
+  #[test]
+  fn remove_duplicate_points_keeps_colinear_vertices() {
+    let mut chain = LineChain::from_points(
+      vec![
+        point(0, 0),
+        point(0, 0),
+        point(5, 0),
+        point(10, 0),
+        point(10, 0),
+        point(10, 0),
+        point(10, 5),
+      ],
+      false,
+    );
+
+    chain.remove_duplicate_points();
+
+    assert_eq!(
+      chain.points(),
+      &[point(0, 0), point(5, 0), point(10, 0), point(10, 5)]
+    );
+  }
+
+  /// Three points: only a duplicate of the first is removed, a duplicate
+  /// of the last is not, and shorter chains are untouched.
+  #[test]
+  fn remove_duplicate_points_special_cases() {
+    let mut first_doubled = LineChain::from_points(
+      vec![point(0, 0), point(0, 0), point(9, 0)],
+      false,
+    );
+    first_doubled.remove_duplicate_points();
+    assert_eq!(first_doubled.points(), &[point(0, 0), point(9, 0)]);
+
+    let mut last_doubled = LineChain::from_points(
+      vec![point(0, 0), point(9, 0), point(9, 0)],
+      false,
+    );
+    last_doubled.remove_duplicate_points();
+    assert_eq!(
+      last_doubled.points(),
+      &[point(0, 0), point(9, 0), point(9, 0)]
+    );
+
+    let mut two = LineChain::from_points(vec![point(3, 3), point(3, 3)], false);
+    two.remove_duplicate_points();
+    assert_eq!(two.points(), &[point(3, 3), point(3, 3)]);
+  }
+
+  /// The closed flag is not consulted: first and last stay even when
+  /// equal, unlike `set_closed`.
+  #[test]
+  fn remove_duplicate_points_ignores_the_closed_flag() {
+    let mut chain = LineChain::new();
+    chain.append(point(0, 0));
+    chain.append(point(4, 0));
+    chain.append(point(4, 4));
+    chain.append(point(0, 4));
+    chain.append_allow_duplicate(point(0, 4));
+    chain.append(point(0, 0));
+    chain.set_closed(false);
+
+    chain.remove_duplicate_points();
+
+    assert_eq!(
+      chain.points(),
+      &[
+        point(0, 0),
+        point(4, 0),
+        point(4, 4),
+        point(0, 4),
+        point(0, 0)
+      ]
     );
   }
 }
