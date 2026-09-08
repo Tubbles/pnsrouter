@@ -1,6 +1,6 @@
 # 002 World model
 
-Status: todo
+Status: in progress (started 2026-09-08)
 
 ## Goal
 
@@ -8,8 +8,8 @@ Items, layers, nets, spatial index, joints, the branching node, line assembly, n
 
 ## Tasks
 
-- [ ] `LayerRange`, `NetId`, `ItemId` (generational), `Kind` bitmask, marker flags, rank, provenance (board or synthetic).
-- [ ] `Item` enum bodies: solid, segment, via, hole. Hull builders per body with the degenerate segment handling from `pns_utils.cpp`.
+- [x] `LayerRange`, `NetId`, `ItemId` (generational), `Kind` bitmask, marker flags, rank, provenance (board or synthetic).
+- [x] `Item` enum bodies: solid, segment, via, hole. Hull builders per body with the degenerate segment handling from `pns_utils.cpp`.
 - [ ] `Index`: per layer R-trees plus net map plus membership set, cheap clone, removal keyed on the item id and its insertion bbox.
 - [ ] `JointMap` with joint arena and `JointId`, touch, link, unlink, rebuild, lock.
 - [ ] `Node` with add, remove, branch, commit, kill children, max clearance, and the single `visit_candidates` helper that visits branch and root only.

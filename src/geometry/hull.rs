@@ -362,6 +362,98 @@ fn move_diagonal(diagonal: &mut Seg, vertices: &LineChain, clearance: i32) {
   diagonal.b += move_by;
 }
 
+/// The convex hull of a point cloud, as a closed clockwise chain.
+///
+/// Port of `BuildConvexHull( std::vector<VECTOR2I>&, const
+/// std::vector<VECTOR2I>& )`,
+/// `libs/kimath/src/geometry/convex_hull.cpp:83`, Andrew's monotone
+/// chain. The points are sorted lexicographically by `(x, y)`, the lower
+/// and then the upper hull are built with a `cross <= 0` pop test, which
+/// drops collinear vertices as well as reflex ones, and the repeat of
+/// the first point is removed at the end (`:123`).
+///
+/// KiCad's router never calls this. It is here because
+/// [`build_hull_for_primitive_shape`] cannot hull a compound shape and
+/// KiCad's compound aware builders (`pcbnew/router/pns_solid.cpp:55`,
+/// `pcbnew/router/pns_hole.cpp:84`) reach for a `SHAPE_POLY_SET` union
+/// instead. `DESIGN.md` section 3 replaces that one polygon boolean with
+/// the convex hull of the per primitive hulls, a conservative superset of
+/// the union, and this is the routine that computes it.
+///
+/// # Winding
+///
+/// The comment at `convex_hull.cpp:51` says counter clockwise, which is
+/// counter clockwise in the mathematical convention with y growing
+/// upwards. Screen coordinates have y growing downwards, so the result is
+/// **clockwise on screen** and satisfies this module's invariant without
+/// any reversal.
+///
+/// # Deviations
+///
+/// - The cross product widens the coordinate differences to `i64` before
+///   subtracting, where KiCad subtracts in `int` and widens the products
+///   (`:77`). KiCad's form wraps for a pair of points more than
+///   `i32::MAX` apart; this one cannot.
+/// - Fewer than two points yields an empty chain. KiCad returns at `:88`
+///   without writing its output parameter, and every caller passes an
+///   empty vector, so the two agree.
+pub fn monotone_chain_hull(points: &[Vec2]) -> LineChain {
+  let mut hull = LineChain::new();
+  hull.set_closed(true);
+
+  if points.len() < 2 {
+    return hull;
+  }
+
+  let mut sorted = points.to_vec();
+  sorted.sort_unstable_by_key(|point| (point.x, point.y));
+
+  /// The z component of the cross product of `origin -> a` and
+  /// `origin -> b`, positive when the turn is counter clockwise in the
+  /// mathematical convention (`convex_hull.cpp:75`).
+  fn turn(origin: Vec2, a: Vec2, b: Vec2) -> i64 {
+    a.widening_sub(origin).cross(b.widening_sub(origin))
+  }
+
+  let mut stack: Vec<Vec2> = Vec::with_capacity(2 * sorted.len());
+
+  // Lower hull (`:102`).
+  for &point in &sorted {
+    while stack.len() >= 2
+      && turn(stack[stack.len() - 2], stack[stack.len() - 1], point) <= 0
+    {
+      stack.pop();
+    }
+
+    stack.push(point);
+  }
+
+  // Upper hull (`:111`). `floor` is KiCad's `t = k + 1`: the second pass
+  // must not eat into the lower hull.
+  let floor = stack.len() + 1;
+
+  for &point in sorted.iter().rev().skip(1) {
+    while stack.len() >= floor
+      && turn(stack[stack.len() - 2], stack[stack.len() - 1], point) <= 0
+    {
+      stack.pop();
+    }
+
+    stack.push(point);
+  }
+
+  // The last point repeats the first (`:123`).
+  if stack.len() > 1 && stack[0] == stack[stack.len() - 1] {
+    stack.pop();
+  }
+
+  for point in stack {
+    hull.append(point);
+  }
+
+  hull
+}
+
 /// The octagon around a polygon that is **assumed** convex.
 ///
 /// Port of `PNS::ConvexHull`,
@@ -1100,6 +1192,99 @@ mod tests {
     move_diagonal(&mut diagonal, &LineChain::new(), 10);
 
     assert_eq!(diagonal, before);
+  }
+
+  // -----------------------------------------------------------------
+  // BuildConvexHull, the monotone chain
+  // -----------------------------------------------------------------
+
+  #[test]
+  fn monotone_chain_hull_of_a_square_is_the_square_clockwise() {
+    let hull = monotone_chain_hull(&[
+      Vec2::new(0, 0),
+      Vec2::new(10, 0),
+      Vec2::new(10, 10),
+      Vec2::new(0, 10),
+    ]);
+
+    assert!(hull.is_closed());
+    assert_eq!(flatten(&hull), vec![0, 0, 10, 0, 10, 10, 0, 10]);
+    // Clockwise on screen means a positive signed area, the invariant
+    // every builder in this module keeps.
+    assert!(hull.area(false) > 0.0);
+  }
+
+  /// Interior points and points in the middle of an edge are both
+  /// dropped, the latter because the pop test is `<= 0` and not `< 0`.
+  #[test]
+  fn monotone_chain_hull_drops_interior_and_collinear_points() {
+    let hull = monotone_chain_hull(&[
+      Vec2::new(0, 0),
+      Vec2::new(5, 5),
+      Vec2::new(10, 0),
+      Vec2::new(5, 0),
+      Vec2::new(10, 10),
+      Vec2::new(0, 10),
+      Vec2::new(0, 5),
+    ]);
+
+    assert_eq!(flatten(&hull), vec![0, 0, 10, 0, 10, 10, 0, 10]);
+  }
+
+  #[test]
+  fn monotone_chain_hull_of_a_triangle() {
+    let hull = monotone_chain_hull(&[
+      Vec2::new(0, 10),
+      Vec2::new(4, 0),
+      Vec2::new(8, 10),
+    ]);
+
+    assert_eq!(flatten(&hull), vec![0, 10, 4, 0, 8, 10]);
+    assert!(hull.area(false) > 0.0);
+  }
+
+  #[test]
+  fn monotone_chain_hull_of_fewer_than_two_points_is_empty() {
+    assert_eq!(monotone_chain_hull(&[]).point_count(), 0);
+    assert_eq!(monotone_chain_hull(&[Vec2::new(3, 4)]).point_count(), 0);
+  }
+
+  #[test]
+  fn monotone_chain_hull_of_repeated_points_collapses() {
+    let hull =
+      monotone_chain_hull(&[Vec2::new(3, 4), Vec2::new(3, 4), Vec2::new(3, 4)]);
+
+    assert_eq!(hull.point_count(), 1);
+    assert_eq!(hull.point(0), Vec2::new(3, 4));
+  }
+
+  /// Two disjoint squares hull into the octagon that encloses both, and
+  /// every corner of both squares is inside it.
+  #[test]
+  fn monotone_chain_hull_encloses_two_disjoint_boxes() {
+    let mut points = Vec::new();
+
+    for corner in [
+      Vec2::new(0, 0),
+      Vec2::new(10, 0),
+      Vec2::new(10, 10),
+      Vec2::new(0, 10),
+      Vec2::new(30, 20),
+      Vec2::new(40, 20),
+      Vec2::new(40, 30),
+      Vec2::new(30, 30),
+    ] {
+      points.push(corner);
+    }
+
+    let hull = monotone_chain_hull(&points);
+
+    for point in &points {
+      assert!(
+        hull.point_inside(*point, 0) || hull.point_on_edge(*point, 0),
+        "{point:?} left outside the hull"
+      );
+    }
   }
 
   // -----------------------------------------------------------------

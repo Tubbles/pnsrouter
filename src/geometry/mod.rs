@@ -31,7 +31,8 @@
 //!   convention: the vector displaces the second argument.
 //! - [`hull`]: the octagons the walkaround and the shove walk around,
 //!   built around a rectangle, a capsule or a polygon assumed convex,
-//!   always clockwise, plus the filter that turns a raw chain
+//!   always clockwise, the monotone chain the item model uses in place of
+//!   KiCad's one polygon boolean, plus the filter that turns a raw chain
 //!   intersection into the crossings the walkaround can use.
 
 pub mod box2;
@@ -51,7 +52,8 @@ pub use collision::{
 pub use direction45::{AngleType, CornerMode, Direction45, Octant};
 pub use hull::{
   HULL_MARGIN, approximate_segment_as_rect, build_hull_for_primitive_shape,
-  convex_hull, hull_intersection, octagonal_hull, segment_hull,
+  convex_hull, hull_intersection, monotone_chain_hull, octagonal_hull,
+  segment_hull,
 };
 pub use line_chain::{Collision, Hit, Intersection, LineChain, SliceError};
 pub use seg::{NearestPoints, Seg, SegCollision};
