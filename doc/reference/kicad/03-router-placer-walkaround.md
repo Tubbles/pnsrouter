@@ -1129,6 +1129,8 @@ Restrict-to-visible-area: `WALKAROUND` does **not** implement any visible-area r
 
 ## 6. pns_utils: hull geometry
 
+Erratum (2026-09-08, found while porting): the description of the side test in `HullIntersection` below has the sign reversed. `pns_utils.cpp:455` keeps a corner hit when `d1[i].Side( d2[j] ) > 0` for some hull edge and some neighbouring line point, and `SEG::Side > 0` is the right of the directed edge in screen coordinates, the inner side of a clockwise hull. See `src/geometry/hull.rs` and its tests.
+
 Declared `pcbnew/router/pns_utils.h`, implemented in `pcbnew/router/pns_utils.cpp`. `constexpr int HULL_MARGIN = 10` lives at `pcbnew/router/pns_utils.h:34` and is unused; the macro `PNS_HULL_MARGIN 10` at `pcbnew/router/pns_line.h:45` is the one actually used (`pcbnew/router/pns_node.cpp:1338`, `:1348`, `pcbnew/router/pns_diff_pair_placer.cpp:247`).
 
 There is no `ClipLine` in the PNS namespace. `ClipLine` exists only in `libs/kimath/include/geometry/geometry_utils.h:238` (Cohen-Sutherland box clipping, used by `pcbnew/pcb_track.cpp:2347`), and `KIGEOM::ClipLineToBox` in `libs/kimath/include/geometry/shape_utils.h:112`. Neither is part of the router.
