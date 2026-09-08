@@ -18,14 +18,18 @@
 //!   coordinates so a clearance inflation cannot overflow.
 //! - [`direction45`]: the octant directions of the 45 degree routing
 //!   regime, their angle classification and the initial trace builder.
+//! - [`line_chain`]: polylines with a closed flag and a width, the
+//!   container the router's lines, hulls and outlines are all made of.
 
 pub mod box2;
 pub mod direction45;
+pub mod line_chain;
 pub mod math;
 pub mod seg;
 pub mod vec2;
 
 pub use box2::Box2;
 pub use direction45::{AngleType, CornerMode, Direction45, Octant};
+pub use line_chain::{LineChain, SliceError};
 pub use seg::{NearestPoints, Seg, SegCollision};
 pub use vec2::{Vec2, Vec2L};
