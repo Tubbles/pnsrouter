@@ -25,6 +25,22 @@ pub fn kiround(value: f64) -> i32 {
   value.round() as i32
 }
 
+/// Round to the nearest integer with halfway cases going away from zero,
+/// then saturate into the `i64` range.
+///
+/// Port of `KiROUND<double, int64_t>`,
+/// `libs/kimath/include/math/util.h:98`, the widened instantiation.
+/// `SEG::SquaredDistance` (`libs/kimath/src/geometry/seg.cpp:738`) and
+/// `BOX2::Distance` (`libs/kimath/include/math/box2.h:799`) both round an
+/// `ecoord` result through it, and an `i32` return would truncate those.
+///
+/// The tie rule, the clamp and the NaN behaviour are the same as
+/// [`kiround`], see its documentation.
+pub fn kiround_i64(value: f64) -> i64 {
+  debug_assert!(!value.is_nan(), "kiround_i64: value is NaN");
+  value.round() as i64
+}
+
 /// Compute `numerator * value / denominator` through a 128 bit intermediate,
 /// rounding to nearest with halfway cases away from zero.
 ///
@@ -245,6 +261,22 @@ mod tests {
   #[cfg(not(debug_assertions))]
   fn kiround_of_nan_is_zero() {
     assert_eq!(kiround(f64::NAN), 0);
+    assert_eq!(kiround_i64(f64::NAN), 0);
+  }
+
+  /// The widened rounding keeps values that would not survive an `i32`,
+  /// and it clamps at the `i64` limits.
+  #[test]
+  fn kiround_i64_rounds_and_saturates() {
+    assert_eq!(kiround_i64(0.5), 1);
+    assert_eq!(kiround_i64(-0.5), -1);
+    assert_eq!(kiround_i64(2.5), 3);
+    assert_eq!(kiround_i64(-2.5), -3);
+    assert_eq!(kiround_i64(3.0e9), 3_000_000_000);
+    assert_eq!(kiround_i64(-3.0e9), -3_000_000_000);
+    assert_eq!(kiround_i64(f64::INFINITY), i64::MAX);
+    assert_eq!(kiround_i64(f64::NEG_INFINITY), i64::MIN);
+    assert_eq!(kiround_i64(1.0e30), i64::MAX);
   }
 
   /// The first few values, including the non squares.

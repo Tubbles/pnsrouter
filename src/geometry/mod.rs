@@ -12,8 +12,16 @@
 //!
 //! - [`math`]: rounding, rational rescaling and integer square root.
 //! - [`vec2`]: the two integer vector types.
+//! - [`seg`]: line segments, with the distance, intersection and
+//!   collinearity tolerances the router depends on.
+//! - [`box2`]: axis aligned bounding boxes, always normalised, with `i64`
+//!   coordinates so a clearance inflation cannot overflow.
 
+pub mod box2;
 pub mod math;
+pub mod seg;
 pub mod vec2;
 
+pub use box2::Box2;
+pub use seg::{NearestPoints, Seg, SegCollision};
 pub use vec2::{Vec2, Vec2L};
