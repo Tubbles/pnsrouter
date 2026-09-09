@@ -8,9 +8,11 @@
 # Both repositories are bind mounted at the same absolute path as on the
 # host and the container runs with the host user id, so files written by
 # the build are owned by the host user. The working directory is the
-# LibrePCB checkout, because that is where the build happens; pnsrouter is
-# mounted so that the path dependency in
-# libs/librepcb/rust-core/Cargo.toml resolves.
+# LibrePCB checkout, because that is where the build happens. LibrePCB
+# builds the crate from its git submodule libs/pnsrouter, not from this
+# checkout, so a crate change reaches the build only after a push and a
+# submodule bump; this checkout is mounted for cargo runs on the crate
+# itself from the LibrePCB side.
 #
 # The cargo registry and the ccache directory live in named podman volumes
 # so they survive between runs. The image is dev/Containerfile, which is

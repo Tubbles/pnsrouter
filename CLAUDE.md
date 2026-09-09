@@ -37,7 +37,7 @@ Nothing is installed on the host. Every cargo invocation goes through the podman
     dev/in-container.sh cargo fmt --all --check
     dev/in-container.sh cargo doc --no-deps --document-private-items
 
-LibrePCB builds against this crate through `dev/librepcb-in-container.sh` (mounts `~/dev/librepcb` too, working directory there); the integration lives on the fork's `pns-router` branch, design in `doc/librepcb-integration.md`.
+LibrePCB builds against this crate through `dev/librepcb-in-container.sh` (mounts `~/dev/librepcb` too, working directory there); the integration lives on the fork's `pns-router` branch, design in `doc/librepcb-integration.md`. LibrePCB takes the crate as the git submodule `libs/pnsrouter` pinned to a commit, so after every push of this repository that the LibrePCB side needs, bump the submodule in the LibrePCB checkout (`git -C libs/pnsrouter fetch origin`, `git -C libs/pnsrouter checkout <sha>`, then commit the gitlink) and rebuild; the build never sees uncommitted or unpushed crate changes.
 
 The LibrePCB side checks, all from this repository (the build directory is already configured with Ninja and tests on):
 
