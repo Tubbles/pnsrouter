@@ -2847,9 +2847,13 @@ impl LinePlacer {
   /// is branched, a track under the cursor is split so that the new trace
   /// has a joint to attach to, and the posture solver is seeded.
   ///
-  /// The net is the start item's, or none for a track that starts on
-  /// nothing; KiCad asks its host for an orphaned net handle there
-  /// (`:1386`), which this crate spells as `None`.
+  /// The net is the start item's, which may itself be `None` for a non
+  /// conductive start item, and for a track that starts on nothing it is
+  /// [`RuleResolver::orphaned_net`] (`:1386`). That net is what makes the
+  /// head of a free space route and its own already fixed tail "same net"
+  /// (`pcbnew/router/pns_item.cpp:188`), so a shove can push an obstacle
+  /// there instead of the placer falling back to the walkaround, while a
+  /// null net would collide with everything.
   ///
   /// # Decision on note 03 section 9.6 item 2
   ///
@@ -2891,7 +2895,10 @@ impl LinePlacer {
     };
 
     // :1386
-    let net = start_item.and_then(|id| world.item(id).and_then(Item::net));
+    let net = match start_item {
+      Some(id) => world.item(id).and_then(Item::net),
+      None => Some(context.resolver.orphaned_net()),
+    };
 
     // :1393
     self.initial_direction = context.settings.initial_direction();
@@ -4354,9 +4361,10 @@ mod tests {
     assert_eq!(placing.direction, seeded);
     assert!(!placing.placing_via);
 
-    // Leg one runs east, leg two north, and the second fix arms a via so
+    // Leg one runs east, leg two south, and the second fix arms a via so
     // that the stage it pushes differs from the first one in every
-    // field an undo restores.
+    // field an undo restores. Neither leg runs the way the seed points,
+    // which is what keeps the assertion below meaningful.
     assert!(placer.move_to(&mut world, &context, at(4_000_000, 0), None));
     assert!(!placer.fix_route(
       &mut world,
@@ -4369,13 +4377,13 @@ mod tests {
     assert!(placer.move_to(
       &mut world,
       &context,
-      at(4_000_000, -4_000_000),
+      at(4_000_000, 4_000_000),
       None
     ));
     assert!(!placer.fix_route(
       &mut world,
       &context,
-      at(4_000_000, -4_000_000),
+      at(4_000_000, 4_000_000),
       None,
       false
     ));
@@ -4467,5 +4475,27 @@ mod tests {
     assert_eq!(placer.current_net(), Some(NetId(7)));
     assert_eq!(placer.current_start(), Some(at(0, 0)));
     assert_eq!(placer.current_layer(), Some(0));
+  }
+
+  #[test]
+  fn a_start_on_nothing_takes_the_resolvers_orphaned_net() {
+    // :1386. KiCad asks the host for a real handle here rather than
+    // leaving the net null, so that the head of a free space route is
+    // "same net" with the tail it has already fixed; the scenario that
+    // depends on it is
+    // `tests/placer.rs::a_route_started_in_free_space_shoves_past_its_own_fixed_tail`.
+    let mut world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let root = world.root();
+    let rules = FixedClearance::uniform(1000);
+    let settings = RoutingSettings::default();
+    let context = AlgoContext::new(&rules, &settings);
+    let mut placer = LinePlacer::new(&world, root, &settings, Sizes::default());
+
+    assert!(placer.start(&mut world, &context, at(0, 0), None));
+    assert_eq!(placer.current_net(), Some(rules.orphaned_net()));
+    assert!(
+      rules.net_code(rules.orphaned_net()) <= 0,
+      "the orphan has to read as `no net` to the topology code"
+    );
   }
 }

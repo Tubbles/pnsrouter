@@ -25,7 +25,7 @@ use pnsrouter::item::{ItemBody, ItemId, Kind, LayerRange, NetId, Solid};
 use pnsrouter::line::Line;
 use pnsrouter::node::{NodeId, World};
 use pnsrouter::placer::line_placer::{LinePlacer, PlacerState};
-use pnsrouter::rules::{FixedClearance, ItemRef};
+use pnsrouter::rules::{FixedClearance, ItemRef, RuleResolver};
 use pnsrouter::settings::{RouterMode, RoutingSettings, Sizes};
 
 /// The clearance every scenario routes to, in nanometres.
@@ -1683,4 +1683,42 @@ fn the_shove_route_is_the_same_twice() {
   let second = committed_shove_board(&route_the_shove_board());
 
   assert_eq!(first, second, "two identical shove runs disagreed");
+}
+
+/// Where the free space route below starts, clear of the start pad.
+const FREE_START: Vec2 = Vec2::new(1_000_000, 0);
+
+/// Where its second leg ends, short of the target pad.
+const FREE_TARGET: Vec2 = Vec2::new(7_000_000, 0);
+
+#[test]
+fn a_route_started_in_free_space_shoves_past_its_own_fixed_tail() {
+  // The net `RuleResolver::orphaned_net` hands a route that starts on
+  // nothing is what makes its head and the leg it has already fixed
+  // "same net" (`pcbnew/router/pns_item.cpp:188`). Without it the head
+  // collides with its own tail, the shove refuses, and the placer falls
+  // back to the walkaround, which leaves the board alone.
+  let (mut world, _) = build_shove_board();
+  let rules = rules();
+  let settings = settings_for(RouterMode::Shove);
+  let context = AlgoContext::new(&rules, &settings);
+  let mut placer = placer_for(&world, &settings);
+
+  assert!(placer.start(&mut world, &context, FREE_START, None));
+  assert_eq!(placer.current_net(), Some(rules.orphaned_net()));
+
+  // One fixed leg, so that the second one has a tail of its own net to
+  // run out of.
+  assert!(placer.move_to(&mut world, &context, SHOVE_RETREAT, None));
+  assert!(!placer.fix_route(&mut world, &context, SHOVE_RETREAT, None, false));
+  assert!(placer.move_to(&mut world, &context, FREE_TARGET, None));
+
+  let pushed = placer.current_node(false);
+
+  assert_ne!(
+    track_shape(&world, pushed, NEAR_TRACK_NET),
+    NEAR_TRACK.to_vec(),
+    "the second leg walked around the near track instead of pushing it"
+  );
+  assert_shove_node_is_clear(&world, pushed, &rules);
 }

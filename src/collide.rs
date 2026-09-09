@@ -1157,6 +1157,10 @@ mod tests {
     fn net_code(&self, net: NetId) -> i32 {
       self.fixed.net_code(net)
     }
+
+    fn orphaned_net(&self) -> NetId {
+      self.fixed.orphaned_net()
+    }
   }
 
   /// A round pad of a radius, on layer 0, flashed there.
@@ -1885,6 +1889,10 @@ mod tests {
 
       fn net_code(&self, net: NetId) -> i32 {
         i32::try_from(net.0).unwrap_or(i32::MAX)
+      }
+
+      fn orphaned_net(&self) -> NetId {
+        NetId(0)
       }
 
       fn is_in_net_tie(&self, _item: ItemRef<'_>) -> bool {

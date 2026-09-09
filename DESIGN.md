@@ -70,11 +70,14 @@ pub trait RuleResolver {
   fn is_drilled_hole(&self, item: ItemRef) -> bool;
   fn is_non_plated_slot(&self, item: ItemRef) -> bool;
   fn net_code(&self, net: NetId) -> i32;
+  fn orphaned_net(&self) -> NetId;
   // diff pair and net tie methods defaulted to "not supported"
 }
 ```
 
 `Option<i32>` replaces the `-1` sentinel, a three state enum replaces the bool plus out parameter. The clearance cache and the hull cache belong to the engine, keyed by `ItemId`, so hosts cannot get invalidation wrong.
+
+`orphaned_net` is KiCad's `ROUTER_IFACE::GetOrphanedNetHandle`, the net a route started in free space is placed on. It sits here rather than on an interface of its own because the resolver is the host object the algorithms already carry, and it has to be stable, to have a net code of zero or below, and to differ from every net a snapshot item carries. A free space route on no net at all collides with its own already fixed tail, which makes the shove refuse and the placer walk around instead.
 
 `IsFlashedOnLayer` is not a callback. It is a pure function of item and layer with three effects (collision suppression, via hull shrinking to the hole, per layer pad geometry), so it is materialised as the `flashed_layers` mask on the item. For LibrePCB's first integration the mask equals the layer span.
 

@@ -62,6 +62,13 @@
 //! `NETINFO_ITEM` straight through (`:1691`) and the clearance ladder
 //! compares handles (`:902`). Only the board outline gets a null net,
 //! which is the case KiCad spells `nullptr` (note 05 section 3.8).
+//!
+//! [`RuleResolver::orphaned_net`], the net a route started in free space
+//! carries, is `NetId(u32::MAX)`, an index outside the table, and
+//! [`RuleResolver::net_code`] answers `-1` for it. KiCad can reuse the
+//! unconnected net's code there because its orphan is a separate
+//! `NETINFO_ITEM` and the router compares handles; an index cannot be
+//! separate from itself, so the orphan gets an index of its own.
 
 use pnsrouter::geometry::hull::monotone_chain_hull;
 use pnsrouter::geometry::line_chain::LineChain;
@@ -634,9 +641,31 @@ impl RuleResolver for KicadRules {
   }
 
   /// The net's index in the board's net table, so index zero, KiCad's
-  /// unconnected net, reads as "no net" to the topology code.
+  /// unconnected net, reads as "no net" to the topology code. The orphan
+  /// below is the one index that is not a table entry and answers `-1`.
   fn net_code(&self, net: NetId) -> i32 {
+    if net == self.orphaned_net() {
+      return -1;
+    }
+
     i32::try_from(net.0).unwrap_or(i32::MAX)
+  }
+
+  /// A net index no board table can reach, standing in for KiCad's
+  /// `NETINFO_LIST::OrphanedItem()`
+  /// (`pcbnew/router/pns_kicad_iface.cpp:3020`).
+  ///
+  /// KiCad's orphan is a distinct `NETINFO_ITEM` that happens to carry
+  /// the same net code as the board's unconnected net, and the router
+  /// tells the two apart by comparing handles. A [`NetId`] here **is**
+  /// the table index, so the two cannot be told apart that way and the
+  /// orphan takes an index instead: `u32::MAX`, which no board of
+  /// `u32::MAX` nets could reach and which the reader never assigns.
+  /// Its net code has to be its own case, because `net_code` above would
+  /// otherwise saturate it to `i32::MAX` and report the orphan as a real
+  /// net.
+  fn orphaned_net(&self) -> NetId {
+    NetId(u32::MAX)
   }
 }
 

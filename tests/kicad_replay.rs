@@ -327,27 +327,21 @@ fn simple_shove_1_replays_without_a_violation() {
   assert_tier_one(&replay_case(&case));
 }
 
-/// Tier 2 for the case above.
+/// Tier 2 for the case above, and the only replayable case that
+/// exercises the net a free space route carries.
 ///
-/// The gap is the net a route started in free space carries.
-/// `LINE_PLACER::Start` gives it
+/// `LINE_PLACER::Start` gives such a route
 /// `ROUTER_IFACE::GetOrphanedNetHandle()`
-/// (`pcbnew/router/pns_line_placer.cpp:1401`), a real net object with a
-/// non-positive net code that note 05 section 3.8 is careful to
-/// distinguish from a null net; this crate's placer leaves the net
-/// `None`. With a null net the shove refuses and the placer falls back to
-/// the walkaround (`:1013`), which walks the head round the obstacles
-/// instead of pushing them, so nothing is added or removed at all.
-///
-/// Measured by giving the same session a synthetic one nanometre start
-/// pad on a fresh net and changing nothing else: the replay then answers
-/// 28 added and 13 removed, the golden exactly. It is not the shove
-/// budget, which was raised to 20000 iterations with no change.
+/// (`pcbnew/router/pns_line_placer.cpp:1386`), a real handle whose net
+/// code is not positive, which
+/// [`pnsrouter::rules::RuleResolver::orphaned_net`] ports. It is what
+/// makes the head and the tail this session has already fixed "same net"
+/// (`pcbnew/router/pns_item.cpp:188`), so the shove pushes the tracks
+/// in the way instead of refusing. A null net there collides with the
+/// route's own tail, the shove refuses, and the placer falls back to the
+/// walkaround (`:1012`), which walks around the obstacles and commits
+/// nothing at all.
 #[test]
-#[ignore = "measured added 0 versus golden 28, measured removed 0 versus \
-            golden 13: a route started in free space has no net here \
-            where KiCad gives it the orphaned net handle, so the shove \
-            falls back to the walkaround"]
 fn simple_shove_1_matches_the_golden() {
   assert_tier_two(&replay_case(&load("simple-shove-1")));
 }

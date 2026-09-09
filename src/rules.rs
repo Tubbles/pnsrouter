@@ -370,6 +370,50 @@ pub trait RuleResolver {
   /// numbering starts at zero has to offset it.
   fn net_code(&self, net: NetId) -> i32;
 
+  /// The net a route started in free space is placed on.
+  ///
+  /// Port of `ROUTER_IFACE::GetOrphanedNetHandle`
+  /// (`pcbnew/router/pns_router.h:118`), whose KiCad implementation hands
+  /// back the process wide `NETINFO_LIST::OrphanedItem()`
+  /// (`pcbnew/router/pns_kicad_iface.cpp:3020`). It has exactly one
+  /// caller, `LINE_PLACER::Start`
+  /// (`pcbnew/router/pns_line_placer.cpp:1386`), which reads
+  /// `aStartItem ? aStartItem->Net() : GetOrphanedNetHandle()`.
+  ///
+  /// # Contract
+  ///
+  /// - The value is **stable** for the life of the resolver. KiCad's is a
+  ///   function local static, so every free space route in a session
+  ///   shares one handle.
+  /// - [`RuleResolver::net_code`] of it is **zero or less**, so the
+  ///   topology code reads it as "no net"
+  ///   (`pcbnew/router/pns_topology.cpp:123`) and the Mark Obstacles net
+  ///   adoption at `pcbnew/router/pns_line_placer.cpp:1571` lets the end
+  ///   item's net win. KiCad's orphan carries `NETINFO_LIST::UNCONNECTED`,
+  ///   which is zero (`pcbnew/netinfo.h:272`,
+  ///   `pcbnew/netinfo_list.cpp:315`).
+  /// - It **differs from every net a snapshot item carries**. KiCad's
+  ///   `OrphanedItem()` is a separate `NETINFO_ITEM` from the board's own
+  ///   unconnected net even though the two share a net code, and the
+  ///   router compares handles rather than codes, so a free space head
+  ///   still keeps clearance from unconnected copper
+  ///   (`pcbnew/router/pns_item.cpp:188`).
+  ///
+  /// The first two make the head of a free space route and its own
+  /// already fixed tail "same net", which is what lets a shove push an
+  /// obstacle instead of the placer falling back to the walkaround; the
+  /// third stops that exemption from spreading to the board.
+  ///
+  /// # Why it lives on this trait
+  ///
+  /// KiCad hangs it off `ROUTER_IFACE`, reached through
+  /// `Router()->GetInterface()`. This crate has no router singleton
+  /// (`DESIGN.md` section 8), and the uses of `ROUTER::GetInstance()`
+  /// became [`crate::algo_base::AlgoContext`] fields instead. The
+  /// resolver is the one of those the host supplies, so the host's net
+  /// vocabulary is asked for here rather than through a second trait.
+  fn orphaned_net(&self) -> NetId;
+
   /// Whether the item belongs to a net tie footprint.
   ///
   /// Port of `IsInNetTie`, `pcbnew/router/pns_node.h:154`. A true answer
@@ -593,6 +637,19 @@ impl RuleResolver for FixedClearance {
   /// [`RuleResolver::net_code`].
   fn net_code(&self, net: NetId) -> i32 {
     i32::try_from(net.0).unwrap_or(i32::MAX)
+  }
+
+  /// `NetId(0)`, whose [`RuleResolver::net_code`] above is already zero.
+  ///
+  /// This resolver's convention is that a real net numbers from one, so
+  /// net zero is free to be the orphan and no special case is needed. A
+  /// host that numbers its own nets from zero has to offset them anyway,
+  /// which is the same requirement [`RuleResolver::net_code`] states, and
+  /// once it has, nothing in a snapshot carries `NetId(0)`. KiCad's
+  /// orphan carries the same code, `NETINFO_LIST::UNCONNECTED`
+  /// (`pcbnew/netinfo.h:272`).
+  fn orphaned_net(&self) -> NetId {
+    NetId(0)
   }
 }
 

@@ -105,13 +105,15 @@ Pointers into the board are safe for the lifetime of one routing session only be
 
 ### 1.6 Net ids
 
-`NetId` is a `u32` newtype and "no net" is `Option::None`, not a reserved value (`src/item.rs`, the `NetId` doc comment). This removes Horizon's zero sentinel bug (note 05 section 5.5), so the host is free to number from zero.
+`NetId` is a `u32` newtype and "no net" is `Option::None`, not a reserved value (`src/item.rs`, the `NetId` doc comment). This removes Horizon's zero sentinel bug (note 05 section 5.5), so the host is free to number from zero. `None` means a non conductive obstacle: its clearance always applies and it is never "same net" with anything, which is why the engine asks a host to give copper a `NetId` even when the copper has no net of its own. See below for how far this integration goes on that.
 
 The snapshot builder walks `board.getProject().getCircuit().getNetClasses()` and the board's net segments, interning `NetSignal` identity (`libs/librepcb/core/project/circuit/netsignal.h:62` for the uuid, `:65` for the net class) into a dense `u32` with a `QHash<const NetSignal*, uint32_t>` and a reverse `QVector<NetSignal*>`. `BoardDesignRuleCheckData` does the same walk for the DRC (`libs/librepcb/core/project/board/drc/boarddesignrulecheckdata.cpp:101` for the net class loop, `:111` for the segments), which is worth reading as the reference implementation for a board snapshot in this code base: it is a plain data structure copied out of the board for a separate consumer, exactly what we are building.
 
-A pad or a net segment with no net signal gets `None`. Note that `BoardEditorState_DrawTrace` refuses to start a trace on a pad with no net at all (`libs/librepcb/editor/project/board/fsm/boardeditorstate_drawtrace.cpp:490` builds the exception, thrown at `:542`); the new tool inherits that restriction for now.
+A pad or a net segment with no net signal gets `None`, which the FFI spells as net zero. That is a deliberate simplification and not the same thing KiCad does: KiCad hands the board's unconnected `NETINFO_ITEM` straight through (`pcbnew/router/pns_kicad_iface.cpp:1691`), so two unassigned pads read as the same net there and keep no clearance from each other, while here they collide like any two obstacles. Interning a net for unassigned copper would close it, and needs the C++ side to send an id instead of zero. Note that `BoardEditorState_DrawTrace` refuses to start a trace on a pad with no net at all (`libs/librepcb/editor/project/board/fsm/boardeditorstate_drawtrace.cpp:490` builds the exception, thrown at `:542`); the new tool inherits that restriction for now.
 
 `RuleResolver::net_code` must return a positive integer for a real net, because the engine's topology code treats zero and below as "no net" (`src/rules.rs`, the `net_code` doc comment). Return `net.0 + 1`.
+
+`RuleResolver::orphaned_net` is the net a route started in free space is placed on, the port of KiCad's `GetOrphanedNetHandle` (`pcbnew/router/pns_kicad_iface.cpp:3020`). It has to be stable, its net code has to be zero or below, and it must not be a net any board item carries, or a route in free space would stop keeping clearance from that net's copper. `NetId(u32::MAX)` with `net_code` answering `-1` for it satisfies all three: the interner numbers densely from zero, so the top of the range is unreachable.
 
 ### 1.7 Pad geometry
 

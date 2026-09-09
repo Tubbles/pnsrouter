@@ -87,11 +87,25 @@ const OCTAGON_CHAMFER_HALF_FACTOR: f64 = 1.0 - FRAC_1_SQRT_2;
 /// keys. A `u32` newtype does all of that and is deterministic, which a
 /// pointer is not (`DESIGN.md` section 8).
 ///
-/// "No net" is `Option::None`, not a reserved value. KiCad's
-/// `GetOrphanedNetHandle` (`pcbnew/router/pns_kicad_iface.cpp:3020`), the
-/// stable non null handle whose net code is not positive that a track
-/// started in empty space gets, is a **host** concern: the host picks
-/// whatever `NetId` it wants for that, or `None`. See note 05 section 1.8.
+/// "No net" is `Option::None`, not a reserved value, and it means one
+/// narrow thing: a **non conductive obstacle**, whose clearance always
+/// applies and which is never "same net" with anything, not even with
+/// another netless item (`pcbnew/router/pns_item.cpp:188` needs both
+/// handles equal *and* the head's handle non null). KiCad reaches it for
+/// text, dimensions and rule areas; note 05 section 1.8 has the list.
+///
+/// Two neighbouring cases are **not** `None`:
+///
+/// - Copper with no net of its own carries a host id anyway. KiCad hands
+///   the board's unconnected `NETINFO_ITEM` straight through
+///   (`pcbnew/router/pns_kicad_iface.cpp:1691`), so two unconnected pads
+///   compare as the same net; a `None` there would make them collide.
+/// - A route started in free space carries
+///   [`crate::rules::RuleResolver::orphaned_net`], the port of
+///   `GetOrphanedNetHandle` (`pcbnew/router/pns_kicad_iface.cpp:3020`).
+///   Its net code is not positive, so the topology code still reads it as
+///   "no net", but it is a real handle, so the head of such a route does
+///   not collide with the tail it already fixed.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct NetId(pub u32);
 
