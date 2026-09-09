@@ -15,6 +15,7 @@ pub mod algo_base;
 pub mod arena;
 pub mod collide;
 pub mod debug;
+pub mod eventlog;
 pub mod geometry;
 pub mod index;
 pub mod item;

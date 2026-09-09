@@ -1,0 +1,74 @@
+# A pnsrouter session recording. The grammar is on
+# `SessionRecording::to_text` in src/eventlog.rs;
+# regenerating a fixture is a deliberate act, see
+# tests/fixtures/sessions/README.md.
+pnsrouter-session 1
+
+# snapshot <copper-layer-count> <max-clearance>
+snapshot 2 800000
+
+# item <host> <net> <layers> <locked> <routable> <free-pad> <compound> <flash> <drill> <geometry>
+item 1 1 0 0 0 1 0 0 flash-default no-drill solid circle 0 0 400000 0 0 0 0 0.0 0
+item 2 2 0 0 0 1 0 0 flash-default no-drill solid circle 2000000 0 400000 2000000 0 0 0 0.0 0
+item 3 1 0 0 0 1 0 0 flash-default no-drill solid circle 4000000 0 400000 4000000 0 0 0 0.0 0
+item 5 1 1 1 0 1 0 0 flash-default no-drill solid circle 3000000 -3000000 400000 3000000 -3000000 0 0 0.0 0
+
+settings 0 mode walkaround
+settings 0 effort medium
+settings 0 shove-vias 1
+settings 0 remove-loops 1
+settings 0 smart-pads 1
+settings 0 follow-mouse 1
+settings 0 start-diagonal 0
+settings 0 jump-over-obstacles 0
+settings 0 smooth-dragged-segments 1
+settings 0 allow-drc-violations 0
+settings 0 free-angle-mode 0
+settings 0 optimize-entire-dragged-track 0
+settings 0 auto-posture 1
+settings 0 fix-all-segments 1
+settings 0 restrict-angles 0
+settings 0 corner-mode mitered-45
+settings 0 walkaround-iteration-limit 40
+settings 0 shove-iteration-limit 250
+settings 0 shove-time-limit-ms 1000
+settings 0 via-force-prop-iteration-limit 40
+settings 0 walkaround-hug-length-threshold 1.5
+
+sizes 0 clearance 0
+sizes 0 min-clearance 0
+sizes 0 track-width 200000
+sizes 0 board-min-track-width 100000
+sizes 0 via-diameter 600000
+sizes 0 via-drill 300000
+sizes 0 diff-pair-width 125000
+sizes 0 diff-pair-gap 180000
+sizes 0 diff-pair-via-gap 180000
+sizes 0 hole-to-hole 0
+sizes 0 diff-pair-hole-to-hole 0
+sizes 0 diff-pair-copper-to-hole 0
+sizes 0 track-width-is-explicit 1
+sizes 0 diff-pair-via-gap-same-as-trace-gap 1
+sizes 0 via-type through
+sizes 0 layer-pair 0 1
+sizes 0 layer-pair 1 0
+
+# event <name> <fields>
+event start-routing 0 0 1 0
+event move-to -1000000 -1000000 -
+event fix-route -1000000 -1000000 - 0
+event move-to -1000000 -2000000 -
+event undo-last-segment
+event move-to 0 -3000000 -
+event toggle-via-placement
+event move-to 0 -3000000 -
+event fix-route 0 -3000000 - 0
+event switch-layer 1
+event move-to 3000000 -3000000 5
+event fix-route 3000000 -3000000 5 0
+
+# commit, then its removed, added and updated items
+commit
+added segment 0 0 0 -3000000 0 200000 1 0 0 -
+added via 0 -3000000 600000 300000 through 1 0 1 -
+added segment 0 -3000000 3000000 -3000000 0 200000 1 1 1 -

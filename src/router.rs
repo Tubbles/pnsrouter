@@ -58,6 +58,7 @@
 use crate::algo_base::AlgoContext;
 use crate::collide::CollisionSearchOptions;
 use crate::debug::{DebugDecorator, NoDebug};
+use crate::eventlog::{Recorder, SessionEvent, SessionRecording};
 use crate::geometry::direction45::CornerMode;
 use crate::geometry::line_chain::LineChain;
 use crate::geometry::seg::Seg;
@@ -512,6 +513,20 @@ pub struct Router {
   /// The arena handles behind the last [`CommitDiff::added`], in that
   /// vector's order, so that [`Router::assign_host_ids`] can find them.
   committed: Vec<ItemId>,
+  /// Where the session is written down, when one is being recorded.
+  ///
+  /// Port of `m_logger` (`pcbnew/router/pns_router.h:293`), which KiCad
+  /// allocates only behind an advanced configuration flag
+  /// (`pcbnew/router/pns_router.cpp:69`). See [`crate::eventlog`].
+  recorder: Option<Recorder>,
+  /// How deep inside a composite facade method the session is.
+  ///
+  /// [`Router::finish`] and [`Router::continue_from_end`] pick their own
+  /// arguments and drive the smaller methods themselves, so each is one
+  /// event and the events those calls would record are suppressed. A
+  /// commit is recorded whatever the depth, because it is a result and
+  /// not an input.
+  recording_depth: u32,
 }
 
 impl Router {
@@ -546,6 +561,8 @@ impl Router {
       state: RouterState::Idle,
       copper_layer_count: snapshot.copper_layer_count,
       committed: Vec::new(),
+      recorder: None,
+      recording_depth: 0,
     }
   }
 
@@ -557,6 +574,73 @@ impl Router {
   /// [`DebugDecorator`].
   pub fn set_debug(&mut self, debug: Box<dyn DebugDecorator>) {
     self.debug = debug;
+  }
+
+  /// Install or remove the session recorder.
+  ///
+  /// The counterpart of KiCad's `m_logger`
+  /// (`pcbnew/router/pns_router.h:293`), which the constructor allocates
+  /// only when an advanced configuration flag is set
+  /// (`pcbnew/router/pns_router.cpp:69`) and which no setter reaches; the
+  /// `SetLogger` in that tree is `ALGO_BASE`'s
+  /// (`pcbnew/router/pns_algo_base.h:65`), for handing the pointer down.
+  ///
+  /// The recorder has to have been built over the same board, settings
+  /// and sizes this router holds, or a replay starts somewhere else;
+  /// [`Router::start_recording`] cannot get that wrong.
+  pub fn set_recorder(&mut self, recorder: Option<Recorder>) {
+    self.recorder = recorder;
+  }
+
+  /// Start recording this session over the board it was built from.
+  ///
+  /// The snapshot is the one [`Router::new`] was given: the engine keeps
+  /// no copy of it, because it is the host's value and the world is
+  /// derived from it.
+  pub fn start_recording(&mut self, snapshot: &WorldSnapshot) {
+    self.recorder = Some(Recorder::new(
+      snapshot.clone(),
+      self.settings,
+      self.sizes.clone(),
+    ));
+  }
+
+  /// What has been recorded so far, if anything.
+  ///
+  /// Port of `Logger()`, `pcbnew/router/pns_router.h:213`.
+  pub const fn recorder(&self) -> Option<&Recorder> {
+    self.recorder.as_ref()
+  }
+
+  /// Take the recording out and stop recording.
+  pub fn take_recording(&mut self) -> Option<SessionRecording> {
+    self.recorder.take().map(Recorder::into_recording)
+  }
+
+  /// Append one event, unless a composite method is driving this call.
+  fn record(&mut self, event: SessionEvent) {
+    if self.recording_depth == 0
+      && let Some(recorder) = self.recorder.as_mut()
+    {
+      recorder.push_event(event);
+    }
+  }
+
+  /// Append one commit result, whatever is driving the call.
+  fn record_commit(&mut self, diff: &CommitDiff) {
+    if let Some(recorder) = self.recorder.as_mut() {
+      recorder.push_commit(diff);
+    }
+  }
+
+  /// Stop recording the events of the methods this one drives.
+  fn suspend_recording(&mut self) {
+    self.recording_depth = self.recording_depth.saturating_add(1);
+  }
+
+  /// Undo one [`Router::suspend_recording`].
+  fn resume_recording(&mut self) {
+    self.recording_depth = self.recording_depth.saturating_sub(1);
   }
 
   /// The persistent settings. Port of `Settings()`,
@@ -592,7 +676,23 @@ impl Router {
   /// fixing and starting a new leg. Widening the placer is a milestone 5
   /// follow up, tracked in `doc/work/005-session-api-and-event-log.md`.
   pub fn set_sizes(&mut self, sizes: Sizes) {
+    self.record(SessionEvent::SetSizes {
+      sizes: sizes.clone(),
+    });
     self.sizes = sizes;
+  }
+
+  /// Replace the persistent settings.
+  ///
+  /// The recordable form of [`Router::settings_mut`], which hands out a
+  /// mutable reference and never learns what was done with it. KiCad has
+  /// only the reference (`pcbnew/router/pns_router.h:227`); a host that
+  /// wants its settings changes to survive into a replay goes through
+  /// this instead. A change takes effect on the next event, because every
+  /// algorithm reads the settings through the context it is handed.
+  pub fn set_settings(&mut self, settings: RoutingSettings) {
+    self.record(SessionEvent::SetSettings { settings });
+    self.settings = settings;
   }
 
   /// The board and its speculative branches.
@@ -871,6 +971,8 @@ impl Router {
     start: Option<HostId>,
     layer: i32,
   ) -> Result<PreviewFrame, StartError> {
+    self.record(SessionEvent::StartRouting { at, start, layer });
+
     if self.routing_in_progress() {
       return Err(StartError::AlreadyRouting);
     }
@@ -928,6 +1030,8 @@ impl Router {
   /// 4.5). An idle router answers with an empty frame, which is the
   /// `default:` branch of `ROUTER::Move` (`:508`).
   pub fn move_to(&mut self, at: Vec2, end: Option<HostId>) -> PreviewFrame {
+    self.record(SessionEvent::MoveTo { at, end });
+
     if self.state != RouterState::RouteTrack {
       return PreviewFrame::default();
     }
@@ -964,6 +1068,12 @@ impl Router {
     end: Option<HostId>,
     force_finish: bool,
   ) -> FixOutcome {
+    self.record(SessionEvent::FixRoute {
+      at,
+      end,
+      force_finish,
+    });
+
     if self.state != RouterState::RouteTrack {
       return FixOutcome::Continue(PreviewFrame::default());
     }
@@ -982,7 +1092,14 @@ impl Router {
     }
 
     if reached {
-      FixOutcome::Finished(self.stop_routing())
+      // The fix is the event; the commit it reaches is not a second one.
+      self.suspend_recording();
+
+      let diff = self.stop_routing();
+
+      self.resume_recording();
+
+      FixOutcome::Finished(diff)
     } else {
       FixOutcome::Continue(self.frame())
     }
@@ -1008,6 +1125,8 @@ impl Router {
   /// straight back (`:608`) and has no such gap; it closes as soon as the
   /// host reports its ids back through [`Router::assign_host_ids`].
   pub fn finish(&mut self) -> Option<FixOutcome> {
+    self.record(SessionEvent::Finish);
+
     if self.state != RouterState::RouteTrack {
       return None;
     }
@@ -1017,6 +1136,10 @@ impl Router {
 
     // :594. Five tries, stopping as soon as the end stops moving.
     let mut settled = self.placer.as_ref().and_then(LinePlacer::current_end);
+
+    // This routine picks its own anchor, so it is one event and the moves
+    // and the fix it drives are not recorded on their own.
+    self.suspend_recording();
 
     for _ in 0..5 {
       settled = self.placer.as_ref().and_then(LinePlacer::current_end);
@@ -1033,10 +1156,16 @@ impl Router {
       .is_some_and(|layer| anchor.layers.contains(layer));
 
     if settled != Some(anchor.at) || !overlaps {
+      self.resume_recording();
+
       return None;
     }
 
-    Some(self.fix_route(anchor.at, host, false))
+    let outcome = self.fix_route(anchor.at, host, false);
+
+    self.resume_recording();
+
+    Some(outcome)
   }
 
   /// Commit what is routed and start again from the far end.
@@ -1055,6 +1184,8 @@ impl Router {
   /// [`ContinueOutcome::frame`] is [`None`] is that case, and the host
   /// still has to apply the diff.
   pub fn continue_from_end(&mut self) -> Option<ContinueOutcome> {
+    self.record(SessionEvent::ContinueFromEnd);
+
     if self.state != RouterState::RouteTrack {
       return None;
     }
@@ -1063,6 +1194,11 @@ impl Router {
     let host = anchor.item.and_then(|id| self.index.host_of(id));
     let layer = self.current_layer()?;
     let end = self.placer.as_ref().and_then(LinePlacer::current_end)?;
+
+    // This routine picks its own anchor, so it is one event and the
+    // commit, the restart and the move it drives are not recorded on
+    // their own.
+    self.suspend_recording();
 
     // :633
     let diff = self.stop_routing();
@@ -1075,13 +1211,16 @@ impl Router {
     };
 
     let restarted = self.start_routing(anchor.at, host, next_layer).is_ok();
-
-    Some(ContinueOutcome {
+    let outcome = ContinueOutcome {
       diff,
       // :643
       frame: restarted.then(|| self.move_to(end, None)),
       start: host,
-    })
+    };
+
+    self.resume_recording();
+
+    Some(outcome)
   }
 
   /// Undo the last fix.
@@ -1096,6 +1235,8 @@ impl Router {
   /// `RoutingInProgress()`, so a dragging session would crash there; this
   /// answers [`None`].
   pub fn undo_last_segment(&mut self) -> Option<Vec2> {
+    self.record(SessionEvent::UndoLastSegment);
+
     if self.state != RouterState::RouteTrack {
       return None;
     }
@@ -1133,6 +1274,8 @@ impl Router {
   /// [`crate::snapshot::WorldSnapshot::copper_layer_count`] is what makes
   /// the check possible at all.
   pub fn switch_layer(&mut self, layer: i32) -> bool {
+    self.record(SessionEvent::SwitchLayer { layer });
+
     if self.state != RouterState::RouteTrack {
       return false;
     }
@@ -1164,6 +1307,8 @@ impl Router {
   /// (`pcbnew/router/pns_line_placer.cpp:2105`), so a host has to move
   /// before the preview shows it.
   pub fn toggle_via_placement(&mut self) -> bool {
+    self.record(SessionEvent::ToggleViaPlacement);
+
     if self.state != RouterState::RouteTrack {
       return false;
     }
@@ -1182,6 +1327,8 @@ impl Router {
   /// (`pcbnew/router/pns_router.cpp:1001`), which forwards to the placer
   /// only while routing.
   pub fn flip_posture(&mut self) {
+    self.record(SessionEvent::FlipPosture);
+
     if self.state != RouterState::RouteTrack {
       return;
     }
@@ -1201,6 +1348,8 @@ impl Router {
   /// (`DESIGN.md` section 3), so this crate has the two mitered ones and
   /// the cycle is between them.
   pub fn toggle_corner_mode(&mut self) {
+    self.record(SessionEvent::ToggleCornerMode);
+
     self.settings.corner_mode = match self.settings.corner_mode {
       CornerMode::Mitered45 => CornerMode::Mitered90,
       CornerMode::Mitered90 => CornerMode::Mitered45,
@@ -1213,6 +1362,8 @@ impl Router {
   /// (`pcbnew/router/pns_router.cpp:1085`), which forwards whenever a
   /// placer exists rather than testing the state.
   pub fn set_ortho_mode(&mut self, ortho: bool) {
+    self.record(SessionEvent::SetOrthoMode { ortho });
+
     if let Some(placer) = self.placer.as_mut() {
       placer.set_ortho_mode(ortho);
     }
@@ -1257,6 +1408,8 @@ impl Router {
   /// `StopRouting` also pushes the touched nets to the host so it can
   /// rebuild the ratsnest (`:971`); a host here reads them off the diff.
   pub fn stop_routing(&mut self) -> CommitDiff {
+    self.record(SessionEvent::StopRouting);
+
     let plan = self.build_commit_plan();
 
     // :959, the placer's own commit, which folds its scratch branch into
@@ -1285,6 +1438,7 @@ impl Router {
 
     self.committed = plan.added;
     self.finish_session();
+    self.record_commit(&plan.diff);
 
     plan.diff
   }
@@ -1302,6 +1456,7 @@ impl Router {
   /// and every item those branches own, so nothing the session built
   /// survives.
   pub fn abort_routing(&mut self) {
+    self.record(SessionEvent::AbortRouting);
     self.finish_session();
   }
 
@@ -1322,6 +1477,8 @@ impl Router {
   /// Returns how many pairs were applied; an index past the end of the
   /// last diff is ignored.
   pub fn assign_host_ids(&mut self, ids: &[(usize, HostId)]) -> usize {
+    self.record(SessionEvent::AssignHostIds { ids: ids.to_vec() });
+
     let mut applied = 0;
 
     for (index, host) in ids {
