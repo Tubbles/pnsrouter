@@ -98,6 +98,4 @@ Deferred during the latency measurement (2026-09-09):
 
 Deferred during the session recording work (2026-09-09):
 
-- Nothing globs `tests/fixtures/sessions/`: a recording dropped there needs a named test in `tests/eventlog.rs`. A directory driven test that replays every LibrePCB recording with `FixedClearance::uniform(sizes.min_clearance)` would make new fixtures free.
 - A recording carries no rule table, only `max_clearance` and the sizes, so a replay of a board with net class overrides cannot pick the right resolver. Serialising the clearance answers the session actually used (a table by net pair, or the net class values) would make replays exact for any board.
-- The first real board fixture, the Gerber Test recording from the LibrePCB gtest, is not in the tree yet; it is at `~/dev/librepcb/tmp/agent-record/librepcb_gerber_test.txt` on this machine.

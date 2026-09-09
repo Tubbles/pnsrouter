@@ -26,13 +26,20 @@ KiCad's own harness regenerates its goldens with `qa_pns_regressions --update-go
 
 ## Adding a fixture
 
-Record a session in `tests/eventlog.rs`, write it here with `SessionRecording::to_text`, and add a test that reads it back and calls `assert_replay_matches`. Keep one file to one scenario; the file name says what the scenario is.
+Record a session in `tests/eventlog.rs`, write it here with `SessionRecording::to_text`, and add a test that reads it back and calls `assert_replay_matches`. Keep one file to one scenario, and let the file name say what the scenario is.
+
+### The `librepcb_` prefix
+
+A file named `librepcb_*.txt` was recorded by LibrePCB itself, through the directory named by `LIBREPCB_PNS_RECORD_DIR`, and needs no named test. `tests/librepcb_sessions.rs` reads the directory at run time, and for every file it finds it checks the text round trip, `assert_replay_matches` and `assert_replay_is_collision_free`, all with `FixedClearance::uniform(sizes.min_clearance)`, the board minimum clearance the file carries. Dropping a recording in here is the whole of adding a case.
+
+The known limitation is the resolver. A recording carries `max_clearance` and the sizes but no rule table, so the uniform board minimum is the best resolver that can be reconstructed from the file. That is exact only while no net class on the board overrides the board minimum. A board that does override it will replay to different geometry than LibrePCB produced and must not be added under this prefix until recordings carry their rules, which is a `TODO.md` item. Such a board can still live here under another name, with a named test that hands `replay` a resolver of its own.
 
 ## The files
 
 - `two_layer_via.txt`: a route out of a pad on layer 0, a via, a leg on layer 1, one fix undone again, and a terminal fix on a pad on layer 1. The board is the two layer fixture `tests/router.rs` and `tests/placer.rs` use.
 - `kicad_backspace1.txt`: KiCad's `backspace1` regression case, replayed. One start on a pad of footprint `U1`, 314 moves, ten fixes and nine backspaces, in shove mode. It is the only case in KiCad's corpus that exercises `UndoLastSegment`.
 - `kicad_shove_same_net_via.txt`: KiCad's `issue24132-shove-same-net-via` regression case, replayed. One start, 342 moves and one fix, in shove mode, on the corpus's smallest board.
+- `librepcb_gerber_test.txt`: the first recording made by a host. LibrePCB's `BoardPnsRouterTest` routed one leg out of a footprint pad into free space on its `Gerber Test` project, in walkaround mode, 236 items on the board and one commit of three segments. Its origin comment is added by hand, everything below it is what LibrePCB wrote.
 
 ### Where the two KiCad fixtures come from
 
