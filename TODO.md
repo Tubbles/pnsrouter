@@ -53,3 +53,10 @@ Deferred during the KiCad replay work (2026-09-09):
 - A `.kicad_dru` reader with `has_user_defined_physical_constraint` and physical clearance rules would let `issue24132-shove-same-net-via` reach its golden; it is a KiCad rule language feature LibrePCB does not have.
 - Keepout zones are counted and skipped by the snapshot converter (`tests/support/kicad_snapshot.rs`); `Item` carries no keepout mark yet. None of the replayed boards has one.
 - A tier 3 comparison (net names and per item geometry against `addedItems`) is cheap once the gaps above close.
+
+Deferred during LibrePCB step 4 (2026-09-09):
+
+- `Router::undo_last_segment` right after `fix_route` answers `None` because the fix clears the head; faithful to KiCad, whose host always moves in between, but a host friendly facade could answer the fixed tail's last point instead. Documented in `BoardPnsRouter::getPreview()` for now.
+- Expose `Router::assign_host_ids` over the FFI before step 5: without it a second route in the same session does not recognise the board objects the first commit became.
+- Add `clang-format` to `dev/Containerfile` so LibrePCB C++ can be formatted in the container; step 4's files were formatted by hand.
+- `dev/librepcb-in-container.sh cargo clippy --lib` on rust-core skips the `ffi` module; document `--features ffi` wherever the check is listed.

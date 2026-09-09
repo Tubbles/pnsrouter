@@ -38,3 +38,13 @@ Nothing is installed on the host. Every cargo invocation goes through the podman
     dev/in-container.sh cargo doc --no-deps --document-private-items
 
 LibrePCB builds against this crate through `dev/librepcb-in-container.sh` (mounts `~/dev/librepcb` too, working directory there); the integration lives on the fork's `pns-router` branch, design in `doc/librepcb-integration.md`.
+
+The LibrePCB side checks, all from this repository (the build directory is already configured with Ninja and tests on):
+
+    dev/librepcb-in-container.sh cargo fmt --manifest-path libs/librepcb/rust-core/Cargo.toml --check
+    dev/librepcb-in-container.sh cargo clippy --manifest-path libs/librepcb/rust-core/Cargo.toml --lib --features ffi -- -D warnings
+    dev/librepcb-in-container.sh cargo test --manifest-path libs/librepcb/rust-core/Cargo.toml --quiet
+    dev/librepcb-in-container.sh sh -c 'cd build && ninja -j16 librepcb_unittests'
+    dev/librepcb-in-container.sh sh -c 'xvfb-run -a ./build/tests/unittests/librepcb-unittests --gtest_filter="BoardPns*"'
+
+Plain `--lib` does not compile the `ffi` module and `--all-targets` fails on pre-existing test lints in rust-core, so `--lib --features ffi` is the clippy check that matters. `clang-format` is not in the image yet.

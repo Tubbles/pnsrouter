@@ -149,7 +149,7 @@ For v1 the router only ever *places* through vias, so `Sizes::via_layer_range` n
 
 The board outline is every `BI_Polygon` whose layer is `Layer::boardOutlines()`, plus every footprint polygon and circle on that layer, which is how `Board::calculateBoundingRect` collects it (`libs/librepcb/core/project/board/board.cpp:752` onwards, and note the transform through `Transform(*device)` at `:765`). `Layer::boardCutouts()` and `Layer::boardPlatedCutouts()` are also board edges (`Layer::isBoardEdge()` at `libs/librepcb/core/types/layer.h:162`) and should be treated the same.
 
-Each outline path becomes one non routable `Solid` spanning every copper layer, with **zero width**, mirroring KiCad (note 05 section 3.6): the clearance comes entirely from the board clearance rule, not from the shape. Do not follow Horizon's chain of 10 nm segments per layer, which note 05 section 5.9 explicitly warns against, both because it multiplies the index size by the layer count and because it only guards the boundary rather than the interior. A zero width closed polyline as a single `Shape::Simple` per outline, spanning all layers, is one item.
+Each edge of the flattened outline path becomes its own non routable `Solid` spanning every copper layer, a **zero width** `Shape::Segment` flagged as a compound primitive, all edges sharing one host id: the clearance comes entirely from the board clearance rule, not from the shape. That is what KiCad does for `Edge_Cuts` (`pcbnew/router/pns_kicad_iface.cpp:2047`, where `MakeEffectiveShapesWithLineEndings` on an unfilled shape yields one segment per edge and the compound flag is set when there is more than one). Not one `Shape::Simple` per outline, which this note first said and step 2 built: that shape is filled, the collision code takes a containment shortcut on any closed chain, and the whole board interior became an obstacle so that no route could start anywhere (found and fixed while building step 4). Do not follow Horizon's chain of 10 nm segments per layer either, which note 05 section 5.9 explicitly warns against because it multiplies the index size by the layer count.
 
 Board level mechanical holes are `board.getHoles()` (`libs/librepcb/core/project/board/board.h:249`), each a `BoardHoleData` with a diameter and a path (`libs/librepcb/core/project/board/boardholedata.h:59`, `:60`), reachable through `BI_Hole::getData()` (`libs/librepcb/core/project/board/items/bi_hole.h:66`). A hole with no copper of its own is a bare `WorldGeometry::Hole` spanning every copper layer, which is the variant that exists for exactly this case (`src/snapshot.rs`, the `Hole` variant's doc comment).
 
@@ -234,9 +234,11 @@ taking every net class in the circuit rather than only the ones in use, because 
 
 ### 3.1 Session lifetime and the FFI surface
 
-The wrapper class, call it `BoardPnsRouter`, lives in `libs/librepcb/editor/project/board/` and owns a `RustHandle<rs::PnsRouter>`. It is constructed on tool entry, destroyed on tool exit, and re-syncs its snapshot whenever the board changed underneath it. `BoardEditorState_DrawTrace` has the same shape: it takes over the undo stack for the duration and blocks other editors (`libs/librepcb/editor/project/board/fsm/boardeditorstate_drawtrace.cpp:470`).
+The wrapper class, call it `BoardPnsRouter`, owns a `RustHandle<rs::PnsRouter>`. It is constructed on tool entry, destroyed on tool exit, and re-syncs its snapshot whenever the board changed underneath it. `BoardEditorState_DrawTrace` has the same shape: it takes over the undo stack for the duration and blocks other editors (`libs/librepcb/editor/project/board/fsm/boardeditorstate_drawtrace.cpp:470`).
 
-The FFI mirrors the crate's session facade (`DESIGN.md` section 7, currently a placeholder in `src/router.rs`):
+As built (step 4) it lives in `libs/librepcb/core/project/board/boardpnsrouter.{h,cpp}`, not in the editor library as this note first said. It has no user interface, no graphics items and no undo stack, and it belongs next to `BoardPnsSnapshot`, which landed in core after this note was written and which it owns.
+
+The FFI mirrors the crate's session facade (`DESIGN.md` section 7, `src/router.rs`):
 
 | Tool event | `Router` method | Returns |
 | --- | --- | --- |
@@ -252,7 +254,30 @@ The FFI mirrors the crate's session facade (`DESIGN.md` section 7, currently a p
 | double click, or `fix_route` reporting finished | `finish()` | `CommitDiff` |
 | escape | `stop()` | `CommitDiff` |
 
-`PreviewFrame` and `CommitDiff` cross back as opaque handles with accessor functions (`ffi_router_preview_item_count`, `ffi_router_preview_item_at`, and so on), because they are read once and dropped. That avoids inventing an out parameter protocol for variable length results. The C++ side wraps them in a `RustHandle` too.
+`PreviewFrame` and `CommitDiff` cross back through accessor functions, because they are read once and dropped and an out parameter protocol for variable length results would be worse. They are **not** separate handles, which is the one place the sketch above was changed: the session keeps its latest frame and its latest commit inside itself and C++ reads them right after the call that produced them. One handle type, one deleter, no lifetime for the host to get wrong, and a `PreviewFrame` is replaced on every event anyway.
+
+### 3.1.1 What the FFI actually is
+
+The prefix is `ffi_pnsrouter_*` throughout, matching the snapshot half of the module, and every function is the thinnest possible shim over the `Router` method of the same name. The whole surface, as of step 4:
+
+- Session: `ffi_pnsrouter_new`, `_delete`, `_copper_layer_count`, `_routing_in_progress`, `_set_settings`, `_current_layer`, `_placing_via`.
+- Events: `ffi_pnsrouter_hover`, `_hover_at`, `_is_starting_point_routable`, `_start_routing`, `_move_to`, `_fix_route`, `_finish`, `_undo_last_segment`, `_switch_layer`, `_toggle_via_placement`, `_flip_posture`, `_toggle_corner_mode`, `_stop_routing`, `_abort_routing`.
+- Preview readback: `ffi_pnsrouter_preview_item_count`, `_preview_item`, `_preview_item_point`, `_preview_has_via`, `_preview_via`, `_preview_fixed_via_count`, `_preview_fixed_via`, `_preview_ratline_point_count`, `_preview_ratline_point`, `_preview_violation_count`, `_preview_violation`, `_preview_hidden_count`, `_preview_hidden_at`.
+- Commit readback: `ffi_pnsrouter_commit_removed_count`, `_removed_at`, `_added_count`, `_added_at`, `_updated_count`, `_updated_at`.
+
+`continue_from_end`, `nearest_ratsnest_anchor`, `assign_host_ids`, `set_ortho_mode`, the recorder and the debug decorator are deliberately absent; they belong to later steps.
+
+The conventions the sketch left open, decided while building it:
+
+- `hover` stores its answer in the session and hands it back with a count and an index accessor, rather than filling a caller allocated buffer. It is then the same shape as every other variable length answer on this boundary, and there is no capacity to get wrong and no truncation case to document. It answers host ids, because host ids are what every other method takes.
+- `StartError` becomes `PnsStartResult`, a flat enum with `Ok` first. The host id and the item id its two naming variants carry are dropped: the host already knows which object it asked about, and an engine item id means nothing to it.
+- `FixOutcome` becomes `PnsFixOutcome` with a third value, `NotRouting`, which is what `Router::finish`'s `None` turns into.
+- New enums are `#[repr(C)]` like the snapshot half's `PnsShapeKind` and `PnsViaType`, and are carried as typed fields rather than as bare integers. Each variant's doc comment names the crate variant it maps to. `pnsrouter::item::ViaType` has five values and `PnsViaType` has three, so a micro via reports as blind and the unset value reports as a through via.
+- Optional values use the negative sentinel the snapshot half already uses: a clearance of `-1` is "no rule applies", a layer index of `-1` is "no layer", a host id of `0` is "no object".
+- A net crosses as the snapshot's number, counted from one with zero for "no net". The engine's orphan net, `NetId(u32::MAX)`, is the one net the host never sent, so it reads back as zero too and `BoardPnsRouter` turns it into a null `NetSignal`, which is what a route placed in free space gets.
+- A cursor point is clamped to the engine's coordinate range rather than rejected. The snapshot builder rejects an out of range coordinate so that the host can name the offending board item; a cursor is not a board object and there is nothing to name.
+- `ffi_pnsrouter_set_settings` and `ffi_pnsrouter_new` derive `RoutingSettings` and `Sizes` through one shared helper, so a session created with a set of values and a session updated to it are the same session. The update starts from the session's current settings rather than from the defaults, so a corner mode the user cycled survives a width change.
+- The session replaces its stored frame on exactly the calls the crate returns one from, which is `start_routing`, `move_to`, `fix_route` and `finish`, plus the two that end a session. The small commands (`switch_layer`, `toggle_via_placement`, `flip_posture`, `toggle_corner_mode`) return no frame, so the stored one is left alone and the host follows them with a move, which is what KiCad's host does anyway. The same applies after a fix: it clears the placer's head, so anything that reads the placement has to move first.
 
 Escape does **not** discard the route. Both KiCad and Horizon keep the already fixed segments on escape, and note 05 section 5.7 argues from the fact that two independent code bases agree that this is inherent to the router's design rather than a KiCad quirk. LibrePCB's own draw trace tool disagrees (escape aborts the command group, `libs/librepcb/editor/project/board/fsm/boardeditorstate_drawtrace.cpp:129` into `abortPositioning`), so this is a deliberate behavioural difference between the two tools and belongs in the open questions of section 6.
 
