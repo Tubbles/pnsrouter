@@ -87,3 +87,11 @@ Deferred during LibrePCB step 8 (2026-09-09):
 - Raise the Slint contract additions with upstream before any PR: `EditorTool.route-trace`, `RouterMode`, two `TabAction` values, two `Board2dTabData` properties, one helper. They are additive but `types.slint` is shared with every tab.
 - Corner mode could move into `BoardPnsRouter::Settings` so a rebuilt session starts where the user left it without the state re-toggling it.
 - Step 9 manual test on the laptop: all three modes on a two layer and a four layer board, DRC before and after, plus the twelve step scripts from steps 6 to 8 in this session's transcript (right click was replaced by the tool button and Shift+W in step 8).
+
+Deferred during the latency measurement (2026-09-09):
+
+- Shove mode is not interactive on a large board: median 56 ms per `move_to` and 80 of 96 moves over the 16 ms frame budget on a 20 000 segment board (`doc/performance.md`). The cost is the shove cascade, not the index, and no local fix changes it. The options are the iteration budget, an early bail out when the cascade is not converging, or KiCad's thread pool.
+- `Line::walkaround` (`src/line.rs:1840`) allocates one `Vec` per graph vertex for a neighbour list of at most three entries, about 3% of `move_to`. An inline list would remove it, but it needs a hand rolled type (no new dependencies) and a proof that no vertex can exceed three neighbours.
+- `RoutingSettings::shove_iteration_limit` stays at KiCad's 250. On both measured boards a limit of 50 gave the same route with a sixth of the worst case move time. Revisit with fixtures from real boards before moving the default, and consider exposing it to LibrePCB.
+- `World::invalidate_caches` (`src/node.rs:3222`) scans both caches once per removed item where KiCad batches (`pns_kicad_iface.cpp:792`). Measured at zero benefit when removed entirely, so it is left alone. Revisit only if a profile on a real board disagrees.
+- `Router::new` is 62 ms for a 20 573 item board, which is the cost a host pays for every full re-sync. That is the incremental sync item already listed under LibrePCB step 6.
