@@ -56,3 +56,18 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo doc --no-deps --document-private-items
+
+  package:
+    name: Package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      # Cargo.toml keeps KiCad's 12 MB regression corpus, the reference
+      # notes and the two tests that read the corpus out of the published
+      # crate. A test that starts reading an excluded file compiles and
+      # passes here but breaks for whoever downloads the crate, so the
+      # packaged set is built and run on its own.
+      - run: cargo package
+      - name: Test the packaged crate
+        run: cargo test --manifest-path "$(echo target/package/*/Cargo.toml)"

@@ -9,6 +9,34 @@ repository = "https://github.com/Tubbles/pnsrouter"
 readme = "README.md"
 keywords = ["pcb", "eda", "routing", "router"]
 categories = ["science", "algorithms"]
+# `documentation` is left out on purpose: crates.io points at docs.rs by
+# itself, and naming it here would only be a second place to keep right.
+#
+# What stays out of the published crate. KiCad's regression corpus is 12 MB
+# of board files and recorded logs, and the reference notes, the decision
+# log, the work items and the agent instructions are working material for
+# the port, not something a user of the library reads. The two
+# integration tests that read the corpus, and the readers under
+# `tests/support/` they share, go out with it so that the packaged set still
+# builds and tests clean; the whole corpus and both tests are in the git
+# repository. Everything the packaged tests do read, including
+# `tests/fixtures/sessions/`, stays.
+exclude = [
+  "/.github/",
+  "/CLAUDE.md",
+  "/SUGGESTIONS.md",
+  "/TODO.md",
+  "/dev/",
+  "/doc/log/",
+  "/doc/reference/",
+  "/doc/work/",
+  "/tests/fixtures/kicad/",
+  "/tests/kicad_fixtures.rs",
+  "/tests/kicad_replay.rs",
+  "/tests/support/",
+  "/tmp/",
+  "/work/",
+]
 
 [features]
 # Turn compiler warnings into errors (used on CI).
