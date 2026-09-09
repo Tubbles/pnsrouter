@@ -36,3 +36,5 @@ Nothing is installed on the host. Every cargo invocation goes through the podman
     dev/in-container.sh cargo clippy --all-targets --features fail-on-warnings -- -D warnings
     dev/in-container.sh cargo fmt --all --check
     dev/in-container.sh cargo doc --no-deps --document-private-items
+
+LibrePCB builds against this crate through `dev/librepcb-in-container.sh` (mounts `~/dev/librepcb` too, working directory there); the integration lives on the fork's `pns-router` branch, design in `doc/librepcb-integration.md`.
