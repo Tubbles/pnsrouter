@@ -1,0 +1,411 @@
+{
+  "addedItems": [
+    {
+      "kind": "segment",
+      "layers": [
+        3,
+        3
+      ],
+      "net": "-HV",
+      "shape": {
+        "end": {
+          "x": 214800000,
+          "y": 62188730
+        },
+        "start": {
+          "x": 203611270,
+          "y": 51000000
+        },
+        "type": "segment",
+        "width": 1000000
+      }
+    },
+    {
+      "kind": "segment",
+      "layers": [
+        3,
+        3
+      ],
+      "net": "-HV",
+      "shape": {
+        "end": {
+          "x": 203611270,
+          "y": 51000000
+        },
+        "start": {
+          "x": 130840000,
+          "y": 51000000
+        },
+        "type": "segment",
+        "width": 1000000
+      }
+    },
+    {
+      "kind": "segment",
+      "layers": [
+        3,
+        3
+      ],
+      "net": "-HV",
+      "shape": {
+        "end": {
+          "x": 130840000,
+          "y": 51000000
+        },
+        "start": {
+          "x": 124500000,
+          "y": 57340000
+        },
+        "type": "segment",
+        "width": 1000000
+      }
+    }
+  ],
+  "board_hash": "882F0094CACF5C7AA0ED628E63F83453",
+  "events": [
+    {
+      "layer": 0,
+      "position": {
+        "x": 149600000,
+        "y": 51200000
+      },
+      "sizes": {
+        "layerBottom": 2,
+        "layerTop": 0,
+        "trackWidth": 155000,
+        "trackWidthIsExplicit": true,
+        "viaDiameter": 600000,
+        "viaDrill": 250000,
+        "viaType": 4
+      },
+      "type": 1,
+      "uuids": [
+        "35fddfdc-92ee-4325-861c-0adba2be6ae4"
+      ]
+    },
+    {
+      "layer": 0,
+      "position": {
+        "x": 149600000,
+        "y": 51200000
+      },
+      "sizes": {
+        "layerBottom": 2,
+        "layerTop": 0,
+        "trackWidth": 155000,
+        "trackWidthIsExplicit": true,
+        "viaDiameter": 600000,
+        "viaDrill": 250000,
+        "viaType": 4
+      },
+      "type": 3,
+      "uuids": []
+    },
+    {
+      "layer": 0,
+      "position": {
+        "x": 149500000,
+        "y": 50700000
+      },
+      "sizes": {
+        "layerBottom": 2,
+        "layerTop": 0,
+        "trackWidth": 155000,
+        "trackWidthIsExplicit": true,
+        "viaDiameter": 600000,
+        "viaDrill": 250000,
+        "viaType": 4
+      },
+      "type": 3,
+      "uuids": []
+    },
+    {
+      "layer": 0,
+      "position": {
+        "x": 149400000,
+        "y": 49900000
+      },
+      "sizes": {
+        "layerBottom": 2,
+        "layerTop": 0,
+        "trackWidth": 155000,
+        "trackWidthIsExplicit": true,
+        "viaDiameter": 600000,
+        "viaDrill": 250000,
+        "viaType": 4
+      },
+      "type": 3,
+      "uuids": []
+    },
+    {
+      "layer": 0,
+      "position": {
+        "x": 149400000,
+        "y": 49000000
+      },
+      "sizes": {
+        "layerBottom": 2,
+        "layerTop": 0,
+        "trackWidth": 155000,
+        "trackWidthIsExplicit": true,
+        "viaDiameter": 600000,
+        "viaDrill": 250000,
+        "viaType": 4
+      },
+      "type": 3,
+      "uuids": []
+    },
+    {
+      "layer": 0,
+      "position": {
+        "x": 149400000,
+        "y": 47800000
+      },
+      "sizes": {
+        "layerBottom": 2,
+        "layerTop": 0,
+        "trackWidth": 155000,
+        "trackWidthIsExplicit": true,
+        "viaDiameter": 600000,
+        "viaDrill": 250000,
+        "viaType": 4
+      },
+      "type": 3,
+      "uuids": []
+    },
+    {
+      "layer": 0,
+      "position": {
+        "x": 149500000,
+        "y": 46300000
+      },
+      "sizes": {
+        "layerBottom": 2,
+        "layerTop": 0,
+        "trackWidth": 155000,
+        "trackWidthIsExplicit": true,
+        "viaDiameter": 600000,
+        "viaDrill": 250000,
+        "viaType": 4
+      },
+      "type": 3,
+      "uuids": []
+    },
+    {
+      "layer": 0,
+      "position": {
+        "x": 149500000,
+        "y": 46300000
+      },
+      "sizes": {
+        "layerBottom": 2,
+        "layerTop": 0,
+        "trackWidth": 155000,
+        "trackWidthIsExplicit": true,
+        "viaDiameter": 600000,
+        "viaDrill": 250000,
+        "viaType": 4
+      },
+      "type": 3,
+      "uuids": []
+    },
+    {
+      "layer": 0,
+      "position": {
+        "x": 149500000,
+        "y": 45800000
+      },
+      "sizes": {
+        "layerBottom": 2,
+        "layerTop": 0,
+        "trackWidth": 155000,
+        "trackWidthIsExplicit": true,
+        "viaDiameter": 600000,
+        "viaDrill": 250000,
+        "viaType": 4
+      },
+      "type": 3,
+      "uuids": []
+    },
+    {
+      "layer": 0,
+      "position": {
+        "x": 149600000,
+        "y": 44300000
+      },
+      "sizes": {
+        "layerBottom": 2,
+        "layerTop": 0,
+        "trackWidth": 155000,
+        "trackWidthIsExplicit": true,
+        "viaDiameter": 600000,
+        "viaDrill": 250000,
+        "viaType": 4
+      },
+      "type": 3,
+      "uuids": []
+    },
+    {
+      "layer": 0,
+      "position": {
+        "x": 149600000,
+        "y": 44100000
+      },
+      "sizes": {
+        "layerBottom": 2,
+        "layerTop": 0,
+        "trackWidth": 155000,
+        "trackWidthIsExplicit": true,
+        "viaDiameter": 600000,
+        "viaDrill": 250000,
+        "viaType": 4
+      },
+      "type": 3,
+      "uuids": []
+    },
+    {
+      "layer": 0,
+      "position": {
+        "x": 149700000,
+        "y": 43500000
+      },
+      "sizes": {
+        "layerBottom": 2,
+        "layerTop": 0,
+        "trackWidth": 155000,
+        "trackWidthIsExplicit": true,
+        "viaDiameter": 600000,
+        "viaDrill": 250000,
+        "viaType": 4
+      },
+      "type": 3,
+      "uuids": []
+    },
+    {
+      "layer": 0,
+      "position": {
+        "x": 149800000,
+        "y": 42900000
+      },
+      "sizes": {
+        "layerBottom": 2,
+        "layerTop": 0,
+        "trackWidth": 155000,
+        "trackWidthIsExplicit": true,
+        "viaDiameter": 600000,
+        "viaDrill": 250000,
+        "viaType": 4
+      },
+      "type": 3,
+      "uuids": []
+    },
+    {
+      "layer": 0,
+      "position": {
+        "x": 149900000,
+        "y": 42700000
+      },
+      "sizes": {
+        "layerBottom": 2,
+        "layerTop": 0,
+        "trackWidth": 155000,
+        "trackWidthIsExplicit": true,
+        "viaDiameter": 600000,
+        "viaDrill": 250000,
+        "viaType": 4
+      },
+      "type": 3,
+      "uuids": []
+    },
+    {
+      "layer": 0,
+      "position": {
+        "x": 149900000,
+        "y": 42600000
+      },
+      "sizes": {
+        "layerBottom": 2,
+        "layerTop": 0,
+        "trackWidth": 155000,
+        "trackWidthIsExplicit": true,
+        "viaDiameter": 600000,
+        "viaDrill": 250000,
+        "viaType": 4
+      },
+      "type": 3,
+      "uuids": []
+    },
+    {
+      "layer": 0,
+      "position": {
+        "x": 149900000,
+        "y": 42300000
+      },
+      "sizes": {
+        "layerBottom": 2,
+        "layerTop": 0,
+        "trackWidth": 155000,
+        "trackWidthIsExplicit": true,
+        "viaDiameter": 600000,
+        "viaDrill": 250000,
+        "viaType": 4
+      },
+      "type": 3,
+      "uuids": []
+    },
+    {
+      "layer": 0,
+      "position": {
+        "x": 149900000,
+        "y": 42200000
+      },
+      "sizes": {
+        "layerBottom": 2,
+        "layerTop": 0,
+        "trackWidth": 155000,
+        "trackWidthIsExplicit": true,
+        "viaDiameter": 600000,
+        "viaDrill": 250000,
+        "viaType": 4
+      },
+      "type": 3,
+      "uuids": []
+    },
+    {
+      "layer": 0,
+      "position": {
+        "x": 149900000,
+        "y": 42200000
+      },
+      "sizes": {
+        "layerBottom": 2,
+        "layerTop": 0,
+        "trackWidth": 155000,
+        "trackWidthIsExplicit": true,
+        "viaDiameter": 600000,
+        "viaDrill": 250000,
+        "viaType": 4
+      },
+      "type": 3,
+      "uuids": []
+    }
+  ],
+  "headItems": [
+    {
+      "kind": "line",
+      "layers": [
+        3,
+        3
+      ],
+      "net": "-HV"
+    }
+  ],
+  "mode": 1,
+  "removedItems": [
+    "35fddfdc-92ee-4325-861c-0adba2be6ae4",
+    "5280fa7d-0e72-4408-97fa-3b7416bd9e48",
+    "b807bbce-40bc-4f71-9308-39c362e923f3"
+  ],
+  "test_case_type": 0
+}
+

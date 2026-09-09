@@ -1,0 +1,1080 @@
+{
+  "addedItems": [
+    {
+      "kind": "segment",
+      "layers": [
+        0,
+        0
+      ],
+      "net": "Net-(J4-Pin_4)",
+      "shape": {
+        "end": {
+          "x": 170490000,
+          "y": 106550000
+        },
+        "start": {
+          "x": 169582792,
+          "y": 106550000
+        },
+        "type": "segment",
+        "width": 250000
+      }
+    },
+    {
+      "kind": "segment",
+      "layers": [
+        0,
+        0
+      ],
+      "net": "Net-(J4-Pin_1)",
+      "shape": {
+        "end": {
+          "x": 170490000,
+          "y": 98930000
+        },
+        "start": {
+          "x": 169186396,
+          "y": 98930000
+        },
+        "type": "segment",
+        "width": 250000
+      }
+    },
+    {
+      "kind": "segment",
+      "layers": [
+        0,
+        0
+      ],
+      "net": "Net-(J4-Pin_4)",
+      "shape": {
+        "end": {
+          "x": 164720000,
+          "y": 102630000
+        },
+        "start": {
+          "x": 164090000,
+          "y": 102000000
+        },
+        "type": "segment",
+        "width": 250000
+      }
+    },
+    {
+      "kind": "segment",
+      "layers": [
+        0,
+        0
+      ],
+      "net": "Net-(R12-Pad1)",
+      "shape": {
+        "end": {
+          "x": 159625000,
+          "y": 105100000
+        },
+        "start": {
+          "x": 159650000,
+          "y": 105100000
+        },
+        "type": "segment",
+        "width": 250000
+      }
+    },
+    {
+      "kind": "segment",
+      "layers": [
+        0,
+        0
+      ],
+      "net": "Net-(J4-Pin_1)",
+      "shape": {
+        "end": {
+          "x": 165170000,
+          "y": 98495000
+        },
+        "start": {
+          "x": 164875000,
+          "y": 98200000
+        },
+        "type": "segment",
+        "width": 250000
+      }
+    },
+    {
+      "kind": "segment",
+      "layers": [
+        0,
+        0
+      ],
+      "net": "Net-(J4-Pin_1)",
+      "shape": {
+        "end": {
+          "x": 164875000,
+          "y": 98200000
+        },
+        "start": {
+          "x": 156750000,
+          "y": 98200000
+        },
+        "type": "segment",
+        "width": 250000
+      }
+    },
+    {
+      "kind": "segment",
+      "layers": [
+        0,
+        0
+      ],
+      "net": "Net-(J4-Pin_1)",
+      "shape": {
+        "end": {
+          "x": 165433604,
+          "y": 110440000
+        },
+        "start": {
+          "x": 165170000,
+          "y": 110176396
+        },
+        "type": "segment",
+        "width": 250000
+      }
+    },
+    {
+      "kind": "segment",
+      "layers": [
+        0,
+        0
+      ],
+      "net": "Net-(J4-Pin_1)",
+      "shape": {
+        "end": {
+          "x": 165170000,
+          "y": 110176396
+        },
+        "start": {
+          "x": 165170000,
+          "y": 98495000
+        },
+        "type": "segment",
+        "width": 250000
+      }
+    },
+    {
+      "kind": "segment",
+      "layers": [
+        0,
+        0
+      ],
+      "net": "Net-(J4-Pin_1)",
+      "shape": {
+        "end": {
+          "x": 165806396,
+          "y": 110440000
+        },
+        "start": {
+          "x": 165433604,
+          "y": 110440000
+        },
+        "type": "segment",
+        "width": 250000
+      }
+    },
+    {
+      "kind": "segment",
+      "layers": [
+        0,
+        0
+      ],
+      "net": "Net-(R12-Pad1)",
+      "shape": {
+        "end": {
+          "x": 165060812,
+          "y": 111340000
+        },
+        "start": {
+          "x": 166179188,
+          "y": 111340000
+        },
+        "type": "segment",
+        "width": 250000
+      }
+    },
+    {
+      "kind": "segment",
+      "layers": [
+        0,
+        0
+      ],
+      "net": "Net-(J4-Pin_1)",
+      "shape": {
+        "end": {
+          "x": 168270000,
+          "y": 107976396
+        },
+        "start": {
+          "x": 165806396,
+          "y": 110440000
+        },
+        "type": "segment",
+        "width": 250000
+      }
+    },
+    {
+      "kind": "segment",
+      "layers": [
+        0,
+        0
+      ],
+      "net": "Net-(J4-Pin_4)",
+      "shape": {
+        "end": {
+          "x": 168720000,
+          "y": 108162792
+        },
+        "start": {
+          "x": 165992792,
+          "y": 110890000
+        },
+        "type": "segment",
+        "width": 250000
+      }
+    },
+    {
+      "kind": "segment",
+      "layers": [
+        0,
+        0
+      ],
+      "net": "Net-(R12-Pad1)",
+      "shape": {
+        "end": {
+          "x": 168429188,
+          "y": 109090000
+        },
+        "start": {
+          "x": 170490000,
+          "y": 109090000
+        },
+        "type": "segment",
+        "width": 250000
+      }
+    },
+    {
+      "kind": "segment",
+      "layers": [
+        0,
+        0
+      ],
+      "net": "Net-(J4-Pin_4)",
+      "shape": {
+        "end": {
+          "x": 165992792,
+          "y": 110890000
+        },
+        "start": {
+          "x": 165247208,
+          "y": 110890000
+        },
+        "type": "segment",
+        "width": 250000
+      }
+    },
+    {
+      "kind": "segment",
+      "layers": [
+        0,
+        0
+      ],
+      "net": "Net-(R12-Pad1)",
+      "shape": {
+        "end": {
+          "x": 166179188,
+          "y": 111340000
+        },
+        "start": {
+          "x": 168429188,
+          "y": 109090000
+        },
+        "type": "segment",
+        "width": 250000
+      }
+    },
+    {
+      "kind": "segment",
+      "layers": [
+        0,
+        0
+      ],
+      "net": "Net-(J4-Pin_1)",
+      "shape": {
+        "end": {
+          "x": 169186396,
+          "y": 98930000
+        },
+        "start": {
+          "x": 168270000,
+          "y": 99846396
+        },
+        "type": "segment",
+        "width": 250000
+      }
+    },
+    {
+      "kind": "segment",
+      "layers": [
+        0,
+        0
+      ],
+      "net": "Net-(R12-Pad1)",
+      "shape": {
+        "end": {
+          "x": 160275000,
+          "y": 108450000
+        },
+        "start": {
+          "x": 160915000,
+          "y": 109090000
+        },
+        "type": "segment",
+        "width": 250000
+      }
+    },
+    {
+      "kind": "segment",
+      "layers": [
+        0,
+        0
+      ],
+      "net": "Net-(R12-Pad1)",
+      "shape": {
+        "end": {
+          "x": 164270000,
+          "y": 110479188
+        },
+        "start": {
+          "x": 164270000,
+          "y": 110549188
+        },
+        "type": "segment",
+        "width": 250000
+      }
+    },
+    {
+      "kind": "segment",
+      "layers": [
+        0,
+        0
+      ],
+      "net": "Net-(R12-Pad1)",
+      "shape": {
+        "end": {
+          "x": 160915000,
+          "y": 109090000
+        },
+        "start": {
+          "x": 162880812,
+          "y": 109090000
+        },
+        "type": "segment",
+        "width": 250000
+      }
+    },
+    {
+      "kind": "segment",
+      "layers": [
+        0,
+        0
+      ],
+      "net": "Net-(R12-Pad1)",
+      "shape": {
+        "end": {
+          "x": 159650000,
+          "y": 105100000
+        },
+        "start": {
+          "x": 160275000,
+          "y": 105725000
+        },
+        "type": "segment",
+        "width": 250000
+      }
+    },
+    {
+      "kind": "segment",
+      "layers": [
+        0,
+        0
+      ],
+      "net": "Net-(J4-Pin_4)",
+      "shape": {
+        "end": {
+          "x": 169582792,
+          "y": 106550000
+        },
+        "start": {
+          "x": 168720000,
+          "y": 107412792
+        },
+        "type": "segment",
+        "width": 250000
+      }
+    },
+    {
+      "kind": "segment",
+      "layers": [
+        0,
+        0
+      ],
+      "net": "Net-(J4-Pin_4)",
+      "shape": {
+        "end": {
+          "x": 168720000,
+          "y": 107412792
+        },
+        "start": {
+          "x": 168720000,
+          "y": 108162792
+        },
+        "type": "segment",
+        "width": 250000
+      }
+    },
+    {
+      "kind": "segment",
+      "layers": [
+        0,
+        0
+      ],
+      "net": "Net-(J4-Pin_4)",
+      "shape": {
+        "end": {
+          "x": 165247208,
+          "y": 110890000
+        },
+        "start": {
+          "x": 164720000,
+          "y": 110362792
+        },
+        "type": "segment",
+        "width": 250000
+      }
+    },
+    {
+      "kind": "segment",
+      "layers": [
+        0,
+        0
+      ],
+      "net": "Net-(R12-Pad1)",
+      "shape": {
+        "end": {
+          "x": 164270000,
+          "y": 110549188
+        },
+        "start": {
+          "x": 165060812,
+          "y": 111340000
+        },
+        "type": "segment",
+        "width": 250000
+      }
+    },
+    {
+      "kind": "segment",
+      "layers": [
+        0,
+        0
+      ],
+      "net": "Net-(J4-Pin_1)",
+      "shape": {
+        "end": {
+          "x": 168270000,
+          "y": 99846396
+        },
+        "start": {
+          "x": 168270000,
+          "y": 107976396
+        },
+        "type": "segment",
+        "width": 250000
+      }
+    },
+    {
+      "kind": "segment",
+      "layers": [
+        0,
+        0
+      ],
+      "net": "Net-(R12-Pad1)",
+      "shape": {
+        "end": {
+          "x": 160275000,
+          "y": 105725000
+        },
+        "start": {
+          "x": 160275000,
+          "y": 108450000
+        },
+        "type": "segment",
+        "width": 250000
+      }
+    },
+    {
+      "kind": "segment",
+      "layers": [
+        0,
+        0
+      ],
+      "net": "Net-(R12-Pad1)",
+      "shape": {
+        "end": {
+          "x": 162880812,
+          "y": 109090000
+        },
+        "start": {
+          "x": 164270000,
+          "y": 110479188
+        },
+        "type": "segment",
+        "width": 250000
+      }
+    },
+    {
+      "kind": "segment",
+      "layers": [
+        0,
+        0
+      ],
+      "net": "Net-(J4-Pin_4)",
+      "shape": {
+        "end": {
+          "x": 164720000,
+          "y": 110362792
+        },
+        "start": {
+          "x": 164720000,
+          "y": 102630000
+        },
+        "type": "segment",
+        "width": 250000
+      }
+    }
+  ],
+  "events": [
+    {
+      "layer": 0,
+      "position": {
+        "x": 167820000,
+        "y": 92710000
+      },
+      "sizes": {
+        "layerBottom": 2,
+        "layerTop": 0,
+        "trackWidth": 155000,
+        "trackWidthIsExplicit": true,
+        "viaDiameter": 600000,
+        "viaDrill": 250000,
+        "viaType": 4
+      },
+      "type": 0,
+      "uuids": []
+    },
+    {
+      "layer": 0,
+      "position": {
+        "x": 167720000,
+        "y": 92820000
+      },
+      "sizes": {
+        "layerBottom": 2,
+        "layerTop": 0,
+        "trackWidth": 155000,
+        "trackWidthIsExplicit": true,
+        "viaDiameter": 600000,
+        "viaDrill": 250000,
+        "viaType": 4
+      },
+      "type": 3,
+      "uuids": []
+    },
+    {
+      "layer": 0,
+      "position": {
+        "x": 166970000,
+        "y": 94240000
+      },
+      "sizes": {
+        "layerBottom": 2,
+        "layerTop": 0,
+        "trackWidth": 155000,
+        "trackWidthIsExplicit": true,
+        "viaDiameter": 600000,
+        "viaDrill": 250000,
+        "viaType": 4
+      },
+      "type": 3,
+      "uuids": []
+    },
+    {
+      "layer": 0,
+      "position": {
+        "x": 166700000,
+        "y": 96030000
+      },
+      "sizes": {
+        "layerBottom": 2,
+        "layerTop": 0,
+        "trackWidth": 155000,
+        "trackWidthIsExplicit": true,
+        "viaDiameter": 600000,
+        "viaDrill": 250000,
+        "viaType": 4
+      },
+      "type": 3,
+      "uuids": []
+    },
+    {
+      "layer": 0,
+      "position": {
+        "x": 166640000,
+        "y": 97150000
+      },
+      "sizes": {
+        "layerBottom": 2,
+        "layerTop": 0,
+        "trackWidth": 155000,
+        "trackWidthIsExplicit": true,
+        "viaDiameter": 600000,
+        "viaDrill": 250000,
+        "viaType": 4
+      },
+      "type": 3,
+      "uuids": []
+    },
+    {
+      "layer": 0,
+      "position": {
+        "x": 166230000,
+        "y": 99660000
+      },
+      "sizes": {
+        "layerBottom": 2,
+        "layerTop": 0,
+        "trackWidth": 155000,
+        "trackWidthIsExplicit": true,
+        "viaDiameter": 600000,
+        "viaDrill": 250000,
+        "viaType": 4
+      },
+      "type": 3,
+      "uuids": []
+    },
+    {
+      "layer": 0,
+      "position": {
+        "x": 165960000,
+        "y": 101520000
+      },
+      "sizes": {
+        "layerBottom": 2,
+        "layerTop": 0,
+        "trackWidth": 155000,
+        "trackWidthIsExplicit": true,
+        "viaDiameter": 600000,
+        "viaDrill": 250000,
+        "viaType": 4
+      },
+      "type": 3,
+      "uuids": []
+    },
+    {
+      "layer": 0,
+      "position": {
+        "x": 165820000,
+        "y": 103820000
+      },
+      "sizes": {
+        "layerBottom": 2,
+        "layerTop": 0,
+        "trackWidth": 155000,
+        "trackWidthIsExplicit": true,
+        "viaDiameter": 600000,
+        "viaDrill": 250000,
+        "viaType": 4
+      },
+      "type": 3,
+      "uuids": []
+    },
+    {
+      "layer": 0,
+      "position": {
+        "x": 165750000,
+        "y": 105520000
+      },
+      "sizes": {
+        "layerBottom": 2,
+        "layerTop": 0,
+        "trackWidth": 155000,
+        "trackWidthIsExplicit": true,
+        "viaDiameter": 600000,
+        "viaDrill": 250000,
+        "viaType": 4
+      },
+      "type": 3,
+      "uuids": []
+    },
+    {
+      "layer": 0,
+      "position": {
+        "x": 165770499,
+        "y": 105969501
+      },
+      "sizes": {
+        "layerBottom": 2,
+        "layerTop": 0,
+        "trackWidth": 155000,
+        "trackWidthIsExplicit": true,
+        "viaDiameter": 600000,
+        "viaDrill": 250000,
+        "viaType": 4
+      },
+      "type": 3,
+      "uuids": []
+    },
+    {
+      "layer": 0,
+      "position": {
+        "x": 165750000,
+        "y": 106600000
+      },
+      "sizes": {
+        "layerBottom": 2,
+        "layerTop": 0,
+        "trackWidth": 155000,
+        "trackWidthIsExplicit": true,
+        "viaDiameter": 600000,
+        "viaDrill": 250000,
+        "viaType": 4
+      },
+      "type": 3,
+      "uuids": []
+    },
+    {
+      "layer": 0,
+      "position": {
+        "x": 165720000,
+        "y": 107310000
+      },
+      "sizes": {
+        "layerBottom": 2,
+        "layerTop": 0,
+        "trackWidth": 155000,
+        "trackWidthIsExplicit": true,
+        "viaDiameter": 600000,
+        "viaDrill": 250000,
+        "viaType": 4
+      },
+      "type": 3,
+      "uuids": []
+    },
+    {
+      "layer": 0,
+      "position": {
+        "x": 165810499,
+        "y": 107759501
+      },
+      "sizes": {
+        "layerBottom": 2,
+        "layerTop": 0,
+        "trackWidth": 155000,
+        "trackWidthIsExplicit": true,
+        "viaDiameter": 600000,
+        "viaDrill": 250000,
+        "viaType": 4
+      },
+      "type": 3,
+      "uuids": []
+    },
+    {
+      "layer": 0,
+      "position": {
+        "x": 165750000,
+        "y": 108530000
+      },
+      "sizes": {
+        "layerBottom": 2,
+        "layerTop": 0,
+        "trackWidth": 155000,
+        "trackWidthIsExplicit": true,
+        "viaDiameter": 600000,
+        "viaDrill": 250000,
+        "viaType": 4
+      },
+      "type": 3,
+      "uuids": []
+    },
+    {
+      "layer": 0,
+      "position": {
+        "x": 165750000,
+        "y": 109110000
+      },
+      "sizes": {
+        "layerBottom": 2,
+        "layerTop": 0,
+        "trackWidth": 155000,
+        "trackWidthIsExplicit": true,
+        "viaDiameter": 600000,
+        "viaDrill": 250000,
+        "viaType": 4
+      },
+      "type": 3,
+      "uuids": []
+    },
+    {
+      "layer": 0,
+      "position": {
+        "x": 165750000,
+        "y": 109380000
+      },
+      "sizes": {
+        "layerBottom": 2,
+        "layerTop": 0,
+        "trackWidth": 155000,
+        "trackWidthIsExplicit": true,
+        "viaDiameter": 600000,
+        "viaDrill": 250000,
+        "viaType": 4
+      },
+      "type": 3,
+      "uuids": []
+    },
+    {
+      "layer": 0,
+      "position": {
+        "x": 165750000,
+        "y": 109450000
+      },
+      "sizes": {
+        "layerBottom": 2,
+        "layerTop": 0,
+        "trackWidth": 155000,
+        "trackWidthIsExplicit": true,
+        "viaDiameter": 600000,
+        "viaDrill": 250000,
+        "viaType": 4
+      },
+      "type": 3,
+      "uuids": []
+    },
+    {
+      "layer": 0,
+      "position": {
+        "x": 165750000,
+        "y": 109580000
+      },
+      "sizes": {
+        "layerBottom": 2,
+        "layerTop": 0,
+        "trackWidth": 155000,
+        "trackWidthIsExplicit": true,
+        "viaDiameter": 600000,
+        "viaDrill": 250000,
+        "viaType": 4
+      },
+      "type": 3,
+      "uuids": []
+    },
+    {
+      "layer": 0,
+      "position": {
+        "x": 165720000,
+        "y": 109750000
+      },
+      "sizes": {
+        "layerBottom": 2,
+        "layerTop": 0,
+        "trackWidth": 155000,
+        "trackWidthIsExplicit": true,
+        "viaDiameter": 600000,
+        "viaDrill": 250000,
+        "viaType": 4
+      },
+      "type": 3,
+      "uuids": []
+    },
+    {
+      "layer": 0,
+      "position": {
+        "x": 165690000,
+        "y": 109790000
+      },
+      "sizes": {
+        "layerBottom": 2,
+        "layerTop": 0,
+        "trackWidth": 155000,
+        "trackWidthIsExplicit": true,
+        "viaDiameter": 600000,
+        "viaDrill": 250000,
+        "viaType": 4
+      },
+      "type": 3,
+      "uuids": []
+    },
+    {
+      "layer": 0,
+      "position": {
+        "x": 165690000,
+        "y": 109820000
+      },
+      "sizes": {
+        "layerBottom": 2,
+        "layerTop": 0,
+        "trackWidth": 155000,
+        "trackWidthIsExplicit": true,
+        "viaDiameter": 600000,
+        "viaDrill": 250000,
+        "viaType": 4
+      },
+      "type": 3,
+      "uuids": []
+    },
+    {
+      "layer": 0,
+      "position": {
+        "x": 165690000,
+        "y": 109850000
+      },
+      "sizes": {
+        "layerBottom": 2,
+        "layerTop": 0,
+        "trackWidth": 155000,
+        "trackWidthIsExplicit": true,
+        "viaDiameter": 600000,
+        "viaDrill": 250000,
+        "viaType": 4
+      },
+      "type": 3,
+      "uuids": []
+    },
+    {
+      "layer": 0,
+      "position": {
+        "x": 165620000,
+        "y": 109920000
+      },
+      "sizes": {
+        "layerBottom": 2,
+        "layerTop": 0,
+        "trackWidth": 155000,
+        "trackWidthIsExplicit": true,
+        "viaDiameter": 600000,
+        "viaDrill": 250000,
+        "viaType": 4
+      },
+      "type": 3,
+      "uuids": []
+    },
+    {
+      "layer": 0,
+      "position": {
+        "x": 165620000,
+        "y": 109950000
+      },
+      "sizes": {
+        "layerBottom": 2,
+        "layerTop": 0,
+        "trackWidth": 155000,
+        "trackWidthIsExplicit": true,
+        "viaDiameter": 600000,
+        "viaDrill": 250000,
+        "viaType": 4
+      },
+      "type": 3,
+      "uuids": []
+    },
+    {
+      "layer": 0,
+      "position": {
+        "x": 165620000,
+        "y": 109990000
+      },
+      "sizes": {
+        "layerBottom": 2,
+        "layerTop": 0,
+        "trackWidth": 155000,
+        "trackWidthIsExplicit": true,
+        "viaDiameter": 600000,
+        "viaDrill": 250000,
+        "viaType": 4
+      },
+      "type": 3,
+      "uuids": []
+    },
+    {
+      "layer": 0,
+      "position": {
+        "x": 165650000,
+        "y": 109990000
+      },
+      "sizes": {
+        "layerBottom": 2,
+        "layerTop": 0,
+        "trackWidth": 155000,
+        "trackWidthIsExplicit": true,
+        "viaDiameter": 600000,
+        "viaDrill": 250000,
+        "viaType": 4
+      },
+      "type": 3,
+      "uuids": []
+    },
+    {
+      "layer": 0,
+      "position": {
+        "x": 165620000,
+        "y": 109990000
+      },
+      "sizes": {
+        "layerBottom": 2,
+        "layerTop": 0,
+        "trackWidth": 155000,
+        "trackWidthIsExplicit": true,
+        "viaDiameter": 600000,
+        "viaDrill": 250000,
+        "viaType": 4
+      },
+      "type": 3,
+      "uuids": []
+    }
+  ],
+  "headItems": [
+    {
+      "kind": "line",
+      "layers": [
+        0,
+        0
+      ],
+      "net": ""
+    }
+  ],
+  "mode": 1,
+  "removedItems": [
+    "131e7aac-e731-46c4-b380-5a13fdd962ec",
+    "1e73c6d7-e84e-48a8-8695-f05dedb935c6",
+    "2f5a6764-92f6-4db4-b0f7-9c354072ff1e",
+    "5447eb29-5a42-4c44-abd7-ab934bff9ab0",
+    "5ec7d5ec-45fe-4163-9a76-4559487f579a",
+    "692e4432-3cc1-46ea-8d75-f8534eaca6f5",
+    "9e7e938a-e9b7-4027-8ff4-a7a875aa3dc0",
+    "a8980bf8-a8cc-4b9c-99dc-f1cba9091fc3",
+    "b609539d-1dcb-4164-85d6-3bc70e34f964",
+    "db602bf0-29a7-4e78-8c30-2e47cddd99bc",
+    "de8e6047-d434-479a-a57c-36e7ded38dce",
+    "e788b0cf-ee85-4638-9a11-f0a246cc61bc",
+    "efc3cd85-b4b7-4962-a044-cf3fd1068bc4"
+  ],
+  "test_case_type": 0,
+  "board_hash" : "68683B3B1F5D35A5ABC9056B2B656B86"
+}
