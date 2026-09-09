@@ -73,3 +73,12 @@ Deferred during LibrePCB step 6 (2026-09-09):
 - Add `BoardPnsCommit::isEmpty()`.
 - `BoardPnsRouter::undoLastSegment()` returns the leg's start for cursor warping, which `BoardEditorFsmAdapter` cannot do; either add a cursor warp to the adapter or drop the return value.
 - The whole board is re-snapshotted after every commit; measure on a large board in step 9 and consider `assign_host_ids` plus an incremental sync.
+
+Deferred during LibrePCB step 7 (2026-09-09):
+
+- The fixed tail renders brighter than the head because `setLighterColorsWithMinAlpha` brightens; decide after the manual test whether the head or the tail should get it (one line in `getMinAlphaOfStyle()`).
+- Collision and rat line share the air wire colour; a dedicated registered graphics layer for router collisions would read better.
+- Clearance halo (KiCad draws the geometry twice, once inflated) needs a primitive that can lower alpha.
+- `BoardPnsPreviewVia::style` beyond Collision is invisible: `PrimitiveCircleGraphicsItem` has no lighter colour mode.
+- `BoardPnsViolation::clearance` and `forcedLayer` have no consumer; either draw a marker or drop them.
+- `BoardPnsHostRef` needs `operator==` and `qHash` so frames can be diffed as sets; `BoardPnsPreviewItem::layer` can be null for an out of range dense index and is silently skipped.

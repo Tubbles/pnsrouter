@@ -1,6 +1,6 @@
 # 006 LibrePCB integration
 
-Status: in progress (started 2026-09-09, steps 1 to 6 of doc/librepcb-integration.md on the fork's pns-router branch)
+Status: in progress (started 2026-09-09, steps 1 to 7 of doc/librepcb-integration.md on the fork's pns-router branch)
 
 ## Goal
 
@@ -15,7 +15,7 @@ Interactive routing in LibrePCB's board editor using pnsrouter, developed on the
 - [x] New tool state `BoardEditorState_RouteTrace` next to the existing draw trace tool, reached from a right click menu on the draw trace tool button, reusing the draw trace toolbar for layer, width, via drill and via size (step 6).
 - [ ] Own Slint toolbar with mode, corner mode, posture and via toggle, plus keyboard commands; blocked on the shortcuts reference sheet, which is one full page (step 8).
 - [x] Commit through the undo stack as one command group per route, anchor resolution to existing net points, pads and vias at apply time (`CmdBoardApplyPnsCommit` in `libs/librepcb/editor/project/cmd/`, step 5).
-- [ ] Preview rendering with the existing graphics items.
+- [x] Preview rendering with the existing graphics items (`BoardPnsPreviewItems` in `libs/librepcb/editor/project/board/`, pooled `PrimitivePathGraphicsItem` and `PrimitiveCircleGraphicsItem`, step 7). No clearance halo yet.
 - [ ] Manual test on a real project in all three modes, on a two layer and a four layer board.
 
 ## Acceptance
