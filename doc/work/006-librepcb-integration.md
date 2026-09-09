@@ -1,6 +1,6 @@
 # 006 LibrePCB integration
 
-Status: in progress (started 2026-09-09, steps 1 to 5 of doc/librepcb-integration.md on the fork's pns-router branch)
+Status: in progress (started 2026-09-09, steps 1 to 6 of doc/librepcb-integration.md on the fork's pns-router branch)
 
 ## Goal
 
@@ -12,7 +12,8 @@ Interactive routing in LibrePCB's board editor using pnsrouter, developed on the
 - [x] Board snapshot over FFI: copper layers, net ids, pads with outlines and clearances, vias, traces, holes, keepout zones, board outline. Planes are not synced (KiCad and Horizon do the same).
 - [x] RuleResolver for LibrePCB in rust-core: net class minimum copper clearance, pad copper clearance, board design rules.
 - [x] `ffi_pnsrouter_*` session functions in rust-core and the headless C++ wrapper `BoardPnsRouter` in `libs/librepcb/core/project/board/` (step 4 of `doc/librepcb-integration.md`; the snapshot and the wrapper live in core, not the editor library, because neither has a user interface or an undo stack).
-- [ ] New tool state `BoardEditorState_DrawTraceInteractive` next to the existing draw trace tool, with a Slint toolbar (mode, layer, width, via size, corner mode).
+- [x] New tool state `BoardEditorState_RouteTrace` next to the existing draw trace tool, reached from a right click menu on the draw trace tool button, reusing the draw trace toolbar for layer, width, via drill and via size (step 6).
+- [ ] Own Slint toolbar with mode, corner mode, posture and via toggle, plus keyboard commands; blocked on the shortcuts reference sheet, which is one full page (step 8).
 - [x] Commit through the undo stack as one command group per route, anchor resolution to existing net points, pads and vias at apply time (`CmdBoardApplyPnsCommit` in `libs/librepcb/editor/project/cmd/`, step 5).
 - [ ] Preview rendering with the existing graphics items.
 - [ ] Manual test on a real project in all three modes, on a two layer and a four layer board.

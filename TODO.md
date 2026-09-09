@@ -65,3 +65,11 @@ Deferred during LibrePCB step 5 (2026-09-09):
 
 - `BoardPnsHostRef` and `BoardPnsNewItem::net` hold const pointers because the snapshot is built from a `const Board&`, while every editor command takes non const references, so `CmdBoardApplyPnsCommit` casts in three places. Either build the snapshot from `Board&` or keep the casts and say why in the header.
 - `BoardPnsNewItem` is one struct carrying both a segment's and a via's fields; a `std::variant` would make the invalid states unrepresentable.
+
+Deferred during LibrePCB step 6 (2026-09-09):
+
+- The shortcuts reference sheet (`utils/shortcutsreferencegenerator.cpp`) is one full page; a second page or a tighter layout is needed before any router command (tool shortcut, via toggle, undo segment, mode cycle, posture flip) can be registered in `EditorCommandSet`.
+- `BoardPnsRouter::getCommit()` returns a reference the session owns while `stopRouting()` returns by value; the tool copies before rebuilding the session. Make both by value or document the trap.
+- Add `BoardPnsCommit::isEmpty()`.
+- `BoardPnsRouter::undoLastSegment()` returns the leg's start for cursor warping, which `BoardEditorFsmAdapter` cannot do; either add a cursor warp to the adapter or drop the return value.
+- The whole board is re-snapshotted after every commit; measure on a large board in step 9 and consider `assign_host_ids` plus an incremental sync.

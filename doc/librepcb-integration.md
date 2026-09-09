@@ -281,6 +281,8 @@ The conventions the sketch left open, decided while building it:
 
 Escape does **not** discard the route. Both KiCad and Horizon keep the already fixed segments on escape, and note 05 section 5.7 argues from the fact that two independent code bases agree that this is inherent to the router's design rather than a KiCad quirk. LibrePCB's own draw trace tool disagrees (escape aborts the command group, `libs/librepcb/editor/project/board/fsm/boardeditorstate_drawtrace.cpp:129` into `abortPositioning`), so this is a deliberate behavioural difference between the two tools and belongs in the open questions of section 6.
 
+As built (step 6), the tool state does that in `processAbortCommand` (`libs/librepcb/editor/project/board/fsm/boardeditorstate_routetrace.cpp:113`): while routing it calls `stopRouting`, applies whatever came back and stays in the tool, and while idle it returns false so that a second escape leaves the tool. Leaving the tool for any other reason takes the same path in `exit()` (`:92`), except that no new session is built for a tool which is going away. A session which fixed nothing returns an empty commit and nothing reaches the undo stack.
+
 ### 3.2 Cursor snapping stays on the C++ side
 
 The crate takes already snapped points; snapping is host work (`DESIGN.md` section 7). Note 05 section 4.5 records KiCad's invariant that every `Move` call receives the snapped point and that the visible crosshair is forced to the same coordinate. Preserve it.
@@ -294,6 +296,10 @@ Shift disables snapping in the existing tool (`libs/librepcb/editor/project/boar
 The grid interval is `getGridInterval()` (`libs/librepcb/editor/project/board/fsm/boardeditorstate.h:195`) and the snapped point is `pos.mappedToGrid(getGridInterval())`, which is what `startPositioning` does at `libs/librepcb/editor/project/board/fsm/boardeditorstate_drawtrace.cpp:472`.
 
 Make it structurally impossible to hand the engine an unsnapped point. Note 05 section 4.5 suggests a `SnappedPoint` newtype; on the C++ side the equivalent is that the wrapper's `move`, `start` and `fix` take a small `struct SnappedCursor { Point pos; std::optional<HostId> item; }` produced by exactly one private method.
+
+As built that is `BoardEditorState_RouteTrace::SnappedCursor` (`libs/librepcb/editor/project/board/fsm/boardeditorstate_routetrace.h:136`), produced only by `snapCursor()` (`libs/librepcb/editor/project/board/fsm/boardeditorstate_routetrace.cpp:397`). The optional is a plain `quint64` with 0 for free space, because that is what the FFI already uses for "no object" (section 3.1.1) and `BoardPnsRouter` takes a `quint64` rather than an optional.
+
+One case the sketch above did not cover: a `BI_NetPoint` is not a router object, the traces meeting there are. `getHostIdOfNetPoint` (`:437`) therefore answers the lowest host ID among the net point's own net lines. The lowest rather than any is deliberate: `BI_NetPoint::getNetLines()` is a `QSet` and has no order, while host IDs are handed out in the snapshot builder's own walk order, so taking the minimum makes the answer reproducible.
 
 ### 3.3 Preview readback
 
@@ -319,6 +325,14 @@ The interactive router needs more controls than the existing toolbar has: routin
 
 Keyboard commands come from `EditorCommandSet` (`libs/librepcb/editor/editorcommandset.h`), which is where the tool shortcut lives (`toolTrace` at `:1183`, bound to `W`). Reuse `layerUp` and `layerDown` (`:1267`, `:1276`, bound to PageUp and PageDown) for the layer switch, which is the gesture KiCad users expect. A new command is needed for the via toggle, for undo last segment (Backspace, which has no command today), for cycling the routing mode and for flipping the posture. The wire mode commands (`wireModeHV` at `:1420` and its four siblings) are the model for how a mode cycle is registered. The existing draw trace tool cycles wire mode on a right click while routing (`libs/librepcb/editor/project/board/fsm/boardeditorstate_drawtrace.cpp:223`), which is a precedent for binding posture flip to the same gesture.
 
+Three corrections from building step 6, all of them about how a key actually reaches a tool state.
+
+A tool state never sees PageUp and PageDown. Slint handles them itself: for a board tab whose tool is `EditorTool.wire` it moves the layer combo box index (`libs/librepcb/ui/api/shortcuts.slint:947` and `:950`), which flows back through `Board2dTab::setDerivedUiData` as `layerRequested` and lands in the state's `setLayer`. The same holds for the trace width, via size and via drill keys. So "reuse `layerUp` and `layerDown`" costs nothing at all as long as the new tool reports `EditorTool.wire` and fills the layer combo box, and the state must treat `setLayer` as the layer key rather than waiting for a key event.
+
+A plain letter key never reaches a tool state either, if some `EditorCommand` claims it. `process-board-2d-tab-shortcuts` tries every tool switching shortcut before `Backend.scene-key-pressed` (`libs/librepcb/ui/api/shortcuts.slint:1220`), so `V` opens the via tool and can not be the via toggle. `isKeySequence` compares the modifier set exactly (`libs/librepcb/editor/utils/uihelpers.cpp:342`), so SHIFT+V does not match `tool_via` and does reach the state; that is what the tool uses (`boardeditorstate_routetrace.cpp:143`). Backspace is bound to nothing anywhere and reaches the state unchanged (`:136`).
+
+A new `EditorCommand` is not free. The keyboard shortcuts reference is a single A4 page and is currently full: `ShortcutsReferenceGenerator::generatePdf` lays the categories out in fixed columns and reports a layout overflow when they no longer fit (`libs/librepcb/editor/utils/shortcutsreferencegenerator.cpp:135`), and `ShortcutsReferenceGeneratorTest.testExportPdfMultipleTimes` fails on it. One more command in the "Tools" category overflows it, which is why step 6 gives the new tool no shortcut of its own and reaches it from a menu entry instead. Steps 7 and 8 have to solve that page layout before adding the via, undo, mode and posture commands this section asks for.
+
 ### 3.5 Where the new state sits in the FSM
 
 Add `BoardEditorState_RouteTrace` (name proposal; alternatives are `_DrawTraceInteractive` from `doc/work/006`, which is long, and `_PushAndShove`, which names the implementation rather than the tool). It derives from `BoardEditorState` (`libs/librepcb/editor/project/board/fsm/boardeditorstate.h:61`) and lives next to the existing tool in `libs/librepcb/editor/project/board/fsm/`.
@@ -328,6 +342,10 @@ Three edits wire it in. A new enum value `ROUTE_TRACE` in `BoardEditorFsm::State
 The adapter grows one overload, `virtual void fsmToolEnter(BoardEditorState_RouteTrace&) = 0` (`libs/librepcb/editor/project/board/fsm/boardeditorfsmadapter.h:117` is where the draw trace one sits), which `Board2dTab` implements next to the existing one (`libs/librepcb/editor/project/board/board2dtab.cpp:1275`). Since the adapter is a pure virtual interface, adding an overload is a breaking change for every implementer; there is exactly one today.
 
 The two tools coexist. That is deliberate and is what `doc/work/006` asks for: the existing tool keeps working, the new one is opt in, and a user who hits a router bug can fall back. It also keeps the diff reviewable, which matters for an upstream contribution.
+
+As built, all four edits are where this section predicted: `ROUTE_TRACE` at `libs/librepcb/editor/project/board/fsm/boardeditorfsm.h:95`, the registration at `libs/librepcb/editor/project/board/fsm/boardeditorfsm.cpp:98`, `processRouteTrace()` at `:193` and the adapter overload at `libs/librepcb/editor/project/board/fsm/boardeditorfsmadapter.h:119`.
+
+What the section did not cover is how the user gets there, because a `TabAction` is what a tool state is entered by and the tool buttons are Slint. Step 6 adds one enum value, `tool-route-trace` (`libs/librepcb/ui/api/types.slint:854`), dispatched in the tab's action switch (`libs/librepcb/editor/project/board/board2dtab.cpp:962`), and triggers it from a menu entry on the existing draw trace tool button, opened by a right click the way the via button already opens its pad menu (`libs/librepcb/ui/project/board/board2dtab.slint:435`). No `EditorTool` value and no toolbar component are added: the state reports `EditorTool.wire` and borrows the draw trace toolbar, so the layer combo box, the trace width, the via drill and the via size are live while the wire mode selector, the automatic width switch and the two "set as default" menu items are inert (`Board2dTab::fsmToolEnter` at `libs/librepcb/editor/project/board/board2dtab.cpp:1393`). Note that the draw trace tool button therefore also shows as checked while the router tool is active.
 
 ## 4. The commit applier
 
