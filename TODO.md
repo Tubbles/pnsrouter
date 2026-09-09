@@ -47,3 +47,10 @@ Deferred during milestone 4 (shove):
 - `ShoveDraggingVia` is declared and never defined in KiCad; the dragger milestone decides whether it exists at all.
 - `reduceSpringback` keeps its bottom frame (`pns_shove.cpp:926`), so the first move's shove is sticky within a session; reproduced, worth a look with a real board fixture.
 - Arcs throughout the shove are marked `TODO(arcs)`.
+
+Deferred during the KiCad replay work (2026-09-09):
+
+- Routes started in free space need an orphan net with a non positive net code (`pns_line_placer.cpp:1401`, note 05 section 7.6); the placer currently leaves the net `None`, so shove mode falls back to the walkaround there. `simple-shove-1` reaches its golden once this lands.
+- A `.kicad_dru` reader with `has_user_defined_physical_constraint` and physical clearance rules would let `issue24132-shove-same-net-via` reach its golden; it is a KiCad rule language feature LibrePCB does not have.
+- Keepout zones are counted and skipped by the snapshot converter (`tests/support/kicad_snapshot.rs`); `Item` carries no keepout mark yet. None of the replayed boards has one.
+- A tier 3 comparison (net names and per item geometry against `addedItems`) is cheap once the two gaps above close.

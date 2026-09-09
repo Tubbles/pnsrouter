@@ -1052,7 +1052,7 @@ impl FootprintTransform {
   clippy::cast_precision_loss,
   clippy::cast_possible_truncation
 )]
-fn rotate_point(point: Point, degrees: f64) -> Point {
+pub fn rotate_point(point: Point, degrees: f64) -> Point {
   let normalized = degrees.rem_euclid(360.0);
   if normalized == 0.0 {
     point

@@ -410,6 +410,42 @@ pub struct CommitDiff {
   pub updated: Vec<(HostId, NewItem)>,
 }
 
+/// What a running session has changed so far, before any commit.
+///
+/// Port of `ROUTER::GetUpdatedItems`
+/// (`pcbnew/router/pns_router.cpp:832`), the read only view of the
+/// placer's speculative node that KiCad's regression harness compares
+/// against the golden stored in a `pns.log`
+/// (`qa/tools/pns/pns_log_player.cpp:63`).
+///
+/// It is deliberately **not** a [`CommitDiff`]. A commit folds a removal
+/// and an addition that share a host object into an update, drops the
+/// holes a via drilled, and in shove mode rewinds to the last locked node
+/// first (`pcbnew/router/pns_line_placer.cpp:1810`); none of that has
+/// happened yet here. A [`CommitDiff`] is what a host applies, this is
+/// what a harness measures.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct PendingUpdate {
+  /// Board objects the session has taken out of the world so far.
+  ///
+  /// Only objects the snapshot named: an item the session created and
+  /// then removed again has no host id, which is the `item->Parent()`
+  /// filter of `qa/tools/pns/pns_log_player.cpp:70`.
+  pub removed: Vec<HostId>,
+  /// Every item the session has put in, in uid order.
+  ///
+  /// Segments, vias and the holes those vias drilled, because the node
+  /// delta does not filter by kind.
+  pub added: Vec<ItemId>,
+  /// The speculative node the two lists were read from.
+  ///
+  /// KiCad's `GetUpdatedItems` keeps this to itself; it is returned here
+  /// so that a harness can run a collision query against the world the
+  /// session is standing in rather than against the board it started
+  /// from. [`None`] when nothing is being routed.
+  pub node: Option<NodeId>,
+}
+
 /// What happened to a fix.
 ///
 /// KiCad's `ROUTER::FixRoute` answers with the placer's bool, which is
@@ -1389,6 +1425,38 @@ impl Router {
   /// the ids it gave the additions back through
   /// [`Router::assign_host_ids`].
   ///
+  /// What the session has changed so far, without committing it.
+  ///
+  /// Port of `ROUTER::GetUpdatedItems`
+  /// (`pcbnew/router/pns_router.cpp:832`): the delta of the node the
+  /// placer stands on with loops removed, `CurrentNode( true )` (`:839`),
+  /// against the board. An idle router answers with nothing.
+  ///
+  /// KiCad's third out parameter, the cloned head items, is not returned:
+  /// its only consumer deletes them immediately with the comment "fixme:
+  /// update the state with the head trace (not supported in current
+  /// testsuite)" (`qa/tools/pns/pns_log_player.cpp:83`), and a host that
+  /// wants the head already has it in the [`PreviewFrame`].
+  ///
+  /// See [`PendingUpdate`] for why this is not a [`CommitDiff`].
+  pub fn pending_update(&self) -> PendingUpdate {
+    let Some(placer) = self.placer.as_ref() else {
+      return PendingUpdate::default();
+    };
+    // :839
+    let node = placer.current_node(true);
+    let (added, removed) = self.world.get_updated_items(node);
+
+    PendingUpdate {
+      removed: removed
+        .into_iter()
+        .filter_map(|id| self.index.host_of(id))
+        .collect(),
+      added,
+      node: Some(node),
+    }
+  }
+
   /// `StopRouting` also pushes the touched nets to the host so it can
   /// rebuild the ratsnest (`:971`); a host here reads them off the diff.
   pub fn stop_routing(&mut self) -> CommitDiff {
@@ -1969,5 +2037,101 @@ fn marker_for(
     forced_layer,
     // :686
     hide_original: !item.is_some_and(Item::is_compound_shape_primitive),
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::geometry::shape::Shape;
+  use crate::rules::FixedClearance;
+  use crate::snapshot::{WorldGeometry, WorldItem};
+
+  /// Two pads on one layer, far enough apart for a straight run.
+  fn board() -> WorldSnapshot {
+    let mut snapshot = WorldSnapshot::new(2, 1_000_000);
+
+    for (id, at) in [(1_u64, Vec2::new(0, 0)), (2, Vec2::new(4_000_000, 0))] {
+      snapshot.items.push(WorldItem::new(
+        HostId(id),
+        Some(NetId(1)),
+        LayerRange::single(0),
+        WorldGeometry::Solid {
+          shape: Shape::circle(at, 400_000),
+          pos: at,
+          offset: Vec2::new(0, 0),
+          orientation_degrees: 0.0,
+          anchors: Vec::new(),
+        },
+      ));
+    }
+
+    snapshot
+  }
+
+  /// A session over that board, already started on the left pad.
+  fn started() -> Router {
+    let mut router = Router::new(
+      &board(),
+      Box::new(FixedClearance::uniform(100_000)),
+      RoutingSettings::default(),
+      Sizes {
+        track_width: 200_000,
+        ..Sizes::default()
+      },
+    );
+
+    router
+      .start_routing(Vec2::new(0, 0), Some(HostId(1)), 0)
+      .expect("the left pad is a routable start");
+    router
+  }
+
+  #[test]
+  fn an_idle_router_has_nothing_pending() {
+    let router = Router::new(
+      &board(),
+      Box::new(FixedClearance::uniform(100_000)),
+      RoutingSettings::default(),
+      Sizes::default(),
+    );
+
+    assert_eq!(router.pending_update(), PendingUpdate::default());
+  }
+
+  #[test]
+  fn a_fixed_leg_is_pending_before_it_is_committed() {
+    let mut router = started();
+
+    router.move_to(Vec2::new(2_000_000, 0), None);
+    router.fix_route(Vec2::new(2_000_000, 0), None, false);
+
+    let pending = router.pending_update();
+
+    assert!(
+      !pending.added.is_empty(),
+      "a fixed leg left nothing in the node delta"
+    );
+    assert!(
+      pending.removed.is_empty(),
+      "a route through empty space removed a board object"
+    );
+
+    for id in &pending.added {
+      assert!(
+        router
+          .world()
+          .item(*id)
+          .is_some_and(|item| item.of_kind(Kind::SEGMENT | Kind::VIA)),
+        "the delta holds something a single track placer cannot make"
+      );
+    }
+
+    // The commit reports the same work through the host facing shape.
+    let committed = pending.added.len();
+    let diff = router.stop_routing();
+
+    assert_eq!(diff.added.len() + diff.updated.len(), committed);
+    assert_eq!(router.pending_update(), PendingUpdate::default());
   }
 }

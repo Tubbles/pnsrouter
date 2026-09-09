@@ -31,3 +31,18 @@ Record a session in `tests/eventlog.rs`, write it here with `SessionRecording::t
 ## The files
 
 - `two_layer_via.txt`: a route out of a pad on layer 0, a via, a leg on layer 1, one fix undone again, and a terminal fix on a pad on layer 1. The board is the two layer fixture `tests/router.rs` and `tests/placer.rs` use.
+- `kicad_backspace1.txt`: KiCad's `backspace1` regression case, replayed. One start on a pad of footprint `U1`, 314 moves, ten fixes and nine backspaces, in shove mode. It is the only case in KiCad's corpus that exercises `UndoLastSegment`.
+- `kicad_shove_same_net_via.txt`: KiCad's `issue24132-shove-same-net-via` regression case, replayed. One start, 342 moves and one fix, in shove mode, on the corpus's smallest board.
+
+### Where the two KiCad fixtures come from
+
+They are produced by `tests/kicad_replay.rs`, which reads a case out of `tests/fixtures/kicad/pns_regressions`, turns its board into a snapshot with `tests/support/kicad_snapshot.rs`, drives a `Router` from the recorded events, and writes the recorder's answer here. Regenerate them with
+
+    dev/in-container.sh cargo test --test kicad_replay -- --ignored \
+      regenerate_the_kicad_session_fixtures
+
+The same warning applies as above: a changed commit diff is a change of routing behaviour.
+
+Their value is that the recording carries its own `WorldSnapshot`, so once the file exists the engine is pinned against a real board independently of the KiCad readers. A change to `tests/support/kicad_snapshot.rs` moves the tier assertions in `tests/kicad_replay.rs` and leaves these two alone; a change to the engine moves these two.
+
+Neither fixture reproduces KiCad's own answer for its case. `backspace1` matches the golden counts stored in the log; `issue24132-shove-same-net-via` does not, because that case ships a `pns.kicad_dru` whose net blind 2 mm physical clearance between a track and a via is what makes KiCad's shove move the board's via, and this crate reads no `.kicad_dru`. The difference is recorded in the `#[ignore]` reason of that case's tier 2 test.

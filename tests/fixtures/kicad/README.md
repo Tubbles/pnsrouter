@@ -18,4 +18,6 @@ A case names its board by content hash rather than by file name, so a case canno
 
 ## How this crate uses it
 
-`tests/support/` reads the boards and the logs into a neutral intermediate representation and `tests/kicad_fixtures.rs` pins what is in them. Replaying the cases against the router is a later step, tracked in `doc/work/005-session-api-and-event-log.md`.
+`tests/support/` reads the boards and the logs into a neutral intermediate representation and `tests/kicad_fixtures.rs` pins what is in them.
+
+`tests/support/kicad_snapshot.rs` turns a board and its `.kicad_pro` into a `WorldSnapshot` and a rule resolver, `tests/support/kicad_replay.rs` drives a `Router` from a log, and `tests/kicad_replay.rs` asserts the result in tiers. Its module documentation carries the case to board mapping, which had to be recovered by intersecting KIID sets because the hash a log names its board by cannot be recomputed here.

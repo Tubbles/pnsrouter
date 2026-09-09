@@ -31,5 +31,7 @@
 
 pub mod json;
 pub mod kicad_pcb;
+pub mod kicad_replay;
+pub mod kicad_snapshot;
 pub mod pns_log;
 pub mod sexpr;

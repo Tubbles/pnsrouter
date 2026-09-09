@@ -1,0 +1,494 @@
+# A pnsrouter session recording. The grammar is on
+# `SessionRecording::to_text` in src/eventlog.rs;
+# regenerating a fixture is a deliberate act, see
+# tests/fixtures/sessions/README.md.
+pnsrouter-session 1
+
+# snapshot <copper-layer-count> <max-clearance>
+snapshot 2 600000
+
+# item <host> <net> <layers> <locked> <routable> <free-pad> <compound> <flash> <drill> <geometry>
+item 1 1 0 1 0 1 0 0 flash-default drill circle 124700000 95900000 350000 solid rect 124200000 95400000 1000000 1000000 0 124700000 95900000 0 0 180.0 0
+item 2 2 0 1 0 1 0 0 flash-default drill circle 124700000 94630000 350000 solid circle 124700000 94630000 500000 124700000 94630000 0 0 180.0 0
+item 3 3 0 0 0 1 0 0 flash-default no-drill solid circle 111800000 93600000 150000 111800000 93600000 0 0 0.0 0
+item 4 3 0 0 0 1 0 0 flash-default no-drill solid circle 112450000 93600000 150000 112450000 93600000 0 0 0.0 0
+item 5 3 0 0 0 1 0 0 flash-default no-drill solid circle 113100000 93600000 150000 113100000 93600000 0 0 0.0 0
+item 6 3 0 0 0 1 0 0 flash-default no-drill solid circle 113750000 93600000 150000 113750000 93600000 0 0 0.0 0
+item 7 3 0 0 0 1 0 0 flash-default no-drill solid circle 114400000 93600000 150000 114400000 93600000 0 0 0.0 0
+item 8 3 0 0 0 1 0 0 flash-default no-drill solid circle 115050000 93600000 150000 115050000 93600000 0 0 0.0 0
+item 9 3 0 0 0 1 0 0 flash-default no-drill solid circle 115700000 93600000 150000 115700000 93600000 0 0 0.0 0
+item 10 3 0 0 0 1 0 0 flash-default no-drill solid circle 116350000 93600000 150000 116350000 93600000 0 0 0.0 0
+item 11 3 0 0 0 1 0 0 flash-default no-drill solid circle 117000000 93600000 150000 117000000 93600000 0 0 0.0 0
+item 12 3 0 0 0 1 0 0 flash-default no-drill solid circle 111800000 94250000 150000 111800000 94250000 0 0 0.0 0
+item 13 3 0 0 0 1 0 0 flash-default no-drill solid circle 112450000 94250000 150000 112450000 94250000 0 0 0.0 0
+item 14 3 0 0 0 1 0 0 flash-default no-drill solid circle 113100000 94250000 150000 113100000 94250000 0 0 0.0 0
+item 15 3 0 0 0 1 0 0 flash-default no-drill solid circle 113750000 94250000 150000 113750000 94250000 0 0 0.0 0
+item 16 3 0 0 0 1 0 0 flash-default no-drill solid circle 114400000 94250000 150000 114400000 94250000 0 0 0.0 0
+item 17 3 0 0 0 1 0 0 flash-default no-drill solid circle 115050000 94250000 150000 115050000 94250000 0 0 0.0 0
+item 18 3 0 0 0 1 0 0 flash-default no-drill solid circle 115700000 94250000 150000 115700000 94250000 0 0 0.0 0
+item 19 3 0 0 0 1 0 0 flash-default no-drill solid circle 116350000 94250000 150000 116350000 94250000 0 0 0.0 0
+item 20 3 0 0 0 1 0 0 flash-default no-drill solid circle 117000000 94250000 150000 117000000 94250000 0 0 0.0 0
+item 21 3 0 0 0 1 0 0 flash-default no-drill solid circle 111800000 94900000 150000 111800000 94900000 0 0 0.0 0
+item 22 3 0 0 0 1 0 0 flash-default no-drill solid circle 112450000 94900000 150000 112450000 94900000 0 0 0.0 0
+item 23 3 0 0 0 1 0 0 flash-default no-drill solid circle 113100000 94900000 150000 113100000 94900000 0 0 0.0 0
+item 24 3 0 0 0 1 0 0 flash-default no-drill solid circle 113750000 94900000 150000 113750000 94900000 0 0 0.0 0
+item 25 3 0 0 0 1 0 0 flash-default no-drill solid circle 114400000 94900000 150000 114400000 94900000 0 0 0.0 0
+item 26 3 0 0 0 1 0 0 flash-default no-drill solid circle 115050000 94900000 150000 115050000 94900000 0 0 0.0 0
+item 27 3 0 0 0 1 0 0 flash-default no-drill solid circle 115700000 94900000 150000 115700000 94900000 0 0 0.0 0
+item 28 1 0 0 0 1 0 0 flash-default no-drill solid circle 116350000 94900000 150000 116350000 94900000 0 0 0.0 0
+item 29 2 0 0 0 1 0 0 flash-default no-drill solid circle 117000000 94900000 150000 117000000 94900000 0 0 0.0 0
+item 30 3 0 0 0 1 0 0 flash-default no-drill solid circle 111800000 95550000 150000 111800000 95550000 0 0 0.0 0
+item 31 3 0 0 0 1 0 0 flash-default no-drill solid circle 112450000 95550000 150000 112450000 95550000 0 0 0.0 0
+item 32 3 0 0 0 1 0 0 flash-default no-drill solid circle 113100000 95550000 150000 113100000 95550000 0 0 0.0 0
+item 33 3 0 0 0 1 0 0 flash-default no-drill solid circle 113750000 95550000 150000 113750000 95550000 0 0 0.0 0
+item 34 3 0 0 0 1 0 0 flash-default no-drill solid circle 114400000 95550000 150000 114400000 95550000 0 0 0.0 0
+item 35 3 0 0 0 1 0 0 flash-default no-drill solid circle 115050000 95550000 150000 115050000 95550000 0 0 0.0 0
+item 36 3 0 0 0 1 0 0 flash-default no-drill solid circle 115700000 95550000 150000 115700000 95550000 0 0 0.0 0
+item 37 3 0 0 0 1 0 0 flash-default no-drill solid circle 116350000 95550000 150000 116350000 95550000 0 0 0.0 0
+item 38 3 0 0 0 1 0 0 flash-default no-drill solid circle 117000000 95550000 150000 117000000 95550000 0 0 0.0 0
+item 39 3 0 0 0 1 0 0 flash-default no-drill solid circle 111800000 96200000 150000 111800000 96200000 0 0 0.0 0
+item 40 3 0 0 0 1 0 0 flash-default no-drill solid circle 112450000 96200000 150000 112450000 96200000 0 0 0.0 0
+item 41 3 0 0 0 1 0 0 flash-default no-drill solid circle 113100000 96200000 150000 113100000 96200000 0 0 0.0 0
+item 42 3 0 0 0 1 0 0 flash-default no-drill solid circle 113750000 96200000 150000 113750000 96200000 0 0 0.0 0
+item 43 3 0 0 0 1 0 0 flash-default no-drill solid circle 114400000 96200000 150000 114400000 96200000 0 0 0.0 0
+item 44 3 0 0 0 1 0 0 flash-default no-drill solid circle 115050000 96200000 150000 115050000 96200000 0 0 0.0 0
+item 45 3 0 0 0 1 0 0 flash-default no-drill solid circle 115700000 96200000 150000 115700000 96200000 0 0 0.0 0
+item 46 3 0 0 0 1 0 0 flash-default no-drill solid circle 116350000 96200000 150000 116350000 96200000 0 0 0.0 0
+item 47 3 0 0 0 1 0 0 flash-default no-drill solid circle 117000000 96200000 150000 117000000 96200000 0 0 0.0 0
+item 48 3 0 0 0 1 0 0 flash-default no-drill solid circle 111800000 96850000 150000 111800000 96850000 0 0 0.0 0
+item 49 3 0 0 0 1 0 0 flash-default no-drill solid circle 112450000 96850000 150000 112450000 96850000 0 0 0.0 0
+item 50 3 0 0 0 1 0 0 flash-default no-drill solid circle 113100000 96850000 150000 113100000 96850000 0 0 0.0 0
+item 51 3 0 0 0 1 0 0 flash-default no-drill solid circle 113750000 96850000 150000 113750000 96850000 0 0 0.0 0
+item 52 3 0 0 0 1 0 0 flash-default no-drill solid circle 114400000 96850000 150000 114400000 96850000 0 0 0.0 0
+item 53 3 0 0 0 1 0 0 flash-default no-drill solid circle 115050000 96850000 150000 115050000 96850000 0 0 0.0 0
+item 54 3 0 0 0 1 0 0 flash-default no-drill solid circle 115700000 96850000 150000 115700000 96850000 0 0 0.0 0
+item 55 3 0 0 0 1 0 0 flash-default no-drill solid circle 116350000 96850000 150000 116350000 96850000 0 0 0.0 0
+item 56 3 0 0 0 1 0 0 flash-default no-drill solid circle 117000000 96850000 150000 117000000 96850000 0 0 0.0 0
+item 57 3 0 0 0 1 0 0 flash-default no-drill solid circle 111800000 97500000 150000 111800000 97500000 0 0 0.0 0
+item 58 3 0 0 0 1 0 0 flash-default no-drill solid circle 112450000 97500000 150000 112450000 97500000 0 0 0.0 0
+item 59 3 0 0 0 1 0 0 flash-default no-drill solid circle 113100000 97500000 150000 113100000 97500000 0 0 0.0 0
+item 60 3 0 0 0 1 0 0 flash-default no-drill solid circle 113750000 97500000 150000 113750000 97500000 0 0 0.0 0
+item 61 3 0 0 0 1 0 0 flash-default no-drill solid circle 114400000 97500000 150000 114400000 97500000 0 0 0.0 0
+item 62 3 0 0 0 1 0 0 flash-default no-drill solid circle 115050000 97500000 150000 115050000 97500000 0 0 0.0 0
+item 63 3 0 0 0 1 0 0 flash-default no-drill solid circle 115700000 97500000 150000 115700000 97500000 0 0 0.0 0
+item 64 3 0 0 0 1 0 0 flash-default no-drill solid circle 116350000 97500000 150000 116350000 97500000 0 0 0.0 0
+item 65 3 0 0 0 1 0 0 flash-default no-drill solid circle 117000000 97500000 150000 117000000 97500000 0 0 0.0 0
+item 66 3 0 0 0 1 0 0 flash-default no-drill solid circle 111800000 98150000 150000 111800000 98150000 0 0 0.0 0
+item 67 3 0 0 0 1 0 0 flash-default no-drill solid circle 112450000 98150000 150000 112450000 98150000 0 0 0.0 0
+item 68 3 0 0 0 1 0 0 flash-default no-drill solid circle 113100000 98150000 150000 113100000 98150000 0 0 0.0 0
+item 69 3 0 0 0 1 0 0 flash-default no-drill solid circle 113750000 98150000 150000 113750000 98150000 0 0 0.0 0
+item 70 3 0 0 0 1 0 0 flash-default no-drill solid circle 114400000 98150000 150000 114400000 98150000 0 0 0.0 0
+item 71 3 0 0 0 1 0 0 flash-default no-drill solid circle 115050000 98150000 150000 115050000 98150000 0 0 0.0 0
+item 72 3 0 0 0 1 0 0 flash-default no-drill solid circle 115700000 98150000 150000 115700000 98150000 0 0 0.0 0
+item 73 3 0 0 0 1 0 0 flash-default no-drill solid circle 116350000 98150000 150000 116350000 98150000 0 0 0.0 0
+item 74 3 0 0 0 1 0 0 flash-default no-drill solid circle 117000000 98150000 150000 117000000 98150000 0 0 0.0 0
+item 75 3 0 0 0 1 0 0 flash-default no-drill solid circle 111800000 98800000 150000 111800000 98800000 0 0 0.0 0
+item 76 3 0 0 0 1 0 0 flash-default no-drill solid circle 112450000 98800000 150000 112450000 98800000 0 0 0.0 0
+item 77 3 0 0 0 1 0 0 flash-default no-drill solid circle 113100000 98800000 150000 113100000 98800000 0 0 0.0 0
+item 78 3 0 0 0 1 0 0 flash-default no-drill solid circle 113750000 98800000 150000 113750000 98800000 0 0 0.0 0
+item 79 3 0 0 0 1 0 0 flash-default no-drill solid circle 114400000 98800000 150000 114400000 98800000 0 0 0.0 0
+item 80 3 0 0 0 1 0 0 flash-default no-drill solid circle 115050000 98800000 150000 115050000 98800000 0 0 0.0 0
+item 81 3 0 0 0 1 0 0 flash-default no-drill solid circle 115700000 98800000 150000 115700000 98800000 0 0 0.0 0
+item 82 3 0 0 0 1 0 0 flash-default no-drill solid circle 116350000 98800000 150000 116350000 98800000 0 0 0.0 0
+item 83 3 0 0 0 1 0 0 flash-default no-drill solid circle 117000000 98800000 150000 117000000 98800000 0 0 0.0 0
+item 84 2 0 0 0 1 0 0 flash-default no-drill segment 117950000 94750000 118050000 94750000 -1 75000
+item 85 2 0 0 0 1 0 0 flash-default no-drill segment 117800000 94900000 117950000 94750000 -1 75000
+item 86 2 0 0 0 1 0 0 flash-default no-drill segment 122143198 94625000 118950000 94625000 -1 200000
+item 87 2 0 0 0 1 0 0 flash-default no-drill segment 117000000 94900000 117800000 94900000 -1 75000
+item 88 2 0 0 0 1 0 0 flash-default no-drill segment 124290000 95040000 122558198 95040000 -1 200000
+item 89 2 0 0 0 1 0 0 flash-default no-drill segment 122558198 95040000 122143198 94625000 -1 200000
+item 90 2 0 0 0 1 0 0 flash-default no-drill segment 124700000 94630000 124290000 95040000 -1 200000
+item 91 1 0 0 0 1 0 0 flash-default no-drill segment 117900000 95300000 118050000 95300000 -1 75000
+item 92 1 0 0 0 1 0 0 flash-default no-drill segment 121956802 95075000 118950000 95075000 -1 200000
+item 93 1 0 0 0 1 0 0 flash-default no-drill segment 124700000 95900000 124290000 95490000 -1 200000
+item 94 1 0 0 0 1 0 0 flash-default no-drill segment 124290000 95490000 122371802 95490000 -1 200000
+item 95 1 0 0 0 1 0 0 flash-default no-drill segment 116650000 95200000 117800000 95200000 -1 75000
+item 96 1 0 0 0 1 0 0 flash-default no-drill segment 116350000 94900000 116650000 95200000 -1 75000
+item 97 1 0 0 0 1 0 0 flash-default no-drill segment 122371802 95490000 121956802 95075000 -1 200000
+item 98 1 0 0 0 1 0 0 flash-default no-drill segment 117800000 95200000 117900000 95300000 -1 75000
+item 99 - 0 1 0 0 0 0 flash-default no-drill solid segment 85000000 80000000 150000000 80000000 -1 0 0 0 0 0 0.0 0
+item 100 - 0 1 0 0 0 0 flash-default no-drill solid segment 85000000 130000000 85000000 80000000 -1 0 0 0 0 0 0.0 0
+item 101 - 0 1 0 0 0 0 flash-default no-drill solid segment 150000000 80000000 150000000 130000000 -1 0 0 0 0 0 0.0 0
+item 102 - 0 1 0 0 0 0 flash-default no-drill solid segment 150000000 130000000 85000000 130000000 -1 0 0 0 0 0 0.0 0
+
+settings 0 mode shove
+settings 0 effort medium
+settings 0 shove-vias 1
+settings 0 remove-loops 1
+settings 0 smart-pads 1
+settings 0 follow-mouse 1
+settings 0 start-diagonal 0
+settings 0 jump-over-obstacles 0
+settings 0 smooth-dragged-segments 1
+settings 0 allow-drc-violations 0
+settings 0 free-angle-mode 0
+settings 0 optimize-entire-dragged-track 0
+settings 0 auto-posture 1
+settings 0 fix-all-segments 1
+settings 0 restrict-angles 0
+settings 0 corner-mode mitered-45
+settings 0 walkaround-iteration-limit 40
+settings 0 shove-iteration-limit 250
+settings 0 shove-time-limit-ms 1000
+settings 0 via-force-prop-iteration-limit 40
+settings 0 walkaround-hug-length-threshold 1.5
+
+sizes 0 clearance 200000
+sizes 0 min-clearance 0
+sizes 0 track-width 200000
+sizes 0 board-min-track-width 200000
+sizes 0 via-diameter 600000
+sizes 0 via-drill 300000
+sizes 0 diff-pair-width 125000
+sizes 0 diff-pair-gap 180000
+sizes 0 diff-pair-via-gap 180000
+sizes 0 hole-to-hole 250000
+sizes 0 diff-pair-hole-to-hole 0
+sizes 0 diff-pair-copper-to-hole 0
+sizes 0 track-width-is-explicit 1
+sizes 0 diff-pair-via-gap-same-as-trace-gap 1
+sizes 0 via-type through
+sizes 0 layer-pair 0 1
+sizes 0 layer-pair 1 0
+
+# event <name> <fields>
+event start-routing 111800000 93600000 3 0
+event move-to 111800000 93500000 -
+event move-to 111800000 93500000 -
+event move-to 111700000 93400000 -
+event move-to 111700000 93400000 -
+event move-to 111600000 93300000 -
+event move-to 111500000 93100000 -
+event move-to 111300000 92900000 -
+event move-to 111200000 92800000 -
+event move-to 110900000 92500000 -
+event move-to 110200000 92000000 -
+event move-to 110000000 91800000 -
+event move-to 109800000 91700000 -
+event move-to 109700000 91600000 -
+event move-to 109600000 91500000 -
+event move-to 109600000 91500000 -
+event move-to 109600000 91500000 -
+event move-to 109600000 91600000 -
+event move-to 109600000 91600000 -
+event move-to 109500000 91600000 -
+event move-to 109400000 91800000 -
+event move-to 109400000 91800000 -
+event move-to 109400000 91900000 -
+event move-to 109200000 92000000 -
+event move-to 109100000 92000000 -
+event move-to 109100000 92100000 -
+event move-to 109000000 92100000 -
+event move-to 108900000 92100000 -
+event move-to 108900000 92200000 -
+event fix-route 108900000 92200000 - 0
+event move-to 108900000 92200000 -
+event move-to 108900000 92200000 -
+event move-to 108900000 92200000 -
+event move-to 108900000 92200000 -
+event move-to 108500000 92300000 -
+event move-to 108000000 92400000 -
+event move-to 107500000 92500000 -
+event move-to 107200000 92700000 -
+event move-to 107000000 92800000 -
+event move-to 106200000 93200000 -
+event move-to 106100000 93200000 -
+event move-to 106100000 93300000 -
+event move-to 106100000 93300000 -
+event move-to 106100000 93300000 -
+event move-to 106100000 93300000 -
+event move-to 106100000 93300000 -
+event move-to 106100000 93300000 -
+event move-to 106100000 93400000 -
+event move-to 106100000 93400000 -
+event move-to 106100000 93400000 -
+event move-to 106100000 93400000 -
+event move-to 106100000 93500000 -
+event move-to 106100000 93500000 -
+event move-to 106100000 93500000 -
+event fix-route 106100000 93500000 - 0
+event move-to 106100000 93500000 -
+event move-to 106100000 93500000 -
+event move-to 106100000 93500000 -
+event move-to 106100000 93500000 -
+event move-to 106000000 93800000 -
+event move-to 105900000 94200000 -
+event move-to 105900000 94400000 -
+event move-to 105900000 94600000 -
+event move-to 105900000 94900000 -
+event move-to 105800000 95100000 -
+event move-to 105900000 95300000 -
+event move-to 105900000 95300000 -
+event move-to 105900000 95400000 -
+event move-to 105900000 95400000 -
+event move-to 105900000 95400000 -
+event move-to 105900000 95400000 -
+event move-to 105900000 95400000 -
+event move-to 105900000 95400000 -
+event move-to 105900000 95400000 -
+event move-to 105900000 95400000 -
+event move-to 105900000 95400000 -
+event move-to 105900000 95300000 -
+event move-to 105900000 95300000 -
+event move-to 105900000 95300000 -
+event move-to 105900000 95300000 -
+event move-to 105900000 95400000 -
+event move-to 105900000 95700000 -
+event move-to 105900000 95900000 -
+event move-to 105800000 96200000 -
+event move-to 105600000 96600000 -
+event move-to 105600000 96900000 -
+event move-to 105500000 97200000 -
+event move-to 105400000 97300000 -
+event move-to 105400000 97400000 -
+event move-to 105400000 97400000 -
+event fix-route 105400000 97400000 - 0
+event move-to 105400000 97400000 -
+event move-to 105400000 97400000 -
+event move-to 105400000 97400000 -
+event move-to 105400000 97400000 -
+event move-to 105400000 97400000 -
+event move-to 105300000 97600000 -
+event move-to 105300000 97900000 -
+event move-to 105300000 98100000 -
+event move-to 105300000 98300000 -
+event move-to 105300000 98500000 -
+event move-to 105500000 99200000 -
+event move-to 105500000 99500000 -
+event move-to 105600000 99700000 -
+event move-to 105600000 99800000 -
+event move-to 105600000 99900000 -
+event move-to 105600000 100000000 -
+event move-to 105700000 100000000 -
+event move-to 105700000 100100000 -
+event move-to 105700000 100100000 -
+event move-to 105700000 100100000 -
+event move-to 105700000 100100000 -
+event move-to 105700000 100200000 -
+event move-to 105800000 100300000 -
+event move-to 105800000 100300000 -
+event move-to 105800000 100300000 -
+event move-to 105900000 100300000 -
+event move-to 106000000 100500000 -
+event move-to 106000000 100500000 -
+event move-to 106000000 100500000 -
+event move-to 106000000 100500000 -
+event move-to 106000000 100500000 -
+event fix-route 106000000 100500000 - 0
+event move-to 106000000 100500000 -
+event move-to 106000000 100500000 -
+event move-to 106000000 100500000 -
+event move-to 106300000 100600000 -
+event move-to 106600000 100800000 -
+event move-to 106600000 100800000 -
+event move-to 107100000 101000000 -
+event move-to 108300000 101300000 -
+event move-to 108400000 101300000 -
+event move-to 109200000 101400000 -
+event move-to 109500000 101500000 -
+event move-to 109700000 101500000 -
+event move-to 110000000 101500000 -
+event move-to 110300000 101500000 -
+event move-to 110300000 101500000 -
+event move-to 110400000 101500000 -
+event move-to 110500000 101500000 -
+event move-to 110500000 101500000 -
+event move-to 110500000 101500000 -
+event move-to 110500000 101500000 -
+event move-to 110500000 101500000 -
+event move-to 110600000 101500000 -
+event move-to 110600000 101500000 -
+event move-to 110700000 101500000 -
+event move-to 110700000 101500000 -
+event fix-route 110700000 101500000 - 0
+event move-to 110700000 101500000 -
+event move-to 110700000 101500000 -
+event move-to 110700000 101500000 -
+event move-to 110700000 101500000 -
+event move-to 110700000 101500000 -
+event move-to 110700000 101500000 -
+event move-to 111000000 101500000 -
+event move-to 111500000 101500000 -
+event move-to 111700000 101400000 -
+event move-to 112100000 101400000 -
+event move-to 113000000 101400000 -
+event move-to 113800000 101300000 -
+event move-to 114500000 101200000 -
+event move-to 115300000 101100000 -
+event move-to 115900000 101100000 -
+event move-to 116200000 101100000 -
+event move-to 116400000 101100000 -
+event move-to 116500000 101100000 -
+event move-to 116500000 101100000 -
+event move-to 116500000 101100000 -
+event move-to 116500000 101100000 -
+event move-to 116500000 101100000 -
+event move-to 116500000 101100000 -
+event move-to 116500000 101100000 -
+event move-to 116500000 101000000 -
+event move-to 116500000 101000000 -
+event move-to 116500000 100900000 -
+event move-to 116500000 100900000 -
+event move-to 116600000 100900000 -
+event move-to 116700000 100900000 -
+event move-to 116700000 100900000 -
+event move-to 116900000 100900000 -
+event move-to 117100000 100900000 -
+event move-to 117200000 100900000 -
+event move-to 117300000 100900000 -
+event move-to 117600000 100900000 -
+event move-to 117800000 101000000 -
+event move-to 117800000 101000000 -
+event move-to 117900000 101000000 -
+event move-to 117900000 101000000 -
+event fix-route 117900000 101000000 - 0
+event move-to 117900000 101000000 -
+event move-to 117900000 101000000 -
+event move-to 117900000 101000000 -
+event move-to 117900000 101000000 -
+event move-to 118000000 100800000 -
+event move-to 118300000 100600000 -
+event move-to 118400000 100600000 -
+event move-to 119100000 100300000 -
+event move-to 119600000 100100000 -
+event move-to 120200000 99800000 -
+event move-to 120800000 99700000 -
+event move-to 121400000 99700000 -
+event move-to 121800000 99700000 -
+event move-to 122000000 99700000 -
+event move-to 122600000 99700000 -
+event move-to 122800000 99700000 -
+event move-to 122900000 99700000 -
+event move-to 122900000 99700000 -
+event move-to 122900000 99700000 -
+event move-to 122900000 99700000 -
+event fix-route 122900000 99700000 - 0
+event move-to 122900000 99700000 -
+event move-to 122900000 99700000 -
+event move-to 122900000 99700000 -
+event move-to 122900000 99700000 -
+event move-to 123100000 99900000 -
+event move-to 123300000 100000000 -
+event move-to 123400000 100000000 -
+event move-to 123500000 100100000 -
+event move-to 123700000 100200000 -
+event move-to 123700000 100200000 -
+event move-to 123800000 100300000 -
+event move-to 123800000 100300000 -
+event move-to 123800000 100300000 -
+event move-to 123800000 100300000 -
+event move-to 123800000 100300000 -
+event move-to 123800000 100400000 -
+event move-to 123800000 100400000 -
+event move-to 123900000 100400000 -
+event move-to 123900000 100500000 -
+event move-to 123900000 100600000 -
+event move-to 123900000 100600000 -
+event move-to 123900000 100700000 -
+event move-to 123900000 100700000 -
+event move-to 123900000 100700000 -
+event move-to 123900000 100700000 -
+event move-to 124000000 100800000 -
+event move-to 124000000 100800000 -
+event move-to 124000000 100900000 -
+event move-to 124000000 100900000 -
+event move-to 124000000 100900000 -
+event move-to 124100000 100900000 -
+event move-to 124100000 101000000 -
+event move-to 124100000 101000000 -
+event fix-route 124100000 101000000 - 0
+event move-to 124100000 101000000 -
+event move-to 124100000 101000000 -
+event move-to 124100000 101000000 -
+event move-to 124100000 101000000 -
+event move-to 124100000 101000000 -
+event move-to 124100000 101000000 -
+event move-to 124100000 101000000 -
+event move-to 124100000 101000000 -
+event move-to 124100000 101000000 -
+event move-to 124100000 101000000 -
+event move-to 124000000 101300000 -
+event move-to 124000000 101300000 -
+event move-to 123800000 101700000 -
+event move-to 123700000 101800000 -
+event move-to 123700000 102000000 -
+event move-to 123600000 102100000 -
+event move-to 123600000 102200000 -
+event move-to 123600000 102300000 -
+event move-to 123600000 102300000 -
+event move-to 123600000 102300000 -
+event move-to 123600000 102300000 -
+event move-to 123600000 102300000 -
+event move-to 123600000 102300000 -
+event move-to 123600000 102300000 -
+event move-to 123600000 102300000 -
+event move-to 123600000 102300000 -
+event move-to 123500000 102300000 -
+event move-to 123500000 102300000 -
+event move-to 123500000 102300000 -
+event move-to 123500000 102300000 -
+event move-to 123500000 102400000 -
+event move-to 123500000 102400000 -
+event move-to 123500000 102400000 -
+event move-to 123500000 102500000 -
+event move-to 123500000 102500000 -
+event move-to 123500000 102600000 -
+event move-to 123500000 102800000 -
+event move-to 123500000 102800000 -
+event move-to 123500000 102900000 -
+event move-to 123500000 102900000 -
+event move-to 123400000 103100000 -
+event move-to 123400000 103100000 -
+event move-to 123400000 103200000 -
+event move-to 123400000 103200000 -
+event move-to 123400000 103300000 -
+event move-to 123400000 103400000 -
+event move-to 123500000 103400000 -
+event move-to 123500000 103500000 -
+event move-to 123400000 103500000 -
+event move-to 123400000 103500000 -
+event move-to 123400000 103500000 -
+event move-to 123400000 103600000 -
+event fix-route 123400000 103600000 - 0
+event move-to 123400000 103600000 -
+event move-to 123400000 103600000 -
+event move-to 123400000 103600000 -
+event move-to 123400000 103600000 -
+event move-to 123400000 103600000 -
+event move-to 123400000 103600000 -
+event move-to 123400000 103600000 -
+event undo-last-segment
+event move-to 123400000 103600000 -
+event move-to 123400000 103600000 -
+event undo-last-segment
+event move-to 124100000 101000000 -
+event move-to 124100000 101000000 -
+event undo-last-segment
+event move-to 122900000 99700000 -
+event move-to 122900000 99700000 -
+event undo-last-segment
+event move-to 117900000 101000000 -
+event move-to 117900000 101000000 -
+event undo-last-segment
+event move-to 110700000 101500000 -
+event move-to 110700000 101500000 -
+event undo-last-segment
+event move-to 106000000 100500000 -
+event move-to 106000000 100500000 -
+event undo-last-segment
+event move-to 105400000 97400000 -
+event move-to 105400000 97400000 -
+event undo-last-segment
+event move-to 106100000 93500000 -
+event move-to 106100000 93500000 -
+event undo-last-segment
+event move-to 108900000 92200000 -
+event move-to 108900000 92200000 -
+event fix-route 108900000 92200000 - 0
+event move-to 108900000 92200000 -
+event stop-routing
+
+# commit, then its removed, added and updated items
+commit
+added segment 111800000 93600000 110300000 93600000 0 200000 3 0 0 -
+added segment 110300000 93600000 108900000 92200000 1 200000 3 0 0 -

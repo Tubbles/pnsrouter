@@ -1,0 +1,417 @@
+# A pnsrouter session recording. The grammar is on
+# `SessionRecording::to_text` in src/eventlog.rs;
+# regenerating a fixture is a deliberate act, see
+# tests/fixtures/sessions/README.md.
+pnsrouter-session 1
+
+# snapshot <copper-layer-count> <max-clearance>
+snapshot 2 600000
+
+# item <host> <net> <layers> <locked> <routable> <free-pad> <compound> <flash> <drill> <geometry>
+item 1 1 0 0 0 1 0 0 flash-default no-drill solid rect 114000000 74450000 1400000 1025000 0 114700000 74962500 0 0 90.0 0
+item 2 2 0 0 0 1 0 0 flash-default no-drill solid rect 114000000 72625000 1400000 1025000 0 114700000 73137500 0 0 90.0 0
+item 3 1 0 0 0 1 0 0 flash-default no-drill solid rect 123300000 74400000 1400000 1025000 0 124000000 74912500 0 0 90.0 0
+item 4 2 0 0 0 1 0 0 flash-default no-drill solid rect 123300000 72575000 1400000 1025000 0 124000000 73087500 0 0 90.0 0
+item 5 1 0 0 0 1 0 0 flash-default no-drill segment 119500000 78000000 115253047 78000000 -1 200000
+item 6 1 0 0 0 1 0 0 flash-default no-drill segment 114700000 77446953 114700000 74962500 -1 200000
+item 7 1 0 0 0 1 0 0 flash-default no-drill segment 124000000 74912500 124000000 77500000 -1 200000
+item 8 1 0 0 0 1 0 0 flash-default no-drill segment 123500000 78000000 119500000 78000000 -1 200000
+item 9 1 0 0 0 1 0 0 flash-default no-drill segment 124000000 77500000 123500000 78000000 -1 200000
+item 10 1 0 0 0 1 0 0 flash-default no-drill segment 115253047 78000000 114700000 77446953 -1 200000
+item 11 2 0 1 0 1 0 0 flash-default no-drill via 119500000 73000000 600000 300000 through 1
+item 12 - 0 1 0 0 0 1 flash-default no-drill solid segment 99950000 50350000 201700000 50350000 -1 0 0 0 0 0 0.0 0
+item 12 - 0 1 0 0 0 1 flash-default no-drill solid segment 201700000 50350000 201700000 101200000 -1 0 0 0 0 0 0.0 0
+item 12 - 0 1 0 0 0 1 flash-default no-drill solid segment 201700000 101200000 99950000 101200000 -1 0 0 0 0 0 0.0 0
+item 12 - 0 1 0 0 0 1 flash-default no-drill solid segment 99950000 101200000 99950000 50350000 -1 0 0 0 0 0 0.0 0
+
+settings 0 mode shove
+settings 0 effort medium
+settings 0 shove-vias 1
+settings 0 remove-loops 1
+settings 0 smart-pads 1
+settings 0 follow-mouse 1
+settings 0 start-diagonal 0
+settings 0 jump-over-obstacles 0
+settings 0 smooth-dragged-segments 1
+settings 0 allow-drc-violations 0
+settings 0 free-angle-mode 0
+settings 0 optimize-entire-dragged-track 0
+settings 0 auto-posture 1
+settings 0 fix-all-segments 1
+settings 0 restrict-angles 0
+settings 0 corner-mode mitered-45
+settings 0 walkaround-iteration-limit 40
+settings 0 shove-iteration-limit 250
+settings 0 shove-time-limit-ms 1000
+settings 0 via-force-prop-iteration-limit 40
+settings 0 walkaround-hug-length-threshold 1.5
+
+sizes 0 clearance 200000
+sizes 0 min-clearance 0
+sizes 0 track-width 200000
+sizes 0 board-min-track-width 200000
+sizes 0 via-diameter 600000
+sizes 0 via-drill 300000
+sizes 0 diff-pair-width 125000
+sizes 0 diff-pair-gap 180000
+sizes 0 diff-pair-via-gap 180000
+sizes 0 hole-to-hole 250000
+sizes 0 diff-pair-hole-to-hole 0
+sizes 0 diff-pair-copper-to-hole 0
+sizes 0 track-width-is-explicit 1
+sizes 0 diff-pair-via-gap-same-as-trace-gap 1
+sizes 0 via-type through
+sizes 0 layer-pair 0 1
+sizes 0 layer-pair 1 0
+
+# event <name> <fields>
+event start-routing 124000000 73087500 4 0
+event move-to 123500000 73000000 -
+event move-to 123500000 73000000 -
+event move-to 123500000 73000000 -
+event move-to 123500000 73000000 -
+event move-to 123000000 73000000 -
+event move-to 123000000 73000000 -
+event move-to 123000000 73000000 -
+event move-to 123000000 73000000 -
+event move-to 123000000 73000000 -
+event move-to 123000000 73000000 -
+event move-to 123000000 73000000 -
+event move-to 123000000 73000000 -
+event move-to 123000000 73000000 -
+event move-to 123000000 73000000 -
+event move-to 123000000 73000000 -
+event move-to 123000000 73000000 -
+event move-to 123000000 73000000 -
+event move-to 123000000 73000000 -
+event move-to 123000000 73000000 -
+event move-to 123000000 73000000 -
+event move-to 122500000 73000000 -
+event move-to 122500000 73000000 -
+event move-to 122500000 73000000 -
+event move-to 122500000 73000000 -
+event move-to 122500000 73000000 -
+event move-to 122000000 73000000 -
+event move-to 122000000 73000000 -
+event move-to 122000000 73000000 -
+event move-to 122000000 73000000 -
+event move-to 122000000 73000000 -
+event move-to 122000000 73000000 -
+event move-to 122000000 73000000 -
+event move-to 121500000 73000000 -
+event move-to 121500000 73000000 -
+event move-to 121500000 73000000 -
+event move-to 121500000 73000000 -
+event move-to 121500000 73000000 -
+event move-to 121500000 73000000 -
+event move-to 121000000 73000000 -
+event move-to 121000000 73000000 -
+event move-to 121000000 73000000 -
+event move-to 121000000 73000000 -
+event move-to 121000000 73000000 -
+event move-to 121000000 73000000 -
+event move-to 121000000 73000000 -
+event move-to 121000000 73000000 -
+event move-to 121000000 73000000 -
+event move-to 120500000 73000000 -
+event move-to 120500000 73000000 -
+event move-to 120500000 73000000 -
+event move-to 120500000 73000000 -
+event move-to 120500000 73000000 -
+event move-to 120500000 73000000 -
+event move-to 120500000 73000000 -
+event move-to 120500000 73000000 -
+event move-to 120500000 73000000 -
+event move-to 120500000 73000000 -
+event move-to 120500000 73000000 -
+event move-to 120000000 73000000 -
+event move-to 120000000 73000000 -
+event move-to 120000000 73000000 -
+event move-to 120000000 73000000 -
+event move-to 120000000 73000000 -
+event move-to 120000000 73000000 -
+event move-to 120000000 73000000 -
+event move-to 120000000 73000000 -
+event move-to 120000000 73000000 -
+event move-to 119500000 73000000 -
+event move-to 119500000 73000000 -
+event move-to 119500000 73000000 -
+event move-to 119500000 73000000 -
+event move-to 119500000 73000000 -
+event move-to 119500000 73000000 -
+event move-to 119500000 73000000 -
+event move-to 119500000 73000000 -
+event move-to 119000000 73000000 -
+event move-to 118500000 73000000 -
+event move-to 118500000 73000000 -
+event move-to 118500000 73000000 -
+event move-to 118000000 73000000 -
+event move-to 118000000 73000000 -
+event move-to 118000000 73000000 -
+event move-to 118000000 73000000 -
+event move-to 118000000 73000000 -
+event move-to 118000000 73000000 -
+event move-to 118000000 73000000 -
+event move-to 118000000 73000000 -
+event move-to 118000000 73000000 -
+event move-to 118000000 73000000 -
+event move-to 118000000 73000000 -
+event move-to 118000000 73000000 -
+event move-to 118000000 73000000 -
+event move-to 118000000 73000000 -
+event move-to 118000000 73000000 -
+event move-to 118000000 73000000 -
+event move-to 118000000 73000000 -
+event move-to 118000000 73000000 -
+event move-to 118500000 73000000 -
+event move-to 118500000 73000000 -
+event move-to 118500000 73000000 -
+event move-to 118500000 73000000 -
+event move-to 118500000 73000000 -
+event move-to 118500000 73000000 -
+event move-to 118500000 73000000 -
+event move-to 118500000 73000000 -
+event move-to 118500000 73000000 -
+event move-to 118500000 73000000 -
+event move-to 118500000 73000000 -
+event move-to 118500000 73000000 -
+event move-to 118500000 73000000 -
+event move-to 118500000 73000000 -
+event move-to 118500000 73000000 -
+event fix-route 118500000 73000000 - 0
+event move-to 118500000 73000000 -
+event move-to 118500000 73000000 -
+event move-to 118500000 73000000 -
+event move-to 118500000 73000000 -
+event move-to 118000000 73000000 -
+event move-to 117500000 73000000 -
+event move-to 117500000 73000000 -
+event move-to 117500000 73000000 -
+event move-to 117500000 73000000 -
+event move-to 117500000 73000000 -
+event move-to 117500000 73000000 -
+event move-to 117500000 73000000 -
+event move-to 117500000 73000000 -
+event move-to 117500000 73000000 -
+event move-to 117500000 73000000 -
+event move-to 117000000 73000000 -
+event move-to 117000000 73000000 -
+event move-to 117000000 73000000 -
+event move-to 117000000 73000000 -
+event move-to 117000000 73000000 -
+event move-to 117000000 73000000 -
+event move-to 117000000 73000000 -
+event move-to 117000000 73000000 -
+event move-to 117000000 73000000 -
+event move-to 117000000 73000000 -
+event move-to 117000000 73000000 -
+event move-to 116114417 72737325 11
+event move-to 116114417 72737325 11
+event move-to 116114417 72737325 11
+event move-to 116114417 72737325 11
+event move-to 116114417 72737325 11
+event move-to 116114417 72737325 11
+event move-to 116114417 72737325 11
+event move-to 116114417 72737325 11
+event move-to 116114417 72737325 11
+event move-to 116114417 72737325 11
+event move-to 116114417 72737325 11
+event move-to 116114417 72737325 11
+event move-to 116114417 72737325 11
+event move-to 116114417 72737325 11
+event move-to 116114417 72737325 11
+event move-to 117000000 72500000 -
+event move-to 117000000 72500000 -
+event move-to 117000000 72000000 -
+event move-to 117000000 72000000 -
+event move-to 117000000 72000000 -
+event move-to 117000000 72000000 -
+event move-to 117000000 72000000 -
+event move-to 117000000 72000000 -
+event move-to 117000000 72000000 -
+event move-to 117000000 72000000 -
+event move-to 117000000 72000000 -
+event move-to 117000000 72000000 -
+event move-to 117000000 72000000 -
+event move-to 117000000 72000000 -
+event move-to 117000000 72000000 -
+event move-to 117000000 72000000 -
+event move-to 117000000 72000000 -
+event move-to 117000000 72000000 -
+event move-to 117000000 72000000 -
+event move-to 117000000 72000000 -
+event move-to 117000000 72000000 -
+event move-to 117000000 71500000 -
+event move-to 117000000 71500000 -
+event move-to 117000000 71500000 -
+event move-to 117000000 71500000 -
+event move-to 117500000 71500000 -
+event move-to 117500000 71500000 -
+event move-to 117500000 71500000 -
+event move-to 117500000 71500000 -
+event move-to 117500000 71500000 -
+event move-to 117500000 71500000 -
+event move-to 117500000 71500000 -
+event move-to 117500000 71500000 -
+event move-to 117500000 71500000 -
+event move-to 117500000 71500000 -
+event move-to 117500000 71500000 -
+event move-to 117500000 71500000 -
+event move-to 117500000 71000000 -
+event move-to 117500000 71000000 -
+event move-to 117500000 71000000 -
+event move-to 117500000 71000000 -
+event move-to 117500000 71000000 -
+event move-to 117500000 71000000 -
+event move-to 117500000 71000000 -
+event move-to 117500000 71000000 -
+event move-to 117500000 71000000 -
+event move-to 117500000 71500000 -
+event move-to 117000000 71500000 -
+event move-to 117000000 72000000 -
+event move-to 117000000 72500000 -
+event move-to 116114417 72737325 11
+event move-to 116114417 72737325 11
+event move-to 116114417 72737325 11
+event move-to 116114417 72737325 11
+event move-to 116114417 72737325 11
+event move-to 116114417 72737325 11
+event move-to 116114417 72737325 11
+event move-to 116114417 72737325 11
+event move-to 116114417 72737325 11
+event move-to 116114417 72737325 11
+event move-to 116500000 73500000 -
+event move-to 116500000 73500000 -
+event move-to 116500000 73500000 -
+event move-to 116500000 73500000 -
+event move-to 116500000 73500000 -
+event move-to 116500000 73500000 -
+event move-to 116500000 73500000 -
+event move-to 117000000 73500000 -
+event move-to 117000000 73500000 -
+event move-to 117000000 73500000 -
+event move-to 117000000 73500000 -
+event move-to 117000000 73500000 -
+event move-to 117000000 73500000 -
+event move-to 117000000 73500000 -
+event move-to 117000000 73500000 -
+event move-to 117000000 73500000 -
+event move-to 117000000 73500000 -
+event move-to 117000000 73500000 -
+event move-to 117000000 73500000 -
+event move-to 117000000 74000000 -
+event move-to 117000000 74000000 -
+event move-to 117000000 74000000 -
+event move-to 117000000 74000000 -
+event move-to 117000000 74000000 -
+event move-to 117000000 74000000 -
+event move-to 116500000 74000000 -
+event move-to 116500000 74000000 -
+event move-to 116500000 74000000 -
+event move-to 116500000 74000000 -
+event move-to 116500000 74000000 -
+event move-to 116500000 74000000 -
+event move-to 116500000 74000000 -
+event move-to 116500000 74000000 -
+event move-to 116500000 74000000 -
+event move-to 116500000 74000000 -
+event move-to 116500000 74500000 -
+event move-to 116500000 74500000 -
+event move-to 116500000 74500000 -
+event move-to 117000000 74500000 -
+event move-to 117000000 74500000 -
+event move-to 117000000 74500000 -
+event move-to 117000000 74500000 -
+event move-to 117500000 74500000 -
+event move-to 117500000 74500000 -
+event move-to 118000000 74500000 -
+event move-to 118000000 74500000 -
+event move-to 118000000 75000000 -
+event move-to 118500000 75000000 -
+event move-to 118500000 75000000 -
+event move-to 119000000 74500000 -
+event move-to 119000000 74500000 -
+event move-to 119000000 74500000 -
+event move-to 119000000 74500000 -
+event move-to 119000000 74000000 -
+event move-to 119000000 73500000 -
+event move-to 119500000 73087500 -
+event move-to 119500000 73087500 -
+event move-to 119500000 73087500 -
+event move-to 119500000 72500000 -
+event move-to 119500000 72500000 -
+event move-to 119500000 72500000 -
+event move-to 119500000 72000000 -
+event move-to 119500000 72000000 -
+event move-to 119500000 72000000 -
+event move-to 119500000 72000000 -
+event move-to 119500000 72000000 -
+event move-to 119500000 72000000 -
+event move-to 119000000 72000000 -
+event move-to 119000000 72000000 -
+event move-to 119000000 72000000 -
+event move-to 118500000 72000000 -
+event move-to 118500000 72000000 -
+event move-to 118500000 72000000 -
+event move-to 118500000 72000000 -
+event move-to 118000000 72000000 -
+event move-to 118000000 71500000 -
+event move-to 118000000 71500000 -
+event move-to 118000000 71500000 -
+event move-to 118000000 71500000 -
+event move-to 118000000 71500000 -
+event move-to 118000000 71500000 -
+event move-to 118000000 71500000 -
+event move-to 118000000 71500000 -
+event move-to 118000000 71500000 -
+event move-to 118000000 71500000 -
+event move-to 118000000 71500000 -
+event move-to 118000000 71500000 -
+event move-to 118000000 71500000 -
+event move-to 118000000 71500000 -
+event move-to 118000000 71500000 -
+event move-to 117500000 71500000 -
+event move-to 117500000 71500000 -
+event move-to 117500000 71500000 -
+event move-to 117500000 71000000 -
+event move-to 117500000 71000000 -
+event move-to 117500000 71500000 -
+event move-to 117500000 71500000 -
+event move-to 118000000 71500000 -
+event move-to 118000000 71500000 -
+event move-to 118000000 71500000 -
+event move-to 118000000 71500000 -
+event move-to 118000000 71500000 -
+event move-to 118000000 71500000 -
+event move-to 118000000 71500000 -
+event move-to 118000000 71500000 -
+event move-to 118000000 71500000 -
+event move-to 118000000 71500000 -
+event move-to 118000000 71500000 -
+event move-to 118000000 71500000 -
+event move-to 118000000 71500000 -
+event move-to 118000000 71500000 -
+event move-to 118000000 71500000 -
+event move-to 118000000 71500000 -
+event move-to 118000000 71500000 -
+event move-to 118000000 71500000 -
+event move-to 118000000 71500000 -
+event move-to 118000000 71500000 -
+event move-to 118000000 71500000 -
+event move-to 118000000 71500000 -
+event move-to 118000000 71500000 -
+event move-to 118000000 71500000 -
+event move-to 118000000 71500000 -
+event move-to 118000000 71500000 -
+event move-to 118000000 71500000 -
+event move-to 118000000 71500000 -
+event move-to 118000000 71500000 -
+event move-to 118000000 71500000 -
+event move-to 118000000 71500000 -
+event move-to 118000000 71500000 -
+event stop-routing
+
+# commit, then its removed, added and updated items
+commit
+added segment 124000000 73087500 118587500 73087500 0 200000 2 0 0 -
+added segment 118587500 73087500 118500000 73000000 1 200000 2 0 0 -
