@@ -99,3 +99,8 @@ Deferred during the latency measurement (2026-09-09):
 Deferred during the session recording work (2026-09-09):
 
 - A recording carries no rule table, only `max_clearance` and the sizes, so a replay of a board with net class overrides cannot pick the right resolver. Serialising the clearance answers the session actually used (a table by net pair, or the net class values) would make replays exact for any board.
+
+Deferred during the M7 close (2026-09-09):
+
+- cargo-fuzz targets for `SessionRecording::from_text` and for random shape pairs through `collide` (no panic, symmetric answer) need a nightly toolchain; run them as a CI job on nightly rather than in the container, which pins 1.92.0 and has a read only rustup directory.
+- 0.1.0 is the user's to publish; the runbook is in `doc/work/007-hardening-and-release.md`.
