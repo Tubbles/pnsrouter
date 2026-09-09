@@ -95,3 +95,9 @@ Deferred during the latency measurement (2026-09-09):
 - `RoutingSettings::shove_iteration_limit` stays at KiCad's 250. On both measured boards a limit of 50 gave the same route with a sixth of the worst case move time. Revisit with fixtures from real boards before moving the default, and consider exposing it to LibrePCB.
 - `World::invalidate_caches` (`src/node.rs:3222`) scans both caches once per removed item where KiCad batches (`pns_kicad_iface.cpp:792`). Measured at zero benefit when removed entirely, so it is left alone. Revisit only if a profile on a real board disagrees.
 - `Router::new` is 62 ms for a 20 573 item board, which is the cost a host pays for every full re-sync. That is the incremental sync item already listed under LibrePCB step 6.
+
+Deferred during the session recording work (2026-09-09):
+
+- Nothing globs `tests/fixtures/sessions/`: a recording dropped there needs a named test in `tests/eventlog.rs`. A directory driven test that replays every LibrePCB recording with `FixedClearance::uniform(sizes.min_clearance)` would make new fixtures free.
+- A recording carries no rule table, only `max_clearance` and the sizes, so a replay of a board with net class overrides cannot pick the right resolver. Serialising the clearance answers the session actually used (a table by net pair, or the net class values) would make replays exact for any board.
+- The first real board fixture, the Gerber Test recording from the LibrePCB gtest, is not in the tree yet; it is at `~/dev/librepcb/tmp/agent-record/librepcb_gerber_test.txt` on this machine.
