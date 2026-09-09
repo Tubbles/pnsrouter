@@ -7,8 +7,9 @@
 //! one out of plain data the way `tests/walkaround.rs` does and drives
 //! [`pnsrouter::shove::Shove`] over it.
 //!
-//! Everything here is segments only, which is what part 1 of the shove
-//! covers. Every scenario that claims success asserts that the node the
+//! Part 1 covered segments; part 2 adds solids, which are walked around
+//! rather than moved, and vias, which move and drag their tracks with
+//! them. Every scenario that claims success asserts that the node the
 //! shove hands back is actually clear, through
 //! `World::check_colliding_line` on every track it holds, because a shove
 //! that reports success over geometry that still collides is the failure
@@ -20,16 +21,18 @@ use pnsrouter::algo_base::AlgoContext;
 use pnsrouter::collide::CollisionSearchOptions;
 use pnsrouter::geometry::line_chain::LineChain;
 use pnsrouter::geometry::seg::Seg;
+use pnsrouter::geometry::shape::Shape;
 use pnsrouter::geometry::vec2::Vec2;
 use pnsrouter::item::{
-  ItemBody, ItemId, Kind, LayerRange, MarkerFlags, NetId, Segment,
+  ItemBody, ItemId, Kind, LayerRange, MarkerFlags, NetId, Segment, Solid, Via,
+  ViaType,
 };
 use pnsrouter::line::Line;
 use pnsrouter::node::{NodeId, World};
 use pnsrouter::optimizer::EffortFlags;
 use pnsrouter::rules::FixedClearance;
 use pnsrouter::settings::RoutingSettings;
-use pnsrouter::shove::{HEAD_RANK, Shove, ShovePolicy, ShoveStatus};
+use pnsrouter::shove::{HEAD_RANK, Shove, ShovePolicy, ShoveStatus, ViaHandle};
 
 /// The clearance every scenario routes to, in nanometres.
 const CLEARANCE: i32 = 100000;
@@ -107,6 +110,20 @@ fn near_track() -> TrackSpec {
 fn bumpy_track() -> TrackSpec {
   TrackSpec {
     points: &BUMPY_POINTS,
+    layer: 0,
+    net: NEAR_NET,
+  }
+}
+
+/// A short track across the head's path, with both ends well clear of it
+/// so that a walkaround has somewhere to go round.
+const STUB_POINTS: [Vec2; 2] =
+  [Vec2::new(1500000, -600000), Vec2::new(1500000, 600000)];
+
+/// The short track the walkaround escalation is exercised against.
+fn stub_track() -> TrackSpec {
+  TrackSpec {
+    points: &STUB_POINTS,
     layer: 0,
     net: NEAR_NET,
   }
@@ -251,8 +268,14 @@ fn min_distance(first: &Line, second: &Line) -> i32 {
 /// The head's net is in the list because a failed run can leave a head
 /// behind, and out of [`BOARD_NETS`] because a successful run takes its
 /// heads back out of the node again.
-const ALL_NETS: [Option<NetId>; 4] =
-  [HEAD_NET, NEAR_NET, FAR_NET, OTHER_LAYER_NET];
+const ALL_NETS: [Option<NetId>; 6] = [
+  HEAD_NET,
+  NEAR_NET,
+  FAR_NET,
+  OTHER_LAYER_NET,
+  PAD_NET,
+  VIA_NET,
+];
 
 /// The nets a board still holds after a successful run.
 const BOARD_NETS: [Option<NetId>; 3] = [NEAR_NET, FAR_NET, OTHER_LAYER_NET];
@@ -270,6 +293,19 @@ fn assert_node_is_clear(world: &World, node: NodeId) {
           .check_colliding_line(node, &line, &rules(), &options)
           .is_none(),
         "a track on net {net:?} still collides after the shove"
+      );
+    }
+
+    // A via is checked the same way, as a line that carries nothing else.
+    for via in world.all_items_in_net(node, net, Kind::VIA) {
+      let item = world.item(via).expect("the node listed it");
+      let line = Line::from_linked_via(via, item);
+
+      assert!(
+        world
+          .check_colliding_line(node, &line, &rules(), &options)
+          .is_none(),
+        "a via on net {net:?} still collides after the shove"
       );
     }
   }
@@ -410,9 +446,10 @@ fn a_track_the_shove_may_not_move_leaves_the_run_incomplete() {
 
   shove.add_head_line(pushing_head(), ShovePolicy::SHOVE);
 
-  // A locked segment may not be pushed (`pns_shove.cpp:647`). KiCad
-  // escalates that to a walkaround around the obstacle, which is part 2,
-  // so here the run simply gives up.
+  // A locked segment may not be pushed (`pns_shove.cpp:647`), so the
+  // shove escalates to walking the head around it (`:1826`). This track
+  // reaches well past both ends of the head, so there is nothing to walk
+  // round and the run gives up.
   assert_eq!(shove.run(&mut world, &context), ShoveStatus::Incomplete);
 
   // The failed run left the world exactly as it was.
@@ -616,4 +653,376 @@ fn two_identical_runs_produce_identical_worlds() {
   };
 
   assert_eq!(run(), run());
+}
+
+// ---------------------------------------------------------------------
+// Solids
+// ---------------------------------------------------------------------
+
+/// The half width of the square pad the solid scenarios use.
+const PAD_HALF: i32 = 300000;
+
+/// The net the pad is on, which is nobody else's.
+const PAD_NET: Option<NetId> = Some(NetId(5));
+
+/// The via's net, so that it is neither the head's nor a track's.
+const VIA_NET: Option<NetId> = Some(NetId(6));
+
+/// The diameter of every via a scenario places.
+const VIA_DIAMETER: i32 = 400000;
+
+/// The drill of every via a scenario places.
+const VIA_DRILL: i32 = 200000;
+
+/// Put a square pad into a node and answer its handle.
+fn add_pad(world: &mut World, node: NodeId, at: Vec2) -> ItemId {
+  let shape = Shape::rect(
+    at - Vec2::new(PAD_HALF, PAD_HALF),
+    Vec2::new(PAD_HALF * 2, PAD_HALF * 2),
+  );
+  let mut item = world.make_item(ItemBody::Solid(Solid::new(shape, at)));
+
+  item.set_layers_and_flash_all(LayerRange::single(0));
+  item.set_net(PAD_NET);
+
+  world.add_solid(node, item, None)
+}
+
+/// Put a through via into a node and answer its handle.
+fn add_via(
+  world: &mut World,
+  node: NodeId,
+  at: Vec2,
+  net: Option<NetId>,
+) -> ItemId {
+  let body =
+    ItemBody::Via(Via::new(at, VIA_DIAMETER, VIA_DRILL, ViaType::Through));
+  let mut item = world.make_item(body);
+
+  item.set_layers_and_flash_all(LayerRange::new(0, 1));
+  item.set_net(net);
+
+  world.add_via(node, item)
+}
+
+/// Where a via of one net sits in a node.
+fn via_pos(world: &World, node: NodeId, net: Option<NetId>) -> Option<Vec2> {
+  let vias = world.all_items_in_net(node, net, Kind::VIA);
+  let first = *vias.first()?;
+
+  match world.item(first)?.body() {
+    ItemBody::Via(body) => Some(body.pos()),
+    _ => None,
+  }
+}
+
+#[test]
+fn a_head_walks_around_a_pad_it_cannot_shove() {
+  let mut world = build(&[other_layer_track()]);
+  let root = world.root();
+  // A pad squarely on the head's path, which no shove can move.
+  add_pad(&mut world, root, Vec2::new(1500000, 0));
+
+  let settings = RoutingSettings::default();
+  let resolver = rules();
+  let context = AlgoContext::new(&resolver, &settings);
+  let head = pushing_head();
+  let mut shove = Shove::new(root);
+
+  shove.add_head_line(head.clone(), ShovePolicy::SHOVE);
+
+  assert_eq!(shove.run(&mut world, &context), ShoveStatus::Ok);
+
+  // A solid is never moved: the head is what gave way
+  // (`pns_shove.cpp:776`).
+  assert!(shove.heads_modified(None));
+
+  let walked = shove
+    .modified_head(0)
+    .expect("the head was re-routed around the pad")
+    .clone();
+
+  assert_eq!(walked.point(0), head.point(0));
+  assert_eq!(walked.last_point(), head.last_point());
+  assert!(walked.point_count() > head.point_count());
+
+  let node = shove.current_node();
+
+  assert_line_is_clear(&world, node, &walked);
+  assert_node_is_clear(&world, node);
+}
+
+#[test]
+fn a_locked_track_escalates_to_a_walkaround() {
+  // `pns_shove.cpp:647` answers `SH_TRY_WALK` for a locked track and
+  // `:1826` turns that into `onCollidingSolid`, so the head walks around
+  // what it may not push. The track is short, because a locked track that
+  // reaches past both ends of the head has no way round it and the
+  // escalation then fails for a geometric reason rather than a structural
+  // one.
+  let mut world = build(&[stub_track()]);
+  let root = world.root();
+
+  for segment in segments_of(&world, root, NEAR_NET) {
+    world
+      .item_mut(segment)
+      .expect("the track was just added")
+      .mark(MarkerFlags::LOCKED);
+  }
+
+  let settings = RoutingSettings::default();
+  let resolver = rules();
+  let context = AlgoContext::new(&resolver, &settings);
+  let before = shape_of(&world, root, NEAR_NET);
+  let head = pushing_head();
+  let mut shove = Shove::new(root);
+
+  shove.add_head_line(head.clone(), ShovePolicy::SHOVE);
+
+  assert_eq!(shove.run(&mut world, &context), ShoveStatus::Ok);
+
+  let node = shove.current_node();
+
+  // The locked track did not move, and the head did.
+  assert_eq!(shape_of(&world, node, NEAR_NET), before);
+  assert!(shove.heads_modified(None));
+
+  let walked = shove
+    .modified_head(0)
+    .expect("the head was re-routed around the locked track")
+    .clone();
+
+  assert_eq!(walked.point(0), head.point(0));
+  assert_eq!(walked.last_point(), head.last_point());
+  assert_line_is_clear(&world, node, &walked);
+  assert_node_is_clear(&world, node);
+}
+
+// ---------------------------------------------------------------------
+// Vias
+// ---------------------------------------------------------------------
+
+#[test]
+fn a_head_pushes_a_stitching_via_aside() {
+  let mut world = build(&[other_layer_track()]);
+  let root = world.root();
+  // A via straddling the head's path, close enough to have to move.
+  let at = Vec2::new(1500000, 200000);
+
+  add_via(&mut world, root, at, VIA_NET);
+
+  let settings = RoutingSettings::default();
+  let resolver = rules();
+  let context = AlgoContext::new(&resolver, &settings);
+  let head = pushing_head();
+  let mut shove = Shove::new(root);
+
+  shove.add_head_line(head.clone(), ShovePolicy::SHOVE);
+
+  assert_eq!(shove.run(&mut world, &context), ShoveStatus::Ok);
+
+  let node = shove.current_node();
+  let after =
+    via_pos(&world, node, VIA_NET).expect("the via is still on the board");
+
+  assert_ne!(after, at);
+  // It was pushed away from the head, which runs along y = 0.
+  assert!(after.y > at.y);
+  assert_line_is_clear(&world, node, &head);
+  assert_node_is_clear(&world, node);
+}
+
+#[test]
+fn a_via_the_settings_forbid_moving_makes_the_head_walk_around_it() {
+  let mut world = build(&[]);
+  let root = world.root();
+  let at = Vec2::new(1500000, 200000);
+
+  add_via(&mut world, root, at, VIA_NET);
+
+  // `pns_shove.cpp:1060`: with vias frozen every via collision degrades
+  // to `SH_TRY_WALK`, so the head walks around instead.
+  let settings = RoutingSettings {
+    shove_vias: false,
+    ..RoutingSettings::default()
+  };
+  let resolver = rules();
+  let context = AlgoContext::new(&resolver, &settings);
+  let head = pushing_head();
+  let mut shove = Shove::new(root);
+
+  shove.add_head_line(head.clone(), ShovePolicy::SHOVE);
+
+  assert_eq!(shove.run(&mut world, &context), ShoveStatus::Ok);
+
+  let node = shove.current_node();
+
+  assert_eq!(via_pos(&world, node, VIA_NET), Some(at));
+  assert!(shove.heads_modified(None));
+
+  let walked = shove
+    .modified_head(0)
+    .expect("the head was re-routed around the frozen via")
+    .clone();
+
+  assert_line_is_clear(&world, node, &walked);
+  assert_node_is_clear(&world, node);
+}
+
+#[test]
+fn a_via_that_cannot_move_at_all_leaves_the_run_incomplete() {
+  let mut world = build(&[]);
+  let root = world.root();
+  let at = Vec2::new(1500000, 0);
+  let via = add_via(&mut world, root, at, VIA_NET);
+
+  // A locked via answers `SH_TRY_WALK` (`pns_shove.cpp:1060`), and the
+  // pads on either side leave the walkaround nowhere to go, so the run
+  // gives up and the world is untouched.
+  world
+    .item_mut(via)
+    .expect("the via was just added")
+    .mark(MarkerFlags::LOCKED);
+  add_pad(&mut world, root, Vec2::new(1500000, -700000));
+  add_pad(&mut world, root, Vec2::new(1500000, 700000));
+
+  let settings = RoutingSettings::default();
+  let resolver = rules();
+  let context = AlgoContext::new(&resolver, &settings);
+  let mut shove = Shove::new(root);
+
+  shove.add_head_line(pushing_head(), ShovePolicy::SHOVE);
+
+  assert_eq!(shove.run(&mut world, &context), ShoveStatus::Incomplete);
+  assert_eq!(shove.current_node(), root);
+  assert_eq!(via_pos(&world, root, VIA_NET), Some(at));
+}
+
+#[test]
+fn a_pushed_via_drags_the_track_hanging_off_it() {
+  let mut world = build(&[]);
+  let root = world.root();
+  let at = Vec2::new(1500000, 200000);
+
+  add_via(&mut world, root, at, VIA_NET);
+
+  // One track running north out of the via, on the via's net, so that the
+  // fanout drag has something to carry (`pns_shove.cpp:1081`).
+  let tail = Seg::new(at, Vec2::new(1500000, 2000000));
+  let mut item =
+    world.make_item(ItemBody::Segment(Segment::new(tail, TRACK_WIDTH)));
+
+  item.set_layers_and_flash_all(LayerRange::single(0));
+  item.set_net(VIA_NET);
+  world
+    .add_segment(root, item, false)
+    .expect("the fanout track is neither degenerate nor redundant");
+
+  let settings = RoutingSettings::default();
+  let resolver = rules();
+  let context = AlgoContext::new(&resolver, &settings);
+  let head = pushing_head();
+  let mut shove = Shove::new(root);
+
+  shove.add_head_line(head.clone(), ShovePolicy::SHOVE);
+
+  assert_eq!(shove.run(&mut world, &context), ShoveStatus::Ok);
+
+  let node = shove.current_node();
+  let after =
+    via_pos(&world, node, VIA_NET).expect("the via is still on the board");
+
+  assert_ne!(after, at);
+
+  // The track followed the via: its via end sits where the via now is,
+  // and its far end did not move.
+  let track = track_of(&world, node, VIA_NET);
+  let ends = [track.point(0), track.last_point().expect("two ends")];
+
+  assert!(
+    ends.contains(&after),
+    "the dragged track {ends:?} does not reach the via at {after:?}"
+  );
+  assert!(ends.contains(&Vec2::new(1500000, 2000000)));
+  assert_line_is_clear(&world, node, &head);
+  assert_node_is_clear(&world, node);
+}
+
+#[test]
+fn a_head_that_ends_with_a_via_pushes_a_track_on_the_other_layer() {
+  // The via head path: the head's own via is stored in the shove's branch
+  // (`pns_shove.cpp:2505`) and hulled as part of the pusher (`:601`), so
+  // a track on the layer the head does not run on still gets out of its
+  // way.
+  let mut world = build(&[other_layer_track()]);
+  let root = world.root();
+  let settings = RoutingSettings::default();
+  let resolver = rules();
+  let context = AlgoContext::new(&resolver, &settings);
+  let before = shape_of(&world, root, OTHER_LAYER_NET);
+
+  // A head on layer 0 that ends over the layer 1 track with a via.
+  let mut head = head(&[Vec2::new(0, -2000000), Vec2::new(1500000, -500000)]);
+  let mut via = world.make_item(ItemBody::Via(Via::new(
+    Vec2::new(1500000, -500000),
+    VIA_DIAMETER,
+    VIA_DRILL,
+    ViaType::Through,
+  )));
+
+  via.set_layers_and_flash_all(LayerRange::new(0, 1));
+  via.set_net(HEAD_NET);
+  head.append_via(via);
+
+  // The via really does stand in the layer 1 track's way once it is put
+  // where the head ends.
+  let mut shove = Shove::new(root);
+
+  shove.add_head_line(head.clone(), ShovePolicy::SHOVE);
+
+  let status = shove.run(&mut world, &context);
+  let node = shove.current_node();
+
+  assert_eq!(status, ShoveStatus::Ok);
+  // Nothing on layer 1 was in the way at that height, so the run is a
+  // clean no op; what matters is that a via head does not fail.
+  assert_eq!(shape_of(&world, node, OTHER_LAYER_NET), before);
+  assert_node_is_clear(&world, node);
+  // The head's via was taken back out of the node with the head.
+  assert!(world.all_items_in_net(node, HEAD_NET, Kind::VIA).is_empty());
+}
+
+#[test]
+fn a_via_drag_head_moves_the_via_and_reports_its_new_handle() {
+  let mut world = build(&[]);
+  let root = world.root();
+  let at = Vec2::new(1500000, 0);
+  let via = add_via(&mut world, root, at, VIA_NET);
+  let handle = ViaHandle::of(&world, via).expect("the via was just added");
+
+  let settings = RoutingSettings::default();
+  let resolver = rules();
+  let context = AlgoContext::new(&resolver, &settings);
+  let target = Vec2::new(2500000, 0);
+  let mut shove = Shove::new(root);
+
+  // `AddHeads( VIA_HANDLE, VECTOR2I, int )`, `pns_shove.cpp:2261`.
+  shove.add_head_via(handle, target, ShovePolicy::SHOVE);
+
+  assert_eq!(shove.run(&mut world, &context), ShoveStatus::Ok);
+
+  let node = shove.current_node();
+  let moved = shove.head_via(0).expect("the drag reports a handle");
+
+  assert_eq!(moved.pos, target);
+  assert_eq!(via_pos(&world, node, VIA_NET), Some(target));
+  // The handle resolves in the node the shove handed back, and it names a
+  // **different** item: a shove moves a via by replacing it, which is the
+  // whole reason the caller is handed a handle and not an item id.
+  let resolved = world
+    .find_via_by_handle(node, moved.pos, moved.layers, moved.net)
+    .expect("the handle resolves in the node the shove handed back");
+
+  assert_ne!(resolved, via);
+  assert_node_is_clear(&world, node);
 }

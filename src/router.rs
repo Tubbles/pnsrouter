@@ -71,7 +71,7 @@ use crate::line::Line;
 use crate::node::{NodeId, World};
 use crate::placer::line_placer::LinePlacer;
 use crate::rules::{ItemRef, RuleResolver};
-use crate::settings::{RouterMode, RoutingSettings, Sizes};
+use crate::settings::{RoutingSettings, Sizes};
 use crate::snapshot::{HostIndex, WorldSnapshot};
 use crate::topology;
 
@@ -122,16 +122,6 @@ pub enum StartError {
   /// never starts twice, and `ContinueFromEnd` commits before restarting
   /// (`pcbnew/router/pns_router.cpp:633`).
   AlreadyRouting,
-
-  /// The shove is not implemented yet.
-  ///
-  /// `TODO(milestone 4)`: `RouterMode::Shove` is accepted by the settings
-  /// and by every algorithm, and the placer falls back to the walkaround
-  /// for its head (note 03 section 9.6). Starting a session in that mode
-  /// would therefore route without ever pushing anything, which is worse
-  /// than refusing, so the facade refuses until
-  /// `pcbnew/router/pns_shove.cpp` is ported.
-  ShoveNotAvailable,
 
   /// The host named a start object the snapshot does not describe.
   UnknownStartItem(HostId),
@@ -975,12 +965,6 @@ impl Router {
 
     if self.routing_in_progress() {
       return Err(StartError::AlreadyRouting);
-    }
-
-    // TODO(milestone 4): `pcbnew/router/pns_shove.cpp`. See
-    // `StartError::ShoveNotAvailable`.
-    if self.settings.mode == RouterMode::Shove {
-      return Err(StartError::ShoveNotAvailable);
     }
 
     let root = self.world.root();

@@ -280,15 +280,27 @@ fn a_start_on_a_pad_puts_the_session_into_route_track() {
 }
 
 #[test]
-fn shove_mode_is_accepted_by_the_settings_and_refused_by_a_start() {
+fn shove_mode_routes_and_commits_through_the_facade() {
   let mut router = router_in(RouterMode::Shove);
 
   assert_eq!(router.settings().mode, RouterMode::Shove);
-  assert_eq!(
-    router.start_routing(START, Some(START_PAD), 0),
-    Err(StartError::ShoveNotAvailable)
-  );
+
+  router
+    .start_routing(START, Some(START_PAD), 0)
+    .expect("shove mode starts a session like the other modes");
+  assert_eq!(router.state(), RouterState::RouteTrack);
+  router.abort_routing();
   assert_eq!(router.state(), RouterState::Idle);
+
+  let mut router = router_in(RouterMode::Shove);
+  let diff = route_across(&mut router);
+
+  assert!(added_segments(&diff) > 0);
+  assert_eq!(router.state(), RouterState::Idle);
+  assert_eq!(
+    committed_segments(&router, TRACE_NET),
+    added_segments(&diff)
+  );
 }
 
 #[test]

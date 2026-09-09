@@ -39,3 +39,11 @@ Deferred during milestone 3 (walkaround router):
 - The dead pad orientation and last segment postures of `LINE_PLACER::Start` (`pns_line_placer.cpp:1408`, `:1415`) are not computed; wiring them into `SetDefaultDirections` is a routing change that needs a fixture.
 - `LINE_PLACER::AbortPlacement` (`pns_line_placer.cpp:2150`) has no caller and is not ported.
 - The via pushout keeps KiCad's discarded `force.Resize( threshold )` (`pns_via.cpp:207`); capping the step is a behaviour change to decide with a shove fixture.
+
+Deferred during milestone 4 (shove):
+
+- The via anti snap loop in `src/shove.rs` is bounded at 1000 iterations and returns `Incomplete`; KiCad's is unbounded. Revisit if a fixture needs more.
+- `World::collide_lines` (`src/node.rs`) does not decompose a via on the obstacle side; every shove call site keeps the via carrying line on the head side. Needed only if a future caller collides two via ended lines.
+- `ShoveDraggingVia` is declared and never defined in KiCad; the dragger milestone decides whether it exists at all.
+- `reduceSpringback` keeps its bottom frame (`pns_shove.cpp:926`), so the first move's shove is sticky within a session; reproduced, worth a look with a real board fixture.
+- Arcs throughout the shove are marked `TODO(arcs)`.

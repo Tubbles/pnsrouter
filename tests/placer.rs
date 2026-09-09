@@ -1318,3 +1318,369 @@ fn the_two_layer_route_is_the_same_twice() {
     assert_eq!(first.1.len(), 1);
   }
 }
+
+// ---------------------------------------------------------------------
+// The milestone 4 exit criterion
+// ---------------------------------------------------------------------
+
+/// The radius of the two pads the shove route runs between.
+///
+/// Deliberately small: the pads have to stay clear of tracks that the
+/// **head** is close enough to push, and a pad is never shoved, so a
+/// route that starts inside a violation could never be fixed.
+const SHOVE_PAD_RADIUS: i32 = 50_000;
+
+/// Where the shove route starts.
+const SHOVE_START: Vec2 = Vec2::new(0, 0);
+
+/// Where the shove route ends.
+const SHOVE_TARGET: Vec2 = Vec2::new(8_000_000, 0);
+
+/// A cursor short of everything the route has to push, which is what the
+/// springback step retreats to.
+const SHOVE_RETREAT: Vec2 = Vec2::new(2_000_000, 0);
+
+/// The net of the track running nearest the route.
+const NEAR_TRACK_NET: Option<NetId> = Some(NetId(4));
+
+/// The net of the track beyond it, which only moves once the near one has
+/// been pushed into it.
+const FAR_TRACK_NET: Option<NetId> = Some(NetId(5));
+
+/// The net of the via the route pushes aside.
+const SHOVE_VIA_NET: Option<NetId> = Some(NetId(6));
+
+/// The net of the track on layer 1, which nothing may disturb.
+const OTHER_LAYER_TRACK_NET: Option<NetId> = Some(NetId(7));
+
+/// The corners of the track running nearest the route.
+const NEAR_TRACK: [Vec2; 2] = [
+  Vec2::new(-1_000_000, 260_000),
+  Vec2::new(9_000_000, 260_000),
+];
+
+/// The corners of the track beyond it.
+const FAR_TRACK: [Vec2; 2] = [
+  Vec2::new(-1_500_000, 560_000),
+  Vec2::new(9_500_000, 560_000),
+];
+
+/// The corners of the track on layer 1.
+const OTHER_LAYER_TRACK: [Vec2; 2] =
+  [Vec2::new(0, -2_500_000), Vec2::new(8_000_000, -2_500_000)];
+
+/// Where the via the route has to push sits before anything happens.
+const SHOVE_VIA: Vec2 = Vec2::new(4_000_000, -300_000);
+
+/// The diameter of that via.
+const SHOVE_VIA_DIAMETER: i32 = 400_000;
+
+/// Its drill.
+const SHOVE_VIA_DRILL: i32 = 200_000;
+
+/// The board the shove scenarios run on.
+struct ShoveBoard {
+  /// The pad the route starts on.
+  start_pad: ItemId,
+  /// The pad the route ends on.
+  target_pad: ItemId,
+}
+
+/// A two layer board with two parallel tracks and a via in the way.
+///
+/// The tracks reach past both ends of the route, so their own endpoints
+/// are outside everything the head can push against; that is what lets
+/// the shove bend them without having to move an endpoint, which
+/// `shoveLineToHullSet` refuses to do
+/// (`pcbnew/router/pns_shove.cpp:455`).
+fn build_shove_board() -> (World, ShoveBoard) {
+  let mut world = World::new(World::DEFAULT_MAX_CLEARANCE);
+  let root = world.root();
+  let add_pad = |world: &mut World, at: Vec2, net| {
+    let body =
+      ItemBody::Solid(Solid::new(Shape::circle(at, SHOVE_PAD_RADIUS), at));
+    let mut item = world.make_item(body);
+
+    item.set_layers_and_flash_all(LayerRange::single(0));
+    item.set_net(net);
+
+    world.add_solid(root, item, None)
+  };
+
+  let start_pad = add_pad(&mut world, SHOVE_START, TRACE_NET);
+  let target_pad = add_pad(&mut world, SHOVE_TARGET, TRACE_NET);
+
+  let add_track = |world: &mut World, ends: [Vec2; 2], layer, net| {
+    let body = ItemBody::Segment(pnsrouter::item::Segment::new(
+      pnsrouter::geometry::seg::Seg::new(ends[0], ends[1]),
+      TRACK_WIDTH,
+    ));
+    let mut item = world.make_item(body);
+
+    item.set_layers_and_flash_all(LayerRange::single(layer));
+    item.set_net(net);
+    world
+      .add_segment(root, item, false)
+      .expect("a board track is neither degenerate nor redundant");
+  };
+
+  add_track(&mut world, NEAR_TRACK, 0, NEAR_TRACK_NET);
+  add_track(&mut world, FAR_TRACK, 0, FAR_TRACK_NET);
+  add_track(&mut world, OTHER_LAYER_TRACK, 1, OTHER_LAYER_TRACK_NET);
+
+  let body = ItemBody::Via(pnsrouter::item::Via::new(
+    SHOVE_VIA,
+    SHOVE_VIA_DIAMETER,
+    SHOVE_VIA_DRILL,
+    pnsrouter::item::ViaType::Through,
+  ));
+  let mut via = world.make_item(body);
+
+  via.set_layers_and_flash_all(LayerRange::new(0, 1));
+  via.set_net(SHOVE_VIA_NET);
+  world.add_via(root, via);
+
+  (
+    world,
+    ShoveBoard {
+      start_pad,
+      target_pad,
+    },
+  )
+}
+
+/// The corners of one net's track in a node.
+fn track_shape(world: &World, node: NodeId, net: Option<NetId>) -> Vec<Vec2> {
+  let segments = world.all_items_in_net(node, net, Kind::SEGMENT);
+  let first = *segments.first().expect("the net has at least one segment");
+
+  world
+    .assemble_line(node, first, None, false, false, true)
+    .shape()
+    .points()
+    .to_vec()
+}
+
+/// Where one net's via sits in a node.
+fn via_position(
+  world: &World,
+  node: NodeId,
+  net: Option<NetId>,
+) -> Option<Vec2> {
+  let vias = world.all_items_in_net(node, net, Kind::VIA);
+
+  world.item(*vias.first()?).map(|item| item.anchor(0))
+}
+
+/// Every net the shove board holds.
+const SHOVE_BOARD_NETS: [Option<NetId>; 5] = [
+  TRACE_NET,
+  NEAR_TRACK_NET,
+  FAR_TRACK_NET,
+  SHOVE_VIA_NET,
+  OTHER_LAYER_TRACK_NET,
+];
+
+/// Fail when anything a node holds collides with anything else.
+fn assert_shove_node_is_clear(
+  world: &World,
+  node: NodeId,
+  rules: &FixedClearance,
+) {
+  let options = CollisionSearchOptions::default();
+
+  for net in SHOVE_BOARD_NETS {
+    for id in world.all_items_in_net(node, net, Kind::SEGMENT) {
+      let line = Line::from_segment(world, node, id)
+        .expect("the node listed the segment");
+
+      assert!(
+        world
+          .check_colliding_line(node, &line, rules, &options)
+          .is_none(),
+        "a track on net {net:?} collides"
+      );
+    }
+
+    for id in world.all_items_in_net(node, net, Kind::VIA) {
+      let item = world.item(id).expect("the node listed the via");
+      let line = Line::from_linked_via(id, item);
+
+      assert!(
+        world
+          .check_colliding_line(node, &line, rules, &options)
+          .is_none(),
+        "a via on net {net:?} collides"
+      );
+    }
+  }
+}
+
+/// Route the shove board end to end and commit, answering the world.
+///
+/// The move to [`SHOVE_RETREAT`] in the middle is the springback step:
+/// the frame the long move pushed is no longer in any head's way, so
+/// `reduceSpringback` drops it and the board comes back
+/// (`pcbnew/router/pns_shove.cpp:924`).
+fn route_the_shove_board() -> World {
+  let (mut world, board) = build_shove_board();
+  let rules = rules();
+  let settings = RoutingSettings {
+    fix_all_segments: true,
+    ..settings_for(RouterMode::Shove)
+  };
+  let context = AlgoContext::new(&rules, &settings);
+  let mut placer = placer_for(&world, &settings);
+
+  assert!(placer.start(
+    &mut world,
+    &context,
+    SHOVE_START,
+    Some(board.start_pad)
+  ));
+
+  // A first short move, so that the springback stack has a frame below
+  // the one the long move pushes: `reduceSpringback` never drops its
+  // bottom frame (`pns_shove.cpp:926`), so what springback can undo is
+  // everything above this state and not the state itself.
+  assert!(placer.move_to(&mut world, &context, SHOVE_RETREAT, None));
+
+  let short = placer.current_node(false);
+  let near_short = track_shape(&world, short, NEAR_TRACK_NET);
+  let far_short = track_shape(&world, short, FAR_TRACK_NET);
+
+  assert_eq!(
+    via_position(&world, short, SHOVE_VIA_NET),
+    Some(SHOVE_VIA),
+    "the short move should not have reached the via"
+  );
+
+  // The long move pushes both tracks and the via aside.
+  assert!(placer.move_to(&mut world, &context, SHOVE_TARGET, None));
+
+  let pushed = placer.current_node(false);
+  let near_pushed = track_shape(&world, pushed, NEAR_TRACK_NET);
+  let via_pushed = via_position(&world, pushed, SHOVE_VIA_NET);
+
+  assert_ne!(near_pushed, near_short, "the near track never moved");
+  assert_ne!(via_pushed, Some(SHOVE_VIA), "the via never moved");
+  assert_ne!(
+    track_shape(&world, pushed, FAR_TRACK_NET),
+    far_short,
+    "the far track never moved"
+  );
+  assert_shove_node_is_clear(&world, pushed, &rules);
+
+  // The cursor retreats: the frame the long move pushed stands in
+  // nothing's way any more, so it is dropped and the board comes back to
+  // exactly what the short move had left.
+  assert!(placer.move_to(&mut world, &context, SHOVE_RETREAT, None));
+
+  let sprung = placer.current_node(false);
+
+  assert_eq!(
+    via_position(&world, sprung, SHOVE_VIA_NET),
+    Some(SHOVE_VIA),
+    "the via did not spring back"
+  );
+  assert_eq!(
+    track_shape(&world, sprung, FAR_TRACK_NET),
+    far_short,
+    "the far track did not spring back"
+  );
+  assert_eq!(
+    track_shape(&world, sprung, NEAR_TRACK_NET),
+    near_short,
+    "the near track did not spring back"
+  );
+
+  // And then the route is finished for real.
+  assert!(placer.move_to(
+    &mut world,
+    &context,
+    SHOVE_TARGET,
+    Some(board.target_pad)
+  ));
+  assert!(placer.fix_route(
+    &mut world,
+    &context,
+    SHOVE_TARGET,
+    Some(board.target_pad),
+    true
+  ));
+  assert!(placer.has_placed_anything());
+  assert!(placer.commit_placement(&mut world));
+
+  world
+}
+
+/// The committed board as plain comparable data.
+fn committed_shove_board(world: &World) -> Vec<(Option<NetId>, Vec<Vec2>)> {
+  let root = world.root();
+  let mut rows: Vec<(Option<NetId>, Vec<Vec2>)> = Vec::new();
+
+  for net in SHOVE_BOARD_NETS {
+    let mut segments: Vec<Vec2> = world
+      .all_items_in_net(root, net, Kind::SEGMENT)
+      .into_iter()
+      .filter_map(|id| Line::from_segment(world, root, id))
+      .flat_map(|line| [line.point(0), line.point(1)])
+      .collect();
+
+    segments.sort_by_key(|point| (point.x, point.y));
+    rows.push((net, segments));
+
+    let mut vias: Vec<Vec2> = world
+      .all_items_in_net(root, net, Kind::VIA)
+      .into_iter()
+      .filter_map(|id| world.item(id).map(|item| item.anchor(0)))
+      .collect();
+
+    vias.sort_by_key(|point| (point.x, point.y));
+    rows.push((net, vias));
+  }
+
+  rows
+}
+
+#[test]
+fn a_shove_route_pushes_two_tracks_and_a_via_and_commits_clear() {
+  let world = route_the_shove_board();
+  let rules = rules();
+  let root = world.root();
+
+  // The route reached the far pad.
+  let routed = stored_segments(&world, root, TRACE_NET);
+
+  assert!(!routed.is_empty(), "nothing was committed");
+  assert!(
+    touches(&routed.iter().collect::<Vec<_>>(), SHOVE_START),
+    "the committed route does not start on the start pad"
+  );
+  assert!(
+    touches(&routed.iter().collect::<Vec<_>>(), SHOVE_TARGET),
+    "the committed route does not reach the target pad"
+  );
+
+  // The obstacles ended up somewhere else, and everything is clear.
+  assert_ne!(
+    track_shape(&world, root, NEAR_TRACK_NET),
+    NEAR_TRACK.to_vec()
+  );
+  assert_ne!(track_shape(&world, root, FAR_TRACK_NET), FAR_TRACK.to_vec());
+  assert_ne!(via_position(&world, root, SHOVE_VIA_NET), Some(SHOVE_VIA));
+  // The layer 1 track was never in anything's way.
+  assert_eq!(
+    track_shape(&world, root, OTHER_LAYER_TRACK_NET),
+    OTHER_LAYER_TRACK.to_vec()
+  );
+  assert_shove_node_is_clear(&world, root, &rules);
+}
+
+#[test]
+fn the_shove_route_is_the_same_twice() {
+  let first = committed_shove_board(&route_the_shove_board());
+  let second = committed_shove_board(&route_the_shove_board());
+
+  assert_eq!(first, second, "two identical shove runs disagreed");
+}

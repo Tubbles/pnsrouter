@@ -61,11 +61,21 @@
 //! `ContinueFromEnd` and `Finish` are host level commands that live on
 //! KiCad's router rather than on its placer
 //! (`pcbnew/router/pns_router.cpp:579`, `:624`), so they arrive with the
-//! session facade of milestone 5, and so does the leading ratline, which
-//! needs `TOPOLOGY::NearestUnconnectedItem`. Shove mode falls back to the
-//! walkaround with a `TODO(milestone 4)`, because
-//! [`crate::settings::RouterMode::Shove`] needs the shove engine that
-//! milestone 4 brings.
+//! session facade of milestone 5.
+//!
+//! # Shove mode
+//!
+//! The placer owns a [`crate::shove::Shove`] built over a branch of the
+//! placement node ([`LinePlacer::start`],
+//! `pcbnew/router/pns_line_placer.cpp:1478`), and shove mode routes its
+//! head through [`Placing::rh_shove_only`]. The shove owns a stack of
+//! branches, so the node the placer routes against is the shove's rather
+//! than its own from the first move onwards; that handoff is note 03
+//! section 9.3 and it is why [`Placing::route_head`] answers with a node
+//! as well as with two lines. Every fix pins the world it wrote into
+//! ([`crate::shove::Shove::add_locked_springback_node`]), an undo rewinds
+//! the springback to the stage it restores, and the commit takes the last
+//! locked frame.
 
 use std::collections::BTreeSet;
 
@@ -85,6 +95,7 @@ use crate::optimizer::{EffortFlags, Optimizer};
 use crate::placer::fixed_tail::FixedTail;
 use crate::rules::{ItemRef, RuleResolver};
 use crate::settings::{OptimizerEffort, RouterMode, RoutingSettings, Sizes};
+use crate::shove::{Shove, ShovePolicy, ShoveStatus};
 use crate::topology;
 use crate::walkaround::{WalkPolicy, Walkaround, WalkaroundStatus};
 
@@ -1235,19 +1246,18 @@ impl Placing {
             .map_or(i32::MAX, |point| (at - point).euclidean_norm())
         });
 
-        // :696
-        if distance_cw < distance_ccw
-          && let Some(chain) = clipped_cw
-        {
-          walk_point = chain.last_point().unwrap_or(walk_point);
-          walk_full.set_shape(chain);
-        } else if let Some(chain) = clipped_ccw {
-          walk_point = chain.last_point().unwrap_or(walk_point);
-          walk_full.set_shape(chain);
+        // :696 to :709. A clockwise clip with the smaller distance wins,
+        // otherwise the counter clockwise one, and neither means the walk
+        // failed. `distance_cw` is `i32::MAX` whenever `clipped_cw` is
+        // absent, so the comparison never selects a missing clip.
+        let chain = if distance_cw < distance_ccw {
+          clipped_cw
         } else {
-          // :709
-          return None;
-        }
+          clipped_ccw
+        }?;
+
+        walk_point = chain.last_point().unwrap_or(walk_point);
+        walk_full.set_shape(chain);
       }
 
       // :713
@@ -1395,6 +1405,135 @@ impl Placing {
     Some((new_head, new_tail))
   }
 
+  /// The shove mode head routine.
+  ///
+  /// Port of `rhShoveOnly`,
+  /// `pcbnew/router/pns_line_placer.cpp:921`. The head is first walked
+  /// around **solids only**, because a pad can never be shoved, and the
+  /// result is handed to the shove as its single head. On failure the
+  /// whole move degrades to the walkaround (`:1013`), which is why shove
+  /// mode never gets stuck where walkaround mode would not.
+  ///
+  /// # The node handoff
+  ///
+  /// Note 03 section 9.3. The shove owns a stack of branches and hands
+  /// back whichever one the caller should stand on now, and KiCad reads
+  /// that twice: once before the run (`:930`), because springback may
+  /// already have dropped frames on a previous move, and once after
+  /// (`:963`), because a successful run has just pushed a new one. Both
+  /// reads happen here and the second node travels back to
+  /// [`LinePlacer::move_to`] with the two lines.
+  ///
+  /// The end item is pinned before the run (`:935`): the placer holds an
+  /// item that lives in one of the shove's nodes, and springback dropping
+  /// that node left KiCad using freed memory. With no end item the pin is
+  /// cleared again (`:944`), so springback can roll back past a frame an
+  /// earlier obstacle touch pinned.
+  ///
+  /// # Deviation: the via after the split
+  ///
+  /// KiCad re-appends `newHead.Via()` at `:1003`, which is a pointer into
+  /// the node `removeHeads` has just emptied. Here the via is rebuilt at
+  /// the shoved head's last point instead, which is the same geometry
+  /// with no stale handle: a head is the pusher at
+  /// [`crate::shove::HEAD_RANK`], so nothing outranks it and the shove
+  /// leaves its via where the placer put it.
+  pub fn rh_shove_only(
+    &mut self,
+    world: &mut World,
+    context: &AlgoContext<'_>,
+    shove: &mut Shove,
+    node: NodeId,
+    at: Vec2,
+  ) -> Option<(Line, Line, NodeId)> {
+    // :927. Solids only: the shove moves everything else itself.
+    let (walk_solids, via_ok) = self.rh_walk_base(
+      world,
+      context,
+      node,
+      at,
+      Kind::SOLID,
+      RouterMode::Shove,
+    )?;
+
+    // :930. The first of the two node handoffs (note 03 section 9.3):
+    // springback may have dropped frames during an earlier move, so the
+    // placer is re-pointed before the run rather than only after it.
+    // Nothing between here and `:963` reads it, so all it really asserts
+    // is that the shove is standing somewhere live.
+    let mut node = shove.current_node();
+
+    debug_assert!(
+      world.node(node).is_some(),
+      "the shove stands on a live node"
+    );
+
+    // :935 and :944.
+    shove.set_pinned_node(self.end_item.and_then(|id| world.home_of(id)));
+
+    let mut new_head = walk_solids;
+
+    // :952
+    if self.placing_via
+      && via_ok
+      && let Some(last) = new_head.last_point()
+    {
+      let via = self.make_via(world, last);
+
+      new_head.append_via(via);
+    }
+
+    // :958
+    shove.clear_heads();
+    shove.add_head_line(new_head.clone(), ShovePolicy::SHOVE);
+
+    let shove_ok = shove.run(world, context) == ShoveStatus::Ok;
+
+    // :963
+    node = shove.current_node();
+
+    // :967 to :987, the same expression `rh_walk_only` uses.
+    let effort = self.optimizer_effort(context);
+
+    // :1013
+    if !shove_ok {
+      return self
+        .rh_walk_only(world, context, node, at)
+        .map(|(head, tail)| (head, tail, node));
+    }
+
+    // :991
+    if shove.heads_modified(None)
+      && let Some(modified) = shove.modified_head(0)
+    {
+      new_head = modified.clone();
+    }
+
+    // :1000
+    let (mut head, tail) = split_head_tail(&new_head, &self.tail);
+
+    // :1003, see the deviation above.
+    if new_head.ends_with_via()
+      && let Some(last) = new_head.last_point()
+    {
+      let via = self.make_via(world, last);
+
+      head.append_via(via);
+    }
+
+    // :1005
+    Optimizer::optimize_line(
+      world,
+      context,
+      node,
+      &mut head,
+      effort,
+      Vec2::new(0, 0),
+    );
+
+    Some((head, tail, node))
+  }
+
   /// The mark obstacles mode head routine.
   ///
   /// Port of `rhMarkObstacles`,
@@ -1500,28 +1639,37 @@ impl Placing {
   /// falls back to walkaround and both share
   /// [`Placing::rh_walk_base`].
   ///
-  /// `TODO(milestone 4)`: [`RouterMode::Shove`] falls back to the
-  /// walkaround. `rhShoveOnly` (`pcbnew/router/pns_line_placer.cpp:921`)
-  /// needs the shove engine, which is milestone 4; its own failure path
-  /// is this same fallback (`:1013`), so shove mode behaves as if every
-  /// shove failed until then.
+  /// Returns the new head, the new tail and the node the placer should
+  /// route against from here on, where KiCad returns a boolean, writes
+  /// two out parameters that are only valid when it is true, and lets
+  /// `rhShoveOnly` assign `m_currentNode` behind the caller's back
+  /// (note 03 section 9.3). Only shove mode ever answers with a different
+  /// node.
   ///
-  /// Returns the new head and the new tail, where KiCad returns a boolean
-  /// and writes two out parameters that are only valid when it is true.
+  /// A shove mode call with no shove engine falls back to the walkaround,
+  /// which is what a host that switched into shove mode without starting
+  /// a placement would get.
   pub fn route_head(
     &mut self,
     world: &mut World,
     context: &AlgoContext<'_>,
+    shove: &mut Option<Shove>,
     node: NodeId,
     at: Vec2,
-  ) -> Option<(Line, Line)> {
+  ) -> Option<(Line, Line, NodeId)> {
     match context.settings.mode {
-      RouterMode::MarkObstacles => {
-        self.rh_mark_obstacles(world, context, node, at)
-      }
-      RouterMode::Walkaround | RouterMode::Shove => {
-        self.rh_walk_only(world, context, node, at)
-      }
+      RouterMode::MarkObstacles => self
+        .rh_mark_obstacles(world, context, node, at)
+        .map(|(head, tail)| (head, tail, node)),
+      RouterMode::Walkaround => self
+        .rh_walk_only(world, context, node, at)
+        .map(|(head, tail)| (head, tail, node)),
+      RouterMode::Shove => match shove.as_mut() {
+        Some(shove) => self.rh_shove_only(world, context, shove, node, at),
+        None => self
+          .rh_walk_only(world, context, node, at)
+          .map(|(head, tail)| (head, tail, node)),
+      },
     }
   }
 
@@ -1742,13 +1890,15 @@ impl Placing {
     &mut self,
     world: &mut World,
     context: &AlgoContext<'_>,
+    shove: &mut Option<Shove>,
     node: NodeId,
     at: Vec2,
-  ) {
+  ) -> NodeId {
     let mut fail = false;
     let mut go_back = false;
     let mut iterations = 1usize;
     let mut index = 0usize;
+    let mut node = node;
 
     while index < iterations && index < ROUTE_STEP_ITERATION_LIMIT {
       let previous_tail = self.tail.clone();
@@ -1761,11 +1911,14 @@ impl Placing {
 
       go_back = false;
 
-      match self.route_head(world, context, node, at) {
-        Some((new_head, new_tail)) => {
+      match self.route_head(world, context, shove, node, at) {
+        Some((new_head, new_tail, routed_node)) => {
           // :1170
           self.head = new_head;
           self.tail = new_tail;
+          // The shove hands back the branch it wants the placer to stand
+          // on; every other mode answers with the node it was given.
+          node = routed_node;
         }
         None => {
           // :1146
@@ -1815,6 +1968,8 @@ impl Placing {
 
     // :1216
     self.last_p_end = Some(at);
+
+    node
   }
 
   /// Route to the cursor and say whether the head got there.
@@ -1823,20 +1978,25 @@ impl Placing {
   /// docstring promises repeated steps due to mouse smoothing; the
   /// implementation calls [`Placing::route_step`] exactly once and this
   /// does the same.
+  ///
+  /// Answers whether the head reached the cursor **and** the node the
+  /// placer should route against from here on, which shove mode changes;
+  /// see [`Placing::route_head`].
   pub fn route(
     &mut self,
     world: &mut World,
     context: &AlgoContext<'_>,
+    shove: &mut Option<Shove>,
     node: NodeId,
     at: Vec2,
-  ) -> bool {
-    self.route_step(world, context, node, at);
+  ) -> (bool, NodeId) {
+    let node = self.route_step(world, context, shove, node, at);
 
     if self.head.point_count() == 0 {
-      return false;
+      return (false, node);
     }
 
-    self.head.last_point() == Some(at)
+    (self.head.last_point() == Some(at), node)
   }
 }
 
@@ -1950,7 +2110,13 @@ fn single_step_force(
 /// clearances only. KiCad's `VIA` always owns a hole, so its pushout also
 /// answers to hole to hole and copper to hole rules. Giving a preview via
 /// a hole needs an arena item for it, which is a change to
-/// [`crate::line::LineVia`] and belongs with the shove.
+/// [`crate::line::LineVia`].
+///
+/// The shove does not have the same gap: a head that ends with a via has
+/// that via **stored** for the duration of the run
+/// (`pcbnew/router/pns_shove.cpp:2505`), and [`World::add_via`] drills a
+/// hole alongside it, so everything the shove measures against the head's
+/// via answers to the hole rules as well.
 #[allow(clippy::too_many_arguments)]
 fn via_pushout_force(
   world: &World,
@@ -2186,6 +2352,27 @@ pub struct LinePlacer {
   /// engine draws nothing here, so the answer is kept for the facade to
   /// read through [`LinePlacer::leading_rat_line`].
   leading_rat_line: Option<LineChain>,
+  /// The shove engine shove mode routes through. Port of `m_shove`
+  /// (`pcbnew/router/pns_line_placer.h:344`), built over a branch of the
+  /// placement node by [`LinePlacer::start`]
+  /// (`pcbnew/router/pns_line_placer.cpp:1478`).
+  ///
+  /// [`None`] before the first start, where KiCad's unique pointer is
+  /// null for the same window. Every springback call site guards on it,
+  /// because a host may call [`LinePlacer::fix_route`] in a mode that
+  /// never built one.
+  shove: Option<Shove>,
+  /// Whether the last event ran in [`RouterMode::Shove`].
+  ///
+  /// KiCad reads `Settings().Mode()` wherever it needs this, including
+  /// inside `CommitPlacement` (`pcbnew/router/pns_line_placer.cpp:1812`).
+  /// [`LinePlacer::commit_placement`] takes no settings, so the mode of
+  /// the last [`LinePlacer::start`], [`LinePlacer::move_to`] or
+  /// [`LinePlacer::fix_route`] is remembered instead. A host that changed
+  /// the mode between its last event and the commit would see KiCad's
+  /// answer and this one differ; nothing else observes the mode in that
+  /// window.
+  shove_mode: bool,
 }
 
 impl LinePlacer {
@@ -2224,6 +2411,8 @@ impl LinePlacer {
       sizes,
       initial_direction: settings.initial_direction(),
       leading_rat_line: None,
+      shove: None,
+      shove_mode: settings.mode == RouterMode::Shove,
     }
   }
 
@@ -2680,8 +2869,10 @@ impl LinePlacer {
   /// happened" and what gives [`LinePlacer::undo_last_segment`] a floor
   /// to stop at.
   ///
-  /// `TODO(milestone 4)`: the shove engine over a branch of the placement
-  /// node, `pcbnew/router/pns_line_placer.cpp:1478`.
+  /// The shove engine is built here over a **branch** of the placement
+  /// node (`:1478`), not over the node itself, so that everything it
+  /// pushes lives above the world the placer stands on and a springback
+  /// rewind can throw it all away.
   ///
   /// Returns false when a placement is already running, where KiCad's
   /// `Start` always answers true; its router builds a fresh placer per
@@ -2760,9 +2951,15 @@ impl LinePlacer {
       .posture
       .set_mouse_disabled(!context.settings.auto_posture);
 
-    // :1436. KiCad takes the shove's node in shove mode (`:1431`);
-    // `TODO(milestone 4)` for that, the placement node is right for the
-    // other two.
+    // :1478. The shove stands on a **branch** of the placement node, so
+    // that everything it pushes lives above the world the placer routes
+    // against and a springback rewind can throw it all away.
+    self.shove = Some(Shove::new(world.branch(branch)));
+    self.shove_mode = context.settings.mode == RouterMode::Shove;
+
+    // :1436. The stage records the placement node, not the shove's:
+    // `undo_last_segment` asks the shove to rewind to it and takes the
+    // false answer for the first stage, which is never on the stack.
     placing.fixed_tail.add_stage(
       placing.fix_start,
       placing.layer,
@@ -2816,6 +3013,8 @@ impl LinePlacer {
       return false;
     }
 
+    self.shove_mode = context.settings.mode == RouterMode::Shove;
+
     // :1487
     let end_item_depth = end_item
       .and_then(|id| world.home_of(id))
@@ -2826,7 +3025,7 @@ impl LinePlacer {
       world.drop_node(last);
     }
 
-    let node = self.current_node;
+    let mut node = self.current_node;
     let net = self.current_net();
     let mut current;
     let mut split_point;
@@ -2840,8 +3039,14 @@ impl LinePlacer {
 
       placing.end_item = end_item;
 
-      // :1498
-      reaches_end = placing.route(world, context, node, at);
+      // :1498. In shove mode the run hands back the branch the shove
+      // wants the placer to stand on, which is KiCad's two assignments to
+      // `m_currentNode` inside `rhShoveOnly` (note 03 section 9.3).
+      let (reached, routed_node) =
+        placing.route(world, context, &mut self.shove, node, at);
+
+      reaches_end = reached;
+      node = routed_node;
 
       // :1505
       if placing.placing_via
@@ -2891,6 +3096,7 @@ impl LinePlacer {
     // :1534
     let last = world.branch(node);
 
+    self.current_node = node;
     self.last_node = Some(last);
 
     // :1537
@@ -3005,8 +3211,9 @@ impl LinePlacer {
   /// the "rollback is broken for arcs" override that forces `fix_all` on
   /// (`:1652`).
   ///
-  /// `TODO(milestone 4)`: the shove node as the collision node (`:1589`)
-  /// and the locked springback nodes at `:1737` and `:1750`.
+  /// The collision gate runs against the shove's node in shove mode and
+  /// against the placement branch otherwise (`:1589`), because in shove
+  /// mode the world the user is looking at is the one the shove built.
   pub fn fix_route(
     &mut self,
     world: &mut World,
@@ -3068,8 +3275,20 @@ impl LinePlacer {
       placing_via = placing.placing_via;
     }
 
+    self.shove_mode = context.settings.mode == RouterMode::Shove;
+
+    // :1589
+    let check_node = if context.settings.mode == RouterMode::Shove {
+      self
+        .shove
+        .as_ref()
+        .map_or(world_node, crate::shove::Shove::current_node)
+    } else {
+      world_node
+    };
+
     // :1587
-    if !Self::check_obstacles(world, context, world_node, &trace) {
+    if !Self::check_obstacles(world, context, check_node, &trace) {
       return false;
     }
 
@@ -3094,11 +3313,16 @@ impl LinePlacer {
       // :1623
       store_trace_via(world, last, &trace);
 
+      // :1626. The via only commit pins the world it wrote the via into,
+      // so springback can never roll back past it.
+      if let Some(shove) = self.shove.as_mut() {
+        shove.add_locked_springback_node(last);
+      }
+
       // :1629. KiCad nulls `m_currentNode` and keeps `m_lastNode`, so a
       // following `CommitPlacement` still folds the via into the board;
       // the node handles are not optional here, so only the state
-      // changes. `TODO(milestone 4)`: the locked springback node at
-      // `:1626`.
+      // changes.
       self.state = PlacerState::Finished {
         placed_anything: true,
       };
@@ -3169,6 +3393,10 @@ impl LinePlacer {
 
     if real_end {
       // :1750
+      if let Some(shove) = self.shove.as_mut() {
+        shove.add_locked_springback_node(last);
+      }
+
       self.state = PlacerState::Finished {
         placed_anything: true,
       };
@@ -3190,6 +3418,11 @@ impl LinePlacer {
 
     self.current_node = last;
     self.last_node = Some(next_node);
+
+    // :1737. Every fixed leg pins the world it was written into.
+    if let Some(shove) = self.shove.as_mut() {
+      shove.add_locked_springback_node(last);
+    }
 
     let placing = self
       .state
@@ -3278,8 +3511,16 @@ impl LinePlacer {
   /// [`LinePlacer::has_placed_anything`] as true, which is what lets a
   /// host tell "nothing was ever placed" from "everything was undone".
   ///
-  /// `TODO(milestone 4)`: the springback rewind and unlock at `:1789`,
-  /// and the shove branch at `:1792`.
+  /// # The springback rewind
+  ///
+  /// `:1789`. The stage's node is rewound to and then unlocked, which
+  /// unlocks nothing: `RewindSpringbackTo` **erases** the frame it is
+  /// asked to rewind to (`pcbnew/router/pns_shove.cpp:2175`), so the
+  /// following `UnlockSpringbackNode` scans a stack the node has already
+  /// left. Both calls are reproduced because the second is harmless and
+  /// leaving it out would hide the wart. In shove mode the placer then
+  /// takes the shove's node instead of the stage's and drops its subtree
+  /// (`:1792`).
   ///
   /// `None` when nothing is being placed.
   pub fn undo_last_segment(
@@ -3329,11 +3570,22 @@ impl LinePlacer {
     // :1777
     self.current_node = stage.node;
 
-    // See the deviation above.
-    world.kill_children(stage.node);
+    // :1789
+    if let Some(shove) = self.shove.as_mut() {
+      shove.rewind_springback_to(world, stage.node);
+      shove.unlock_springback_node(stage.node);
+
+      // :1792
+      if context.settings.mode == RouterMode::Shove {
+        self.current_node = shove.current_node();
+      }
+    }
+
+    // :1794, and the deviation above.
+    world.kill_children(self.current_node);
 
     // :1798
-    self.last_node = Some(world.branch(stage.node));
+    self.last_node = Some(world.branch(self.current_node));
 
     head_start
   }
@@ -3393,8 +3645,11 @@ impl LinePlacer {
   /// scratch branch (`:1621`, `:1704`), and [`World::commit`] folds the
   /// branch whole, hole included.
   ///
-  /// `TODO(milestone 4)`: the shove rewind at `:1814`, which adopts the
-  /// last locked springback node as the node to commit.
+  /// In shove mode the node that is committed is the shove's last locked
+  /// springback frame (`:1814`), not the placer's scratch branch: every
+  /// fix pins the world it wrote into, so the last locked frame is the
+  /// world that holds every fixed leg together with everything the shove
+  /// moved to make room for them.
   ///
   /// `AbortPlacement` (`pcbnew/router/pns_line_placer.cpp:2150`) is not
   /// ported: note 03 section 9.5 lists it among the routines with no
@@ -3405,6 +3660,18 @@ impl LinePlacer {
   /// KiCad leaves both node pointers null; this leaves the placer
   /// pointing at the root, see [`LinePlacer::current_node`].
   pub fn commit_placement(&mut self, world: &mut World) -> bool {
+    // :1812
+    if self.shove_mode
+      && let Some(shove) = self.shove.as_mut()
+    {
+      shove.rewind_to_last_locked_node();
+
+      let node = shove.current_node();
+
+      world.kill_children(node);
+      self.last_node = Some(node);
+    }
+
     if let Some(last) = self.last_node {
       world.commit(last);
     }

@@ -2190,6 +2190,40 @@ impl World {
     self.nodes.get(joint.node)?.joints.get(joint.joint)
   }
 
+  /// The via at a position, named by what survives the via being
+  /// replaced.
+  ///
+  /// Port of `NODE::FindViaByHandle`,
+  /// `pcbnew/router/pns_node.cpp:1850`: the joint at the handle's
+  /// position on the handle's first layer, then the first of its links
+  /// that is a via on the right net with an overlapping layer range.
+  ///
+  /// The shove needs it because moving a via **replaces** the item, so a
+  /// caller that held the old [`ItemId`] would be looking at something
+  /// the node no longer has; a position plus a layer range plus a net can
+  /// be resolved again in whatever branch the caller now stands on.
+  ///
+  /// Link order is insertion order, so the answer is deterministic where
+  /// KiCad's is the order its index happened to build the joint in.
+  pub fn find_via_by_handle(
+    &self,
+    node: NodeId,
+    pos: Vec2,
+    layers: LayerRange,
+    net: Option<NetId>,
+  ) -> Option<ItemId> {
+    let reference = self.find_joint(node, pos, layers.start(), net)?;
+    let joint = self.joint(reference)?;
+
+    joint.links().iter().copied().find(|link| {
+      self.items.get(*link).is_some_and(|item| {
+        item.of_kind(Kind::VIA)
+          && item.net() == net
+          && item.layers().overlaps(layers)
+      })
+    })
+  }
+
   /// The joints at the two ends of a run of segments.
   ///
   /// Port of `NODE::FindLineEnds`,
@@ -2553,11 +2587,7 @@ impl World {
     let mut previous_reversed = false;
     let mut count: u32 = 0;
 
-    loop {
-      let Some(item) = self.items.get(current) else {
-        break;
-      };
-
+    while let Some(item) = self.items.get(current) {
       // :1086
       let position =
         item.anchor(usize::from(scan_forward != previous_reversed));
@@ -5810,5 +5840,34 @@ mod tests {
     // The root is never dropped.
     world.drop_node(root);
     assert!(world.node(root).is_some());
+  }
+
+  #[test]
+  fn a_via_is_found_again_from_its_position_layers_and_net() {
+    let (world, items) = fixture();
+    let root = world.root();
+    let via = world.item(items.via).expect("the fixture built one");
+    let layers = via.layers();
+    let net = via.net();
+
+    assert_eq!(
+      world.find_via_by_handle(root, MIDDLE, layers, net),
+      Some(items.via)
+    );
+
+    // A handle that names another position, another net or layers the
+    // via does not reach finds nothing.
+    assert_eq!(
+      world.find_via_by_handle(root, Vec2::new(0, 0), layers, net),
+      None
+    );
+    assert_eq!(
+      world.find_via_by_handle(root, MIDDLE, layers, OTHER_NET),
+      None
+    );
+    assert_eq!(
+      world.find_via_by_handle(root, MIDDLE, LayerRange::single(9), net),
+      None
+    );
   }
 }

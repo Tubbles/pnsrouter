@@ -32,11 +32,42 @@
 //!
 //! # What this revision covers
 //!
-//! Segments only, which is phase 1 and 2 of note 04 section 8.5: the hull
-//! walk, the line stack, the springback stack, the root line index, the
-//! optimizer queue and the main loop. Every site that needs a solid, a
-//! via or an arc carries a `TODO(part 2)` with the KiCad line it stands
-//! for, and answers [`ShoveStatus::Incomplete`] rather than guessing.
+//! Phases 1 to 4 of note 04 section 8.5: the hull walk, the line stack,
+//! the springback stack, the root line index, the optimizer queue, the
+//! main loop, solids through the walkaround escalation
+//! (`Shove::on_colliding_solid`) and vias in all three of their roles
+//! (pusher, pushee and head). Arcs are phase 5 and every arc site
+//! carries a `TODO(arcs)`.
+//!
+//! # Solids and the walkaround escalation
+//!
+//! A solid can never be shoved, so the roles swap: the **current** line
+//! is re-routed around it. [`ShoveStatus::TryWalk`] is the answer that
+//! asks for that, and `Shove::shove_iteration` turns it into a call to
+//! `Shove::on_colliding_solid`
+//! (`pcbnew/router/pns_shove.cpp:1825`). The walk runs over a
+//! [`World::assemble_cluster`] of everything topologically attached to
+//! the obstacle, so a pad in a row of touching pads is walked around as
+//! a group. Its first attempt ranks the result at
+//! `rank + WALKAROUND_RANK_PROMOTION`, which turns a line that had to
+//! give way into a pusher for every later iteration.
+//!
+//! # Vias
+//!
+//! Three interactions, note 04 section 2.6:
+//!
+//! - a via as the **pusher**, when the current line's segments are on
+//!   another layer and only its via reaches the obstacle:
+//!   `Shove::shove_line_from_lone_via`;
+//! - a via as the **pushee**: `Shove::on_colliding_via` computes a
+//!   minimum translation vector and `Shove::push_or_shove_via` moves the
+//!   via and drags every track attached to its joint along with it;
+//! - via against via, per shape layer, which takes priority over a line
+//!   collision when both are present.
+//!
+//! [`crate::settings::RoutingSettings::shove_vias`] switches the middle
+//! one off, and then every via collision degrades to
+//! [`ShoveStatus::TryWalk`] and therefore to the walkaround.
 //!
 //! # Effects instead of in place mutation
 //!
@@ -97,20 +128,31 @@
 //! - `formatPolicy` (`:2617`) and the stale namespace scope copy of
 //!   `SHOVE_POLICY` (`:2607`) are debug scaffolding with two copy paste
 //!   bugs in them.
+//! - `ShoveDraggingVia` (`pcbnew/router/pns_shove.h:86`) is declared and
+//!   never defined; its one would be caller is commented out
+//!   (`pcbnew/router/pns_dragger.cpp:919`), which runs an ordinary
+//!   [`Shove::run`] over a via head instead. `walkaroundLoneVia` is not
+//!   in this revision at all; the routine that walks an obstacle around a
+//!   lone via is `shoveLineFromLoneVia` (`:278`), which is ported.
 
 use std::collections::BTreeMap;
 
 use crate::algo_base::AlgoContext;
-use crate::collide::CollisionSearchOptions;
+use crate::collide::{CollisionSearchOptions, LineHead, collide_line_items};
 use crate::geometry::box2::Box2;
 use crate::geometry::direction45::CornerMode;
 use crate::geometry::line_chain::{LineChain, PointInsideTracker};
+use crate::geometry::shape::Shape;
 use crate::geometry::vec2::Vec2;
-use crate::item::{Item, ItemId, Kind, MarkerFlags, NetId};
+use crate::item::{
+  Item, ItemBody, ItemId, Kind, LayerRange, MarkerFlags, NetId,
+};
 use crate::line::{Line, LineVia};
 use crate::node::{NodeId, World};
 use crate::optimizer::{EffortFlags, Optimizer};
+use crate::rules::ItemRef;
 use crate::settings::OptimizerEffort;
+use crate::walkaround::{WalkPolicy, Walkaround, WalkaroundStatus};
 
 // ---------------------------------------------------------------------
 // Constants
@@ -148,6 +190,56 @@ const ENDPOINT_ON_HULL_THRESHOLD: i64 = 1000;
 /// the private constant `src/node.rs` uses for the same purpose.
 const PROBE_UID: u64 = u64::MAX;
 
+/// How far above its own rank a walked around line is promoted.
+///
+/// Port of the `currentRank + 10000` at
+/// `pcbnew/router/pns_shove.cpp:832`, the "jump the queue" trick: a line
+/// that had to walk around something immovable is lifted far above
+/// everything else, so later iterations treat it as a pusher rather than
+/// as a pushee. [`crate::settings::RoutingSettings::jump_over_obstacles`]
+/// switches it off, and then the ordinary `rank - 1` applies.
+const WALKAROUND_RANK_PROMOTION: i32 = 10000;
+
+/// How many times `Shove::on_colliding_solid` walks the current line.
+///
+/// Port of the loop bound at `pcbnew/router/pns_shove.cpp:827`. The two
+/// attempts differ only in the rank they would assign; see
+/// [`WALKAROUND_RANK_PROMOTION`].
+const SOLID_WALKAROUND_ATTEMPTS: i32 = 2;
+
+/// How far a cluster around a solid may grow before it is abandoned.
+///
+/// The `10.0` of `TOPOLOGY::AssembleCluster`'s call at
+/// `pcbnew/router/pns_shove.cpp:804`, a ratio against the seed item's own
+/// area.
+const CLUSTER_AREA_EXPANSION_LIMIT: f64 = 10.0;
+
+/// How far a via is nudged per anti snap step, in nanometres.
+///
+/// The `aForce.Resize( 2 )` of `pushOrShoveVia`,
+/// `pcbnew/router/pns_shove.cpp:1074`: a via must not land exactly on an
+/// existing joint, so it is walked along the force until it does not.
+const VIA_ANTI_SNAP_NUDGE: i32 = 2;
+
+/// How many anti snap steps one via push may take.
+///
+/// # Deviation
+///
+/// KiCad's loop at `pcbnew/router/pns_shove.cpp:1067` has no bound at
+/// all; a dense enough run of joints along the force direction would spin
+/// it forever. A budget is the crate's answer to an unbounded loop
+/// (`DESIGN.md` section 8), and a via that has stepped this far has moved
+/// well past where the geometry asked it to go, so giving up is the
+/// honest answer. Exceeding it is [`ShoveStatus::Incomplete`].
+const VIA_ANTI_SNAP_LIMIT: u32 = 1000;
+
+/// The slack added to a fanout width before it is used as a diameter.
+///
+/// The `+ 1` of `fixupViaCollisions`, `pcbnew/router/pns_shove.cpp:1553`
+/// and `:1592`, which makes the inflated scratch via strictly wider than
+/// the track it stands for.
+const FANOUT_WIDTH_SLACK: i32 = 1;
+
 /// The kinds `Shove::shove_iteration` looks for, in KiCad's order.
 ///
 /// Port of the search order at `pcbnew/router/pns_shove.cpp:1650`. It is
@@ -156,6 +248,49 @@ const PROBE_UID: u64 = u64::MAX;
 /// then vias, then segments, then holes.
 const OBSTACLE_SEARCH_ORDER: [Kind; 4] =
   [Kind::SOLID, Kind::VIA, Kind::SEGMENT, Kind::HOLE];
+
+// ---------------------------------------------------------------------
+// Via handles
+// ---------------------------------------------------------------------
+
+/// Where a via is, in a form that survives the via being replaced.
+///
+/// Port of `VIA_HANDLE`, `pcbnew/router/pns_via.h:45`. Every shove that
+/// moves a via **replaces** the item, so a caller that held the old
+/// handle would be looking at something the node no longer has; a
+/// position, a layer range and a net can be looked up again in whatever
+/// node the caller now stands on, which is what
+/// [`World::find_via_by_handle`] does.
+///
+/// KiCad's `valid` flag is an [`Option`] at every use site here.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct ViaHandle {
+  /// Where the via sits. Port of `pos`.
+  pub pos: Vec2,
+  /// The layers it spans. Port of `layers`.
+  pub layers: LayerRange,
+  /// The net it is on. Port of `net`.
+  pub net: Option<NetId>,
+}
+
+impl ViaHandle {
+  /// The handle of a stored via.
+  ///
+  /// Port of `VIA::MakeHandle`, `pcbnew/router/pns_via.cpp:310`.
+  /// `None` when the handle is stale or does not name a via.
+  pub fn of(world: &World, via: ItemId) -> Option<Self> {
+    let item = world.item(via)?;
+    let ItemBody::Via(body) = item.body() else {
+      return None;
+    };
+
+    Some(Self {
+      pos: body.pos(),
+      layers: item.layers(),
+      net: item.net(),
+    })
+  }
+}
 
 // ---------------------------------------------------------------------
 // Status and policy
@@ -183,9 +318,10 @@ pub enum ShoveStatus {
   /// This obstacle cannot be shoved, so the current line has to walk
   /// around it instead. `SH_TRY_WALK`.
   ///
-  /// A handler answer, never a [`Shove::run`] answer: KiCad converts it
-  /// into a call to `onCollidingSolid` inside `shoveIteration`
-  /// (`pcbnew/router/pns_shove.cpp:1825`), which is `TODO(part 2)` here.
+  /// A handler answer, never a [`Shove::run`] answer:
+  /// `Shove::shove_iteration` converts it into a call to
+  /// `Shove::on_colliding_solid` (`pcbnew/router/pns_shove.cpp:1825`),
+  /// so the current line walks around whatever refused to move.
   TryWalk,
 }
 
@@ -354,18 +490,27 @@ pub struct SpringbackFrame {
   affected_area: Option<Box2>,
   /// Whether springback may drop this frame. Port of `m_locked`, set
   /// only through [`Shove::add_locked_springback_node`].
-  ///
-  /// `TODO(part 2)`: `m_draggedVias` (`pcbnew/router/pns_shove.h:204`),
-  /// the per head via handles a frame snapshots so that popping it can
-  /// restore them (`pcbnew/router/pns_shove.cpp:1006`, `:958`). It needs
-  /// a via handle type, which arrives with the via heads.
   locked: bool,
+  /// Where each head's via stood when this frame was pushed. Port of
+  /// `m_draggedVias` (`pcbnew/router/pns_shove.h:204`), written at
+  /// `pcbnew/router/pns_shove.cpp:1006` and read back by
+  /// `reduceSpringback` at `:958` so that popping a frame puts the
+  /// caller's via handle back where that frame found it.
+  ///
+  /// One slot per head, in head order; [`None`] for a head that is a
+  /// line rather than a via.
+  dragged_vias: Vec<Option<ViaHandle>>,
 }
 
 impl SpringbackFrame {
   /// The branch this frame owns.
   pub const fn node(&self) -> NodeId {
     self.node
+  }
+
+  /// Where each head's via stood when this frame was pushed.
+  pub fn dragged_vias(&self) -> &[Option<ViaHandle>] {
+    &self.dragged_vias
   }
 
   /// Everything this frame and the frames below it changed.
@@ -420,6 +565,14 @@ struct RootLineEntry {
   /// Whether this track is one of the caller's heads. Port of `isHead`,
   /// read by the optimizer (`:2109`) and by `removeHeads` (`:2288`).
   is_head: bool,
+  /// The via this entry stood for before the session moved it. Port of
+  /// `oldVia`, written by `Run` for a via head
+  /// (`pcbnew/router/pns_shove.cpp:2453`).
+  old_via: Option<ItemId>,
+  /// The via this entry stands for now. Port of `newVia`, written by
+  /// `replaceItems` when a via moves (`pcbnew/router/pns_shove.cpp:67`)
+  /// and read by `reconstructHeads` (`:2404`).
+  new_via: Option<ItemId>,
 }
 
 /// Every track this shove session has touched, by uid.
@@ -461,6 +614,8 @@ impl RootLineIndex {
       new_line: None,
       policy,
       is_head: false,
+      old_via: None,
+      new_via: None,
     });
 
     for uid in uids {
@@ -529,33 +684,79 @@ impl RootLineIndex {
 /// Note 04 section 8.2 asks for this to be an explicit enum so that the
 /// rule is testable on its own, rather than the three way branch buried
 /// in `unwindLineStack` (`pcbnew/router/pns_shove.cpp:1397`).
-///
-/// `TODO(part 2)`: KiCad's third answer, `DegradeToViaStub`. A line that
-/// ends with a via must not be dropped outright when one of its
-/// **segments** goes: it is reduced to the via alone
-/// (`ClearLinks`, `Line().Clear()`, `LinkVia`) so that the via keeps
-/// taking part in cross layer collision checks. The note to self at
-/// `pcbnew/router/pns_shove.cpp:1397` says why it matters on a dense
-/// board. No line in this revision ends with a via, so the case cannot
-/// arise yet.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum UnwindAction {
   /// The line does not reference the item; leave it alone.
   Keep,
   /// The line references the item; take it off the stack.
   Drop,
+  /// The line references the item and ends with a via; reduce it to the
+  /// via alone and keep it.
+  ///
+  /// The note to self at `pcbnew/router/pns_shove.cpp:1397` says why:
+  /// "if we have a tadpole in the stack, keep track of the via even if
+  /// the parent line has been deleted, otherwise the via will be ignored
+  /// in the case of collisions with tracks on another layer". A stub is
+  /// [`Line::clear_links`], an empty chain and one
+  /// [`Line::link_via`].
+  DegradeToViaStub,
 }
 
 /// What one stacked line should do about an item being replaced.
 ///
 /// The predicate of `unwindLineStack`,
 /// `pcbnew/router/pns_shove.cpp:1392`, as a pure function.
-pub fn unwind_action(line: &Line, item: ItemId) -> UnwindAction {
-  if line.contains_link(item) {
-    UnwindAction::Drop
-  } else {
-    UnwindAction::Keep
+/// `item_is_via` is KiCad's `aSeg->OfKind( ITEM::VIA_T )`: unwinding a
+/// **via** drops every line that references it, because there is no via
+/// left to degrade to.
+pub fn unwind_action(
+  line: &Line,
+  item: ItemId,
+  item_is_via: bool,
+) -> UnwindAction {
+  if !line.contains_link(item) {
+    return UnwindAction::Keep;
   }
+
+  // :1397
+  if line.ends_with_via() && !item_is_via {
+    return UnwindAction::DegradeToViaStub;
+  }
+
+  UnwindAction::Drop
+}
+
+/// Reduce a line to the via it ends with.
+///
+/// The `ClearLinks(); Line().Clear(); LinkVia( via )` of
+/// `unwindLineStack` (`pcbnew/router/pns_shove.cpp:1414`). KiCad scans
+/// the line's links for a via and keeps the **last** one; a line whose
+/// via is owned rather than linked has no via link, and KiCad then leaves
+/// the line untouched (`:1412` guards the whole rewrite), which is
+/// reproduced by answering false.
+fn degrade_to_via_stub(world: &World, line: &mut Line) -> bool {
+  let via = line.links().iter().rev().copied().find(|link| {
+    world
+      .item(*link)
+      .is_some_and(|item| item.of_kind(Kind::VIA))
+  });
+
+  let Some(via) = via else {
+    return false;
+  };
+  let Some(pos) = world.item(via).and_then(|item| match item.body() {
+    ItemBody::Via(body) => Some(body.pos()),
+    _ => None,
+  }) else {
+    return false;
+  };
+
+  line.clear_links();
+  line.chain_mut().clear();
+  line.remove_via();
+  line.link_via(via, pos);
+
+  true
 }
 
 /// The lines whose collisions still have to be resolved.
@@ -565,7 +766,7 @@ pub fn unwind_action(line: &Line, item: ItemId) -> UnwindAction {
 /// below the top (`:1465`) and erases from the middle (`:1421`). Note 04
 /// section 8.2 asks for exactly those three operations to be named, and
 /// they are [`LineStack::push`], [`LineStack::push_below_top`] and
-/// [`LineStack::retain_not_referencing`].
+/// [`LineStack::unwind`].
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct LineStack {
   /// The lines, bottom first.
@@ -628,15 +829,32 @@ impl LineStack {
     self.lines.pop()
   }
 
-  /// Drop every line that references an item.
+  /// Take every line that references an item off the stack, or reduce it
+  /// to its via.
   ///
   /// The line stack half of `unwindLineStack`,
   /// `pcbnew/router/pns_shove.cpp:1390`, decided per line by
-  /// [`unwind_action`].
-  pub fn retain_not_referencing(&mut self, item: ItemId) {
-    self
-      .lines
-      .retain(|line| unwind_action(line, item) == UnwindAction::Keep);
+  /// [`unwind_action`] and carried out by `degrade_to_via_stub`.
+  ///
+  /// It is not a `retain`: the third answer keeps the line and rewrites
+  /// it, so the loop has to be able to touch what it walks over.
+  pub fn unwind(&mut self, world: &World, item: ItemId) {
+    let item_is_via =
+      world.item(item).is_some_and(|item| item.of_kind(Kind::VIA));
+    let mut index = 0;
+
+    while index < self.lines.len() {
+      match unwind_action(&self.lines[index], item, item_is_via) {
+        UnwindAction::Keep => index += 1,
+        UnwindAction::Drop => {
+          self.lines.remove(index);
+        }
+        UnwindAction::DegradeToViaStub => {
+          degrade_to_via_stub(world, &mut self.lines[index]);
+          index += 1;
+        }
+      }
+    }
   }
 
   /// Forget everything.
@@ -762,9 +980,10 @@ impl OptimizerQueue {
 
 /// One line the caller wants routed, and what became of it.
 ///
-/// Port of `HEAD_LINE_ENTRY`, `pcbnew/router/pns_shove.h:133`, reduced to
-/// the line head case. Its four via fields (`theVia`, `prevVia`,
-/// `draggedVia`, `viaNewPos`) are `TODO(part 2)`.
+/// Port of `HEAD_LINE_ENTRY`, `pcbnew/router/pns_shove.h:133`. A head is
+/// either a line or a via being dragged, which is why `orig_head` is an
+/// [`Option`] exactly as KiCad's is: `reconstructHeads` branches on it
+/// (`pcbnew/router/pns_shove.cpp:2306`).
 #[derive(Clone, PartialEq, Debug)]
 struct HeadEntry {
   /// The line as the caller handed it over, and then as the node holds
@@ -773,10 +992,36 @@ struct HeadEntry {
   /// KiCad clears the links of its copy in the constructor
   /// (`pcbnew/router/pns_shove.h:139`) and [`Shove::add_head_line`] does
   /// the same; [`Shove::run`] then adds it to the branch, which links it.
-  orig_head: Line,
+  /// [`None`] for a via head.
+  orig_head: Option<Line>,
   /// What the shove made of it. Port of `newHead`, filled in by
   /// `reconstructHeads` (`pcbnew/router/pns_shove.cpp:2316`).
   new_head: Option<Line>,
+  /// Where the dragged via is now. Port of `theVia`, which
+  /// `reduceSpringback` also restores from a popped frame
+  /// (`pcbnew/router/pns_shove.cpp:961`).
+  the_via: Option<ViaHandle>,
+  /// Where it was before this run. Port of `prevVia`, which the failure
+  /// path of `Run` restores (`pcbnew/router/pns_shove.cpp:2578`).
+  prev_via: Option<ViaHandle>,
+  /// The via as this run's branch holds it. Port of `draggedVia`, written
+  /// by `Run` (`pcbnew/router/pns_shove.cpp:2455`).
+  dragged_via: Option<ItemId>,
+  /// Where the caller wants the via. Port of `viaNewPos`.
+  via_new_pos: Option<Vec2>,
+  /// The root entry `Shove::run` created for this head.
+  ///
+  /// KiCad has no field for it: `reconstructHeads` calls
+  /// `findRootLine( *headEntry.origHead )`
+  /// (`pcbnew/router/pns_shove.cpp:2309`), which reads uids off the
+  /// original head's links. By then the shove may have replaced the head
+  /// and the node may have dropped those items, so KiCad is reading uids
+  /// out of freed memory; here the handles simply stop resolving and the
+  /// lookup finds nothing. The entry is therefore remembered when it is
+  /// created, which is the same entry KiCad's lookup is trying to reach:
+  /// `replaceLine` only ever re-points **new** links at it and never
+  /// erases the old ones (`:157`).
+  root_entry: Option<RootLineId>,
   /// Whether the shove moved it. Port of `geometryModified`.
   geometry_modified: bool,
   /// What may be done to it. Port of `policy`.
@@ -804,9 +1049,22 @@ pub enum PushMode {
   Top,
   /// Stack it one slot below the top, KiCad's `aKeepCurrentOnTop`.
   ///
-  /// `TODO(part 2)`: only `pushOrShoveVia` asks for this
-  /// (`pcbnew/router/pns_shove.cpp:1155`).
+  /// `pushOrShoveVia`'s commented out `pushLineStack( lp.second, true )`
+  /// at `pcbnew/router/pns_shove.cpp:1155` is the one site that ever
+  /// asked for it; the shipped call passes false and its "WHY?" comment
+  /// records the doubt. Nothing in this crate asks for it either, and it
+  /// stays because [`LineStack::push_below_top`] is a named stack
+  /// operation note 04 section 8.2 wants tested.
   BelowTop,
+  /// Take the current top off the stack first, then stack the new line
+  /// on top.
+  ///
+  /// The `popLineStack(); pushLineStack( walkaroundLine )` pair of
+  /// `onCollidingSolid` (`pcbnew/router/pns_shove.cpp:892` and `:894`).
+  /// It cannot be spelled as two effects: the line to push is the one
+  /// the replace has just produced, so its links do not exist until the
+  /// replace has been applied.
+  PopThenTop,
 }
 
 /// What one [`ShoveEffect::ReplaceLine`] does.
@@ -838,6 +1096,48 @@ pub struct LineReplacement {
   pub allow_redundant: bool,
   /// Where the new line goes on the stack.
   pub push: PushMode,
+}
+
+/// What is pushing a via out of the way.
+///
+/// The two branches of `onCollidingVia`'s `aCurrent`
+/// (`pcbnew/router/pns_shove.cpp:1188` and `:1233`), which is an `ITEM*`
+/// there and is only ever a `LINE` or a `SOLID`. The solid case is
+/// reached from one place, `onCollidingSolid`'s role swap at `:800`.
+#[derive(Copy, Clone, PartialEq, Debug)]
+pub enum ViaPusher<'a> {
+  /// A line, KiCad's `LINE_T` branch.
+  Line(&'a Line),
+  /// A stored solid, KiCad's `SOLID_T` branch.
+  Solid(ItemId),
+}
+
+/// What one [`ShoveEffect::MoveVia`] does.
+///
+/// The whole body of `pushOrShoveVia` from `SetRank` onwards
+/// (`pcbnew/router/pns_shove.cpp:1107` to `:1166`), as data. It is one
+/// effect rather than a via effect plus a line effect per branch for the
+/// reason the module documentation gives: the dragged lines have to
+/// **link** the via that the move produces, and that handle does not
+/// exist until the move has been applied.
+#[derive(Clone, PartialEq, Debug)]
+pub struct ViaMovement {
+  /// The via the node holds now.
+  pub old_via: ItemId,
+  /// The via to put in its place, already at its new position and
+  /// carrying the old one's marker.
+  pub new_via: Box<Item>,
+  /// Every track attached to the via's joint, as it is and as it should
+  /// be after being dragged.
+  ///
+  /// The `draggedLines` of `pcbnew/router/pns_shove.cpp:1081`, each pair
+  /// reversed so that the via end is the **last** point (`:1096`).
+  pub dragged: Vec<(Line, Line)>,
+  /// The rank the via and every dragged line carry. KiCad's `aNewRank`.
+  pub rank: i32,
+  /// Whether the stacks are left alone. KiCad's `aDontUnwindStack`,
+  /// which only the via drag head passes true (`:2459`).
+  pub dont_unwind_stack: bool,
 }
 
 /// One change `Shove::shove_iteration` decided on.
@@ -889,6 +1189,11 @@ pub enum ShoveEffect {
   /// essential: this is how a line that has come clean reaches the
   /// optimizer at all.
   RetireLine,
+  /// Move a via and drag every track attached to it along.
+  ///
+  /// Port of the mutating half of `pushOrShoveVia`,
+  /// `pcbnew/router/pns_shove.cpp:1107` to `:1166`. See [`ViaMovement`].
+  MoveVia(Box<ViaMovement>),
 }
 
 // ---------------------------------------------------------------------
@@ -905,6 +1210,11 @@ pub enum ShoveEffect {
 /// the caller's [`World`], which every method takes as a parameter, so
 /// that a shove and a placer can stand on the same arena at once
 /// (`DESIGN.md` section 6.4).
+///
+/// [`Clone`] is derived because the line placer holds one and is
+/// cloneable itself; a cloned shove points at the same nodes, so only one
+/// of the two copies may be run.
+#[derive(Clone, Debug)]
 pub struct Shove {
   /// The node the session started from. Port of `m_root`.
   root: NodeId,
@@ -1065,9 +1375,6 @@ impl Shove {
   /// because [`Shove::run`] adds it to a fresh branch and the links it
   /// arrives with belong to some other node.
   ///
-  /// `TODO(part 2)`: the via drag head, `AddHeads( VIA_HANDLE, VECTOR2I,
-  /// int )` at `:2261`, which needs a via handle type.
-  ///
   /// # Deviation
   ///
   /// KiCad also calls `SetShovePolicy( aHead, aPolicy )` here (`:2257`).
@@ -1083,11 +1390,57 @@ impl Shove {
     orig_head.clear_links();
 
     self.heads.push(HeadEntry {
-      orig_head,
+      orig_head: Some(orig_head),
       new_head: None,
+      the_via: None,
+      prev_via: None,
+      dragged_via: None,
+      via_new_pos: None,
+      root_entry: None,
       geometry_modified: false,
       policy,
     });
+  }
+
+  /// Add one via for the next run to drag to a new position.
+  ///
+  /// Port of `AddHeads( VIA_HANDLE, VECTOR2I, int )`,
+  /// `pcbnew/router/pns_shove.cpp:2261`. Note that it does **not** call
+  /// `SetShovePolicy`, where the line overload does; the policy is
+  /// carried on the entry and reaches the via's root entry through
+  /// `Shove::add_via_head_to_node`.
+  ///
+  /// The via is named by a [`ViaHandle`] rather than by an [`ItemId`]
+  /// because [`Shove::run`] branches a fresh node and looks the via up
+  /// again there: the handle the caller holds names an item of some other
+  /// node.
+  pub fn add_head_via(
+    &mut self,
+    via: ViaHandle,
+    new_pos: Vec2,
+    policy: ShovePolicy,
+  ) {
+    self.heads.push(HeadEntry {
+      orig_head: None,
+      new_head: None,
+      the_via: Some(via),
+      prev_via: Some(via),
+      dragged_via: None,
+      via_new_pos: Some(new_pos),
+      root_entry: None,
+      geometry_modified: false,
+      policy,
+    });
+  }
+
+  /// Where a via head stands now.
+  ///
+  /// The `theVia` of one head entry
+  /// (`pcbnew/router/pns_shove.h:141`), which is what a via dragger reads
+  /// back after a run: the shove replaces the via item, so the caller's
+  /// old handle names nothing.
+  pub fn head_via(&self, index: usize) -> Option<ViaHandle> {
+    self.heads.get(index)?.the_via
   }
 
   /// Whether the shove moved a head, or any head at all.
@@ -1132,6 +1485,7 @@ impl Shove {
       node,
       affected_area: None,
       locked: true,
+      dragged_vias: Vec::new(),
     });
 
     true
@@ -1215,9 +1569,10 @@ impl Shove {
   /// frame's, so the optimizer's restriction covers everything the whole
   /// session has moved. Always answers true, as KiCad's does.
   ///
-  /// `TODO(part 2)`: the per head via snapshot at `:1006`, which is why
-  /// KiCad's doc comment at `:2568` insists this runs **after**
-  /// `reconstructHeads`.
+  /// The per head via snapshot (`:1006`) is why KiCad's doc comment at
+  /// `:2568` insists this runs **after** `reconstructHeads`: it stores
+  /// the handles that call has just refreshed, so that popping the frame
+  /// puts the caller's vias back where this frame found them.
   fn push_springback(&mut self, node: NodeId, affected_area: Option<Box2>) {
     let previous = self.stack.last().and_then(|frame| frame.affected_area);
 
@@ -1229,6 +1584,8 @@ impl Shove {
         (None, area) => area,
       },
       locked: false,
+      // :989 and :994.
+      dragged_vias: self.heads.iter().map(|head| head.the_via).collect(),
     });
   }
 
@@ -1246,8 +1603,10 @@ impl Shove {
   /// pushing a locked frame whenever it commits
   /// (`pcbnew/router/pns_line_placer.cpp:1626`).
   ///
-  /// `TODO(part 2)`: the via handle restoration at `:958`, which needs
-  /// the frame's via snapshot.
+  /// The surviving frame's via snapshot is copied back onto the heads
+  /// (`:958`), which is how a via drag that the mouse retreated from ends
+  /// up reporting the via where the frame below left it rather than where
+  /// the dropped frame had pushed it.
   fn reduce_springback(
     &mut self,
     world: &mut World,
@@ -1276,6 +1635,24 @@ impl Shove {
       self.prune_root_lines(world, node);
       world.drop_node(node);
       self.stack.pop();
+    }
+
+    // :952
+    let Some(frame) = self.stack.last() else {
+      return self.root;
+    };
+
+    // :958
+    let restored: Vec<Option<ViaHandle>> = frame.dragged_vias.clone();
+
+    for (index, via) in restored.into_iter().enumerate() {
+      let (Some(via), Some(head)) = (via, self.heads.get_mut(index)) else {
+        continue;
+      };
+
+      head.the_via = Some(via);
+      head.prev_via = Some(via);
+      head.geometry_modified = true;
     }
 
     self.stack.last().map_or(self.root, |frame| frame.node)
@@ -1340,6 +1717,28 @@ impl Shove {
       ShovePolicy::DEFAULT,
       &uids,
     )
+  }
+
+  /// The entry that stands for one stored item, creating one if needed.
+  ///
+  /// Port of `touchRootLine( const LINKED_ITEM* )`,
+  /// `pcbnew/router/pns_shove.cpp:2003`, which creates the entry with
+  /// **no** root shape: a via has no pre shove polyline to compare
+  /// against, only a position.
+  fn touch_root_line_of_item(
+    &mut self,
+    world: &World,
+    item: ItemId,
+  ) -> RootLineId {
+    let Some(uid) = world.item(item).map(Item::uid) else {
+      return self.root_lines.alloc(None, ShovePolicy::DEFAULT, &[]);
+    };
+
+    if let Some(id) = self.root_lines.find_by_uid(uid) {
+      return id;
+    }
+
+    self.root_lines.alloc(None, ShovePolicy::DEFAULT, &[uid])
   }
 
   /// Drop the index entries of everything a node added.
@@ -1418,8 +1817,19 @@ impl Shove {
   fn unwind_line_stack(&mut self, world: &World, item: ItemId) {
     let is_via = world.item(item).is_some_and(|item| item.of_kind(Kind::VIA));
 
-    self.line_stack.retain_not_referencing(item);
+    self.line_stack.unwind(world, item);
     self.optimizer_queue.retain_not_referencing(item, is_via);
+  }
+
+  /// Take every line that references any link of a line off both stacks.
+  ///
+  /// Port of the `LINE_T` branch of `unwindLineStack( const ITEM* )`,
+  /// `pcbnew/router/pns_shove.cpp:1447`, which is the per link overload
+  /// once per link.
+  fn unwind_line(&mut self, world: &World, line: &Line) {
+    for link in line.links().to_vec() {
+      self.unwind_line_stack(world, link);
+    }
   }
 
   // -----------------------------------------------------------------
@@ -1435,9 +1845,10 @@ impl Shove {
   /// re-points every one of the new line's links at that same entry so
   /// that the pre shove shape survives any number of further shoves.
   ///
-  /// `TODO(part 2)`: the via unlink at `:99`, which takes a via link off
-  /// the old line so that the replace does not remove the via with the
-  /// segments.
+  /// The via unlink at `:99` is what stops a shove from deleting a via:
+  /// [`World::remove_line`] takes every link out of the node, via links
+  /// included, so the via has to leave the old line's link list before
+  /// the replace runs.
   fn replace_line(
     &mut self,
     world: &mut World,
@@ -1453,6 +1864,18 @@ impl Shove {
         Some(previous) => previous.merge(area),
         None => area,
       });
+    }
+
+    // :99. The via link comes off the old line so that the replace does
+    // not take the via out of the node with the segments.
+    if old.ends_with_via()
+      && let Some(via) = old.links().iter().copied().find(|link| {
+        world
+          .item(*link)
+          .is_some_and(|item| item.of_kind(Kind::VIA))
+      })
+    {
+      old.unlink(via);
     }
 
     // :124. The old line's uids have to be read before the replace, which
@@ -1483,20 +1906,56 @@ impl Shove {
   // Geometry
   // -----------------------------------------------------------------
 
-  /// The clearance two lines need from each other.
+  /// The clearance two items need from each other.
   ///
-  /// Port of `getClearance`, `pcbnew/router/pns_shove.cpp:169`, for the
-  /// one pair of shapes this revision asks about. The forced clearance
-  /// short circuits the resolver entirely, which is the whole reason the
-  /// function exists.
-  ///
-  /// `TODO(part 2)`: the two hole terms at `:177` and `:180`. Neither a
-  /// segment nor a line owns a hole, so they cannot contribute until vias
-  /// arrive.
+  /// Port of `getClearance`, `pcbnew/router/pns_shove.cpp:169`. The
+  /// forced clearance short circuits the resolver entirely, which is the
+  /// whole reason the function exists, and the two hole terms at `:177`
+  /// and `:180` raise the answer to whatever the holes need: a via has to
+  /// be hulled so that the hull clears the **hole** as well as the pad.
   ///
   /// `-1` is KiCad's "these two can never collide" arriving in an `int`
   /// and being used as a length regardless; the hull it sizes is only
   /// ever compared with other hulls.
+  fn clearance_between_items(
+    &self,
+    world: &World,
+    context: &AlgoContext<'_>,
+    first: ItemRef<'_>,
+    second: ItemRef<'_>,
+  ) -> i32 {
+    if let Some(forced) = self.force_clearance {
+      return forced;
+    }
+
+    let ask = |a: ItemRef<'_>, b: ItemRef<'_>| {
+      context.resolver.clearance(a, Some(b), false).unwrap_or(-1)
+    };
+    let mut clearance = ask(first, second);
+
+    // :176
+    if let Some(hole) = first.item().hole()
+      && let Some(stored) = world.item(hole)
+    {
+      clearance = clearance.max(ask(ItemRef::stored(hole, stored), second));
+    }
+
+    // :179
+    if let Some(hole) = second.item().hole()
+      && let Some(stored) = world.item(hole)
+    {
+      clearance = clearance.max(ask(first, ItemRef::stored(hole, stored)));
+    }
+
+    clearance
+  }
+
+  /// The clearance two lines need from each other.
+  ///
+  /// [`Shove::clearance_between_items`] over the two rule probes, which
+  /// is the `getClearance( &aCurLine, &obstacleLine )` of
+  /// `ShoveObstacleLine` (`pcbnew/router/pns_shove.cpp:570`). A line owns
+  /// no hole, so neither hole term can contribute.
   fn clearance_between_lines(
     &self,
     world: &World,
@@ -1504,21 +1963,71 @@ impl Shove {
     first: &Line,
     second: &Line,
   ) -> i32 {
-    if let Some(forced) = self.force_clearance {
-      return forced;
-    }
-
     let first_item = first.rule_item(world, PROBE_UID);
     let second_item = second.rule_item(world, PROBE_UID);
 
-    context
+    self.clearance_between_items(
+      world,
+      context,
+      ItemRef::unstored(&first_item),
+      ItemRef::unstored(&second_item),
+    )
+  }
+
+  /// The clearance a via needs from a line, with the hole as the binding
+  /// constraint when it is one.
+  ///
+  /// The `:604` to `:612` block of `ShoveObstacleLine`, repeated at
+  /// `:286` to `:290` inside `shoveLineFromLoneVia`: if the hole
+  /// clearance plus the hole radius reaches further than the pad
+  /// clearance plus the pad radius, the pad clearance is rewritten so
+  /// that a hull built around the **pad** still clears the hole.
+  ///
+  /// `via` is an [`ItemRef`] rather than an [`ItemId`] because the pusher's
+  /// via may be one the line owns and no node holds.
+  fn via_clearance_against_line(
+    &self,
+    world: &World,
+    context: &AlgoContext<'_>,
+    via: ItemRef<'_>,
+    obstacle: &Line,
+  ) -> i32 {
+    let probe = obstacle.rule_item(world, PROBE_UID);
+    let mut clearance = self.clearance_between_items(
+      world,
+      context,
+      via,
+      ItemRef::unstored(&probe),
+    );
+
+    let ItemBody::Via(body) = via.item().body() else {
+      return clearance;
+    };
+
+    let Some((hole_id, hole)) = via
+      .item()
+      .hole()
+      .and_then(|id| world.item(id).map(|item| (id, item)))
+    else {
+      return clearance;
+    };
+
+    let hole_clearance = context
       .resolver
       .clearance(
-        crate::rules::ItemRef::unstored(&first_item),
-        Some(crate::rules::ItemRef::unstored(&second_item)),
+        ItemRef::stored(hole_id, hole),
+        Some(ItemRef::unstored(&probe)),
         false,
       )
-      .unwrap_or(-1)
+      .unwrap_or(-1);
+    let diameter = body.diameter(via.item().layers(), obstacle.layer());
+
+    // :609
+    if hole_clearance + body.drill() / 2 > clearance + diameter / 2 {
+      clearance = hole_clearance + body.drill() / 2 - diameter / 2;
+    }
+
+    clearance
   }
 
   /// Whether a candidate was shoved the right way.
@@ -1541,7 +2050,8 @@ impl Shove {
     shoved_line: &Line,
   ) -> bool {
     // :248. A lone via has no points at all, so its centre is the
-    // reference; `TODO(part 2)` covers the via that produces that shape.
+    // reference; `Shove::on_reverse_colliding_via` builds exactly that
+    // shape at `:1348`.
     let lone_via = cur_line.point_count() == 0 && cur_line.ends_with_via();
 
     let mut reference = if lone_via {
@@ -1599,9 +2109,9 @@ impl Shove {
   /// KiCad writes a direction rejected candidate into its out parameter
   /// before moving on (`:470`), so a caller that ignores the return value
   /// can read a shape that failed. `onCollidingArc` is exactly such a
-  /// caller (note 04 section 1.7); it is `TODO(part 2)`, and the segment
-  /// handler reads the shape only on success, so the wart has no
-  /// counterpart here.
+  /// caller (note 04 section 1.7); it is `TODO(arcs)`, and every caller
+  /// here reads the shape only on success, so the wart has no
+  /// counterpart.
   fn shove_line_to_hull_set(
     &self,
     world: &World,
@@ -1748,10 +2258,9 @@ impl Shove {
   /// placer uses it as a geometric primitive outside any run
   /// (`pcbnew/router/pns_diff_pair_placer.cpp:251`).
   ///
-  /// `TODO(part 2)`: the lone via branch at `:558`
-  /// (`shoveLineFromLoneVia`, `:278`), the via hull at `:614`, and the
-  /// arc clearance bump at `:593`, whose accumulation across several arc
-  /// segments note 04 section 2.3 flags as probably unintended.
+  /// `TODO(arcs)`: the arc clearance bump at `:593`, whose accumulation
+  /// across several arc segments note 04 section 2.3 flags as probably
+  /// unintended.
   pub fn shove_obstacle_line(
     &self,
     world: &World,
@@ -1789,15 +2298,20 @@ impl Shove {
       obstacle.remove_via();
     }
 
-    // :558
-    if cur_line.ends_with_via() {
-      // `TODO(part 2)`: `shoveLineFromLoneVia`. A pusher whose via is the
-      // only thing on the obstacle's layer needs the via hull path.
-      if !cur_line.layers().overlaps(obstacle.layers())
-        || cur_line.segment_count() == 0
-      {
-        return None;
-      }
+    // :545 and :558. Only the pusher's via reaches the obstacle's layer,
+    // so the hull set collapses to that one via hull.
+    let pusher_has_via = cur_line.ends_with_via();
+
+    if pusher_has_via
+      && (!cur_line.layers().overlaps(obstacle.layers())
+        || cur_line.segment_count() == 0)
+    {
+      let shape =
+        self.shove_line_from_lone_via(world, context, cur_line, &obstacle)?;
+
+      result.set_shape(shape);
+
+      return Some(result);
     }
 
     // :570
@@ -1821,8 +2335,18 @@ impl Shove {
         ));
       }
 
-      // `TODO(part 2)`: the pusher's own via hull at `:604`, with the
-      // hole clearance rewrite at `:609`.
+      // :601. The pusher's own via, hulled last so that the hull set
+      // stays ordered along the pusher.
+      if pusher_has_via && let Some(via) = cur_line.via_item(world) {
+        let via_clearance =
+          self.via_clearance_against_line(world, context, via, &obstacle);
+
+        hulls.push(via.item().hull(
+          via_clearance,
+          obstacle.width(),
+          obstacle.layer(),
+        ));
+      }
 
       // :617
       let adjust = EndpointAdjustment {
@@ -1848,6 +2372,82 @@ impl Shove {
     }
 
     None
+  }
+
+  /// Push a line away from a via that is the only thing in its way.
+  ///
+  /// Port of `shoveLineFromLoneVia`,
+  /// `pcbnew/router/pns_shove.cpp:278`, used when the pusher's segments
+  /// are on another layer or it has none, so only its via matters. One
+  /// hull, walked both ways, clockwise preferred unless
+  /// `Shove::check_shove_direction` rejects it, then the same endpoint
+  /// and collision checks the hull set path applies.
+  ///
+  /// Answers the walked chain, or [`None`] when either walk failed or a
+  /// check rejected the result.
+  ///
+  /// # A KiCad wart, reproduced
+  ///
+  /// `ShoveObstacleLine` re-appends the obstacle's own via only on its
+  /// **other** branch (`:622`), so an obstacle that ends with a via loses
+  /// it on this path. That is the shipped behaviour and the caller keeps
+  /// it.
+  fn shove_line_from_lone_via(
+    &self,
+    world: &World,
+    context: &AlgoContext<'_>,
+    cur_line: &Line,
+    obstacle_line: &Line,
+  ) -> Option<LineChain> {
+    let via = cur_line.via_item(world)?;
+    // :286 to :290, the hole as the binding constraint.
+    let clearance =
+      self.via_clearance_against_line(world, context, via, obstacle_line);
+    // :292
+    let hull =
+      via
+        .item()
+        .hull(clearance, obstacle_line.width(), cur_line.layer());
+
+    // :296 and :299.
+    let clockwise = obstacle_line.walkaround(&hull, true)?;
+    let counter_clockwise = obstacle_line.walkaround(&hull, false)?;
+
+    // :302. Clockwise unless it went the wrong way.
+    let mut candidate = obstacle_line.clone();
+
+    candidate.set_shape(clockwise);
+
+    if !self.check_shove_direction(world, cur_line, obstacle_line, &candidate) {
+      candidate.set_shape(counter_clockwise);
+    }
+
+    // :309
+    if candidate.point_count() < 2 {
+      return None;
+    }
+
+    // :312 and :315.
+    if candidate.last_point() != obstacle_line.last_point()
+      || candidate.point(0) != obstacle_line.point(0)
+    {
+      return None;
+    }
+
+    // :318
+    if world
+      .collide_lines(
+        &candidate,
+        cur_line,
+        context.resolver,
+        &CollisionSearchOptions::default(),
+      )
+      .is_some()
+    {
+      return None;
+    }
+
+    Some(candidate.shape().clone())
   }
 
   // -----------------------------------------------------------------
@@ -1981,6 +2581,914 @@ impl Shove {
     )
   }
 
+  /// Resolve a collision with something that cannot be shoved by walking
+  /// the current line around it.
+  ///
+  /// Port of `onCollidingSolid`,
+  /// `pcbnew/router/pns_shove.cpp:776`, the escape hatch of the whole
+  /// algorithm: a pad, a board edge or a via the settings forbid moving
+  /// never yields, so the **current** line is re-routed instead.
+  ///
+  /// The walk runs over a [`World::assemble_cluster`] around the
+  /// obstacle, not over the obstacle alone, so a pad in a row of touching
+  /// pads is cleared in one go rather than one pad per iteration (note 04
+  /// section 2.5).
+  ///
+  /// Two attempts that differ only in the rank the result would carry:
+  /// the first promotes it by [`WALKAROUND_RANK_PROMOTION`] unless
+  /// [`crate::settings::RoutingSettings::jump_over_obstacles`] is on, the
+  /// second demotes it the ordinary way. KiCad re-routes on both, which
+  /// is wasted work on the second attempt because nothing between them
+  /// changes; it is reproduced because the acceptance test below can
+  /// answer differently in principle and the cost is one walk.
+  ///
+  /// # Where the answer comes from
+  ///
+  /// The walked line is accepted when it does not collide with the line
+  /// at the **bottom** of the stack, or when it does and pushing that
+  /// line out of the way is feasible (`:863`). KiCad reads
+  /// `m_lineStack.front()` and calls it "the last line"; an empty stack
+  /// leaves `success` false, so the handler answers
+  /// [`ShoveStatus::Incomplete`] (`:885`). Both are reproduced.
+  ///
+  /// `world` is `&mut` because the walkaround needs the hull cache, not
+  /// because this touches an item; see the module documentation.
+  fn on_colliding_solid(
+    &self,
+    world: &mut World,
+    context: &AlgoContext<'_>,
+    node: NodeId,
+    current: &Line,
+    obstacle: ItemId,
+    max_fanout_width: i32,
+  ) -> (ShoveStatus, Vec<ShoveEffect>) {
+    // :780. A head that ends with a via meets the solid with the via, not
+    // with the track, so the roles swap and the solid becomes the pusher.
+    if current.ends_with_via() {
+      let Some(via) = self.via_at_line_end(world, node, current) else {
+        return (ShoveStatus::Incomplete, Vec::new());
+      };
+
+      let collides = match (world.item(via), world.item(obstacle)) {
+        (Some(via_item), Some(obstacle_item)) => crate::collide::collide_items(
+          world.items(),
+          ItemRef::stored(obstacle, obstacle_item),
+          ItemRef::stored(via, via_item),
+          context.resolver,
+          &CollisionSearchOptions::default(),
+        )
+        .is_some(),
+        _ => false,
+      };
+
+      // :799
+      if collides {
+        let next_rank =
+          world.item(obstacle).map_or(-1, crate::item::Item::rank) - 1;
+
+        return self.on_colliding_via(
+          world,
+          context,
+          node,
+          &ViaPusher::Solid(obstacle),
+          via,
+          max_fanout_width,
+          next_rank,
+        );
+      }
+    }
+
+    // :804
+    let cluster = world.assemble_cluster(
+      node,
+      obstacle,
+      current.layers().start(),
+      Some(CLUSTER_AREA_EXPANSION_LIMIT),
+      None,
+      context.resolver,
+    );
+
+    // :811 to :818.
+    let mut walkaround = Walkaround::new(node, context.settings);
+
+    walkaround.set_solids_only(false);
+    walkaround.restrict_to_cluster(world, true, &cluster);
+    walkaround.set_allowed_policies(&[WalkPolicy::Shortest]);
+    walkaround.set_iteration_limit(context.settings.walkaround_iteration_limit);
+
+    let current_rank = current.rank(world);
+    let mut accepted: Option<(Line, i32)> = None;
+
+    // :827
+    for attempt in 0..SOLID_WALKAROUND_ATTEMPTS {
+      // :829
+      let next_rank = if attempt == 1 || context.settings.jump_over_obstacles {
+        current_rank - 1
+      } else {
+        current_rank + WALKAROUND_RANK_PROMOTION
+      };
+
+      // :834
+      let result = walkaround.route(world, context, current);
+
+      if result.status(WalkPolicy::Shortest) != WalkaroundStatus::Done {
+        continue;
+      }
+
+      let mut walked = result.into_line(WalkPolicy::Shortest);
+
+      // :841 to :843.
+      walked.clear_links();
+      walked.unmark(world, MarkerFlags::ALL);
+      walked.chain_mut().simplify2(true);
+
+      // :845
+      if walked.has_loops() {
+        continue;
+      }
+
+      // :861. An empty stack never sets `success`.
+      let Some(last_line) = self.line_stack.first().cloned() else {
+        continue;
+      };
+
+      // :865, `lastLine.Collide( &walkaroundLine )`: the bottom line is
+      // KiCad's `this` and the walked line is its `aHead`, which is the
+      // way round that lets the walked line's own via take part.
+      let collides = world
+        .collide_lines(
+          &last_line,
+          &walked,
+          context.resolver,
+          &CollisionSearchOptions::default(),
+        )
+        .is_some();
+
+      // :869. The probe only asks whether the bottom line could be
+      // pushed out of the way; its result is thrown away.
+      if !collides
+        || self
+          .shove_obstacle_line(world, context, node, &walked, &last_line)
+          .is_some()
+      {
+        accepted = Some((walked, next_rank));
+        break;
+      }
+    }
+
+    // :885
+    let Some((walked, next_rank)) = accepted else {
+      return (ShoveStatus::Incomplete, Vec::new());
+    };
+
+    // :888 to :894.
+    (
+      ShoveStatus::Ok,
+      vec![ShoveEffect::ReplaceLine(Box::new(LineReplacement {
+        old: current.clone(),
+        new: walked,
+        rank: next_rank,
+        include_in_changed_area: true,
+        allow_redundant: false,
+        push: PushMode::PopThenTop,
+      }))],
+    )
+  }
+
+  // -----------------------------------------------------------------
+  // Vias
+  // -----------------------------------------------------------------
+
+  /// The stored via at a line's via end.
+  ///
+  /// The joint lookup of `onCollidingSolid`
+  /// (`pcbnew/router/pns_shove.cpp:784` to `:795`): the line's via may be
+  /// one it owns, and what the shove has to move is the real item the
+  /// node holds at that point.
+  fn via_at_line_end(
+    &self,
+    world: &World,
+    node: NodeId,
+    line: &Line,
+  ) -> Option<ItemId> {
+    let pos = line.via_pos(world)?;
+    let reference = world.find_joint(node, pos, line.layer(), line.net())?;
+
+    world.joint(reference)?.via(world.items())
+  }
+
+  /// Move a via out of the way, dragging every track attached to it.
+  ///
+  /// Port of `onCollidingVia`,
+  /// `pcbnew/router/pns_shove.cpp:1175`: it computes a minimum
+  /// translation vector and hands it to [`Shove::push_or_shove_via`].
+  ///
+  /// Three sources of a vector, in KiCad's priority order (`:1246`): via
+  /// against via beats line against via beats solid against via. KiCad
+  /// negates the winner twice, once at `:1247` with a "we may have a sign
+  /// issue" comment and once at `:1255`, so the via ends up pushed by
+  /// `+mtv`; the two negations cancel and are not reproduced.
+  ///
+  /// `max_fanout_width` is `OBSTACLE::m_maxFanoutWidth`, which
+  /// [`Shove::fixup_via_collisions`] fills in: the obstacle via is
+  /// inflated to the width of the widest track hanging off it before the
+  /// vector is measured, so that the vector is large enough to clear
+  /// those tracks too (`:1194`).
+  #[allow(clippy::too_many_arguments)]
+  fn on_colliding_via(
+    &self,
+    world: &mut World,
+    context: &AlgoContext<'_>,
+    node: NodeId,
+    current: &ViaPusher<'_>,
+    obstacle_via: ItemId,
+    max_fanout_width: i32,
+    next_rank: i32,
+  ) -> (ShoveStatus, Vec<ShoveEffect>) {
+    let Some(force) = self.via_pushout_vector(
+      world,
+      context,
+      current,
+      obstacle_via,
+      max_fanout_width,
+    ) else {
+      return (ShoveStatus::Incomplete, Vec::new());
+    };
+
+    // :1255
+    self.push_or_shove_via(
+      world,
+      context,
+      node,
+      obstacle_via,
+      force,
+      next_rank,
+      false,
+    )
+  }
+
+  /// The vector [`Shove::on_colliding_via`] pushes a via by.
+  ///
+  /// The measuring half of `onCollidingVia`,
+  /// `pcbnew/router/pns_shove.cpp:1179` to `:1253`, as its own function
+  /// so that the mover can stay readable. `None` names a stale handle,
+  /// which KiCad cannot represent; a pair that simply does not collide
+  /// comes back as a zero vector, which
+  /// [`Shove::push_or_shove_via`] answers [`ShoveStatus::Ok`] to
+  /// (`:1051`).
+  fn via_pushout_vector(
+    &self,
+    world: &World,
+    context: &AlgoContext<'_>,
+    current: &ViaPusher<'_>,
+    obstacle_via: ItemId,
+    max_fanout_width: i32,
+  ) -> Option<Vec2> {
+    let stored = world.item(obstacle_via)?;
+    let ItemBody::Via(body) = stored.body() else {
+      return None;
+    };
+
+    match current {
+      ViaPusher::Line(line) => {
+        let layer = line.layer();
+        let layers = stored.layers();
+
+        // :1179
+        let probe = line.rule_item(world, PROBE_UID);
+        let clearance = self.clearance_between_items(
+          world,
+          context,
+          ItemRef::unstored(&probe),
+          ItemRef::stored(obstacle_via, stored),
+        );
+
+        // :1194. The scratch copy the fanout width inflates.
+        let mut scratch = stored.clone();
+
+        if max_fanout_width > 0
+          && max_fanout_width > body.diameter(layers, layer)
+          && let ItemBody::Via(scratch_body) = scratch.body_mut()
+        {
+          scratch_body.set_diameter(
+            layers,
+            crate::item::Via::ALL_LAYERS,
+            max_fanout_width,
+          );
+        }
+
+        // :1211. `Collide( CIRCLE, LINE_CHAIN, .., &mtvLine )` writes the
+        // force on the **via**; the operands are the other way round here
+        // because `collide_mtv` displaces its second argument, which is
+        // the same cell without the negation (`src/geometry/collision.rs`).
+        let chain = Shape::LineChain(line.shape().clone());
+        let line_mtv = scratch.shape(layer).and_then(|shape| {
+          crate::geometry::collision::collide_mtv(
+            &chain,
+            &shape,
+            clearance + line.width() / 2,
+          )
+        });
+
+        // :1216. Via against via takes priority, and the largest per
+        // layer vector wins.
+        let mut via_mtv: Option<Vec2> = None;
+
+        if let Some(via) = line.via_item(world) {
+          let via_clearance = self.clearance_between_items(
+            world,
+            context,
+            via,
+            ItemRef::unstored(&scratch),
+          );
+
+          for layer in via.item().relevant_shape_layers(&scratch) {
+            let (Some(mine), Some(theirs)) =
+              (via.item().shape(layer), scratch.shape(layer))
+            else {
+              continue;
+            };
+
+            // The vector displaces the second operand, which is the
+            // obstacle via; see `collide_mtv`'s sign convention.
+            let Some(mtv) = crate::geometry::collision::collide_mtv(
+              &mine,
+              &theirs,
+              via_clearance,
+            ) else {
+              continue;
+            };
+
+            if via_mtv.is_none_or(|best: Vec2| {
+              mtv.squared_euclidean_norm() > best.squared_euclidean_norm()
+            }) {
+              via_mtv = Some(mtv);
+            }
+          }
+        }
+
+        // :1246
+        Some(via_mtv.or(line_mtv).unwrap_or(Vec2::new(0, 0)))
+      }
+      ViaPusher::Solid(solid) => {
+        let pusher = world.item(*solid)?;
+        let clearance = self.clearance_between_items(
+          world,
+          context,
+          ItemRef::stored(*solid, pusher),
+          ItemRef::stored(obstacle_via, stored),
+        );
+
+        // :1236, with the layer KiCad's `Shape( -1 )` names.
+        let layer = crate::item::Via::ALL_LAYERS;
+        let (Some(pusher_shape), Some(via_shape)) =
+          (pusher.shape(layer), stored.shape(layer))
+        else {
+          return Some(Vec2::new(0, 0));
+        };
+
+        Some(
+          crate::geometry::collision::collide_mtv(
+            &pusher_shape,
+            &via_shape,
+            clearance,
+          )
+          .unwrap_or(Vec2::new(0, 0)),
+        )
+      }
+    }
+  }
+
+  /// Work out how to move a via and what to drag with it.
+  ///
+  /// Port of `pushOrShoveVia`,
+  /// `pcbnew/router/pns_shove.cpp:1041`, up to but not including its
+  /// mutations, which are [`ShoveEffect::MoveVia`].
+  ///
+  /// The three refusals are KiCad's, in KiCad's order: no joint at the
+  /// via centre is [`ShoveStatus::Incomplete`] (`:1054`), a locked via or
+  /// [`crate::settings::RoutingSettings::shove_vias`] switched off is
+  /// [`ShoveStatus::TryWalk`] so the caller walks around it instead
+  /// (`:1060`), and a locked **joint** is
+  /// [`ShoveStatus::Incomplete`] (`:1063`).
+  ///
+  /// The fanout is every segment at the via's joint, each assembled into
+  /// a whole line and reversed if needed so that the via end is last, then
+  /// corner dragged to the via's new position. A locked segment anywhere
+  /// in that fanout is [`ShoveStatus::TryWalk`] (`:1091`).
+  #[allow(clippy::too_many_arguments)]
+  fn push_or_shove_via(
+    &self,
+    world: &World,
+    context: &AlgoContext<'_>,
+    node: NodeId,
+    via: ItemId,
+    force: Vec2,
+    new_rank: i32,
+    dont_unwind_stack: bool,
+  ) -> (ShoveStatus, Vec<ShoveEffect>) {
+    // :1051
+    if force == Vec2::new(0, 0) {
+      return (ShoveStatus::Ok, Vec::new());
+    }
+
+    let Some(stored) = world.item(via) else {
+      return (ShoveStatus::Incomplete, Vec::new());
+    };
+    let ItemBody::Via(body) = stored.body() else {
+      return (ShoveStatus::Incomplete, Vec::new());
+    };
+
+    let origin = body.pos();
+    let layer = stored.layer();
+    let net = stored.net();
+
+    // :1054
+    let Some(reference) = world.find_joint(node, origin, layer, net) else {
+      trace(context, || {
+        "shove: weird, cannot find the centre of via joint".to_string()
+      });
+
+      return (ShoveStatus::Incomplete, Vec::new());
+    };
+    let Some(joint) = world.joint(reference) else {
+      return (ShoveStatus::Incomplete, Vec::new());
+    };
+
+    // :1060
+    if !context.settings.shove_vias || stored.is_locked() {
+      return (ShoveStatus::TryWalk, Vec::new());
+    }
+
+    // :1063
+    if joint.is_locked() {
+      return (ShoveStatus::Incomplete, Vec::new());
+    }
+
+    // :1067. The via must not land on an existing joint.
+    let mut pushed_pos = origin + force;
+    let nudge = force.resize(VIA_ANTI_SNAP_NUDGE);
+    let mut steps = 0;
+
+    while world.find_joint(node, pushed_pos, layer, net).is_some() {
+      if steps >= VIA_ANTI_SNAP_LIMIT {
+        return (ShoveStatus::Incomplete, Vec::new());
+      }
+
+      pushed_pos += nudge;
+      steps += 1;
+    }
+
+    // :1077, `Clone( *aVia )` followed by `SetPos`. KiCad's via copy
+    // constructor gives the copy a **fresh** hole rather than aliasing
+    // the original's (`pcbnew/router/pns_via.h:126` and `:143`), and so
+    // must this: a hole is a separate arena item here, and letting the
+    // new via keep the old handle would re home the original's hole into
+    // whatever branch the copy is added to, so dropping that branch would
+    // take the original's drill with it.
+    let mut pushed = stored.clone();
+
+    pushed.set_hole(None);
+
+    if let ItemBody::Via(body) = pushed.body_mut() {
+      body.set_pos(pushed_pos);
+    }
+
+    // :1107
+    pushed.set_rank(new_rank);
+
+    // :1081. Joint link order is insertion order, which is deterministic
+    // here because every writer of it is (note 04 section 9 item 6).
+    let mut dragged: Vec<(Line, Line)> = Vec::new();
+
+    for link in joint.links().to_vec() {
+      let Some(item) = world.item(link) else {
+        continue;
+      };
+
+      if !item.of_kind(Kind::SEGMENT | Kind::ARC) {
+        continue;
+      }
+
+      let mut before = world.assemble_line(node, link, None, true, false, true);
+
+      // :1091
+      if before.has_locked_segments(world) {
+        return (ShoveStatus::TryWalk, Vec::new());
+      }
+
+      // :1096. KiCad asserts the via is at one end of the line; a line
+      // that does not touch the via at all is skipped here instead.
+      let corner = match before.shape().find(origin, 0) {
+        Some(0) => {
+          before.reverse();
+
+          before.point_count() - 1
+        }
+        Some(index) if index == before.point_count() - 1 => index,
+        _ => continue,
+      };
+
+      // :1099
+      let mut after = before.clone();
+
+      after.clear_links();
+      after.drag_corner(pushed_pos, corner);
+      after.chain_mut().simplify2(true);
+
+      dragged.push((before, after));
+    }
+
+    (
+      ShoveStatus::Ok,
+      vec![ShoveEffect::MoveVia(Box::new(ViaMovement {
+        old_via: via,
+        new_via: Box::new(pushed),
+        dragged,
+        rank: new_rank,
+        dont_unwind_stack,
+      }))],
+    )
+  }
+
+  /// Yield to a via that this run already shoved.
+  ///
+  /// Port of `onReverseCollidingVia`,
+  /// `pcbnew/router/pns_shove.cpp:1267`. The current line has run into a
+  /// via with a **higher** rank, so the earlier decision wins and the
+  /// current line is the one that moves.
+  ///
+  /// It is shoved once per track attached to the via, against a synthetic
+  /// pusher made of that track plus the via, so that the results compose
+  /// (`:1315`). A via with nothing attached gets a degenerate pusher that
+  /// is the via alone (`:1348`).
+  ///
+  /// A via to via collision escalates back to
+  /// [`Shove::on_colliding_via`] instead (`:1301`), because two vias
+  /// cannot both stay where they are.
+  fn on_reverse_colliding_via(
+    &self,
+    world: &mut World,
+    context: &AlgoContext<'_>,
+    node: NodeId,
+    current: &Line,
+    obstacle_via: ItemId,
+    max_fanout_width: i32,
+  ) -> (ShoveStatus, Vec<ShoveEffect>) {
+    let Some(stored) = world.item(obstacle_via) else {
+      return (ShoveStatus::Incomplete, Vec::new());
+    };
+
+    // :1271. KiCad also fetches the obstacle's hull and runs an inside
+    // test purely to draw it (`:1282`); nothing reads the answer.
+    if current.ends_with_via()
+      && let Some(via) = current.via_item(world)
+    {
+      let clearance = self.clearance_between_items(
+        world,
+        context,
+        via,
+        ItemRef::stored(obstacle_via, stored),
+      );
+      let mut collides = false;
+
+      for layer in via.item().relevant_shape_layers(stored) {
+        let (Some(mine), Some(theirs)) =
+          (via.item().shape(layer), stored.shape(layer))
+        else {
+          continue;
+        };
+
+        collides |=
+          crate::geometry::collision::collides(&mine, &theirs, clearance);
+      }
+
+      // :1299
+      if collides {
+        let next_rank = current.rank(world) - 1;
+
+        return self.on_colliding_via(
+          world,
+          context,
+          node,
+          &ViaPusher::Line(current),
+          obstacle_via,
+          max_fanout_width,
+          next_rank,
+        );
+      }
+    }
+
+    let Some(pos) =
+      world.item(obstacle_via).and_then(|item| match item.body() {
+        ItemBody::Via(body) => Some(body.pos()),
+        _ => None,
+      })
+    else {
+      return (ShoveStatus::Incomplete, Vec::new());
+    };
+    let net = world.item(obstacle_via).and_then(Item::net);
+    let layer = world.item(obstacle_via).map_or(0, Item::layer);
+
+    // :1308 and :1312.
+    let mut carried = current.clone();
+
+    carried.clear_links();
+    carried.remove_via();
+
+    let mut shoved = current.clone();
+
+    shoved.clear_links();
+
+    // :1313
+    let mut effects: Vec<ShoveEffect> = current
+      .links()
+      .iter()
+      .map(|link| ShoveEffect::Unwind(*link))
+      .collect();
+
+    // :1315
+    let links = world
+      .find_joint(node, pos, layer, net)
+      .and_then(|reference| world.joint(reference))
+      .map_or_else(Vec::new, |joint| joint.links().to_vec());
+    let mut pushers = 0;
+
+    for link in links {
+      let Some(item) = world.item(link) else {
+        continue;
+      };
+
+      if !item.of_kind(Kind::SEGMENT | Kind::ARC)
+        || !item.layers().overlaps(current.layers())
+      {
+        continue;
+      }
+
+      // :1322
+      let mut pusher = world.assemble_line(node, link, None, true, false, true);
+
+      pusher.link_via(obstacle_via, pos);
+
+      // :1326
+      let Some(result) =
+        self.shove_obstacle_line(world, context, node, &pusher, &carried)
+      else {
+        return (ShoveStatus::Incomplete, Vec::new());
+      };
+
+      // :1344
+      carried.set_shape(result.shape().clone());
+      shoved = result;
+      pushers += 1;
+    }
+
+    // :1348. A stitching via with nothing attached.
+    if pushers == 0 {
+      let mut pusher = current.clone();
+
+      pusher.chain_mut().clear();
+      pusher.clear_links();
+      pusher.remove_via();
+      pusher.link_via(obstacle_via, pos);
+
+      let Some(result) =
+        self.shove_obstacle_line(world, context, node, &pusher, current)
+      else {
+        return (ShoveStatus::Incomplete, Vec::new());
+      };
+
+      carried.set_shape(result.shape().clone());
+      shoved = result;
+    }
+
+    shoved.clear_links();
+
+    // :1368
+    if let Some(via) = current.via() {
+      restore_via(&mut shoved, via.clone());
+    }
+
+    // :1377. The rank is captured before the replace, and KiCad writes it
+    // back after the push; the effect carries it into the replace, which
+    // reaches the same items through `LINE::SetRank`'s propagation.
+    let current_rank = current.rank(world);
+
+    // :1378 and :1379.
+    effects.extend(
+      current
+        .links()
+        .iter()
+        .map(|link| ShoveEffect::Unwind(*link)),
+    );
+    effects.push(ShoveEffect::ReplaceLine(Box::new(LineReplacement {
+      old: current.clone(),
+      new: shoved,
+      rank: current_rank,
+      include_in_changed_area: true,
+      allow_redundant: false,
+      push: PushMode::Top,
+    })));
+
+    (ShoveStatus::Ok, effects)
+  }
+
+  /// Rewrite an obstacle so that a via is shoved rather than the track
+  /// hanging off it.
+  ///
+  /// Port of `fixupViaCollisions`,
+  /// `pcbnew/router/pns_shove.cpp:1517`, a pre-pass on every iteration
+  /// (`:1700`) whose whole job is to keep the force propagation
+  /// assumption true: a track end never moves on its own, it is only ever
+  /// dragged by a via.
+  ///
+  /// Two cases. The obstacle is a via, and then the widest track attached
+  /// to it is reported so that
+  /// [`Shove::on_colliding_via`] can inflate the via before it measures
+  /// (`:1527`). Or the obstacle is a segment with a via on one end that
+  /// is **narrower** than the segment, and then the obstacle is rewritten
+  /// to be that via (`:1564`), because shoving the segment would leave
+  /// the via behind.
+  ///
+  /// Answers the obstacle to act on and its fanout width, where KiCad
+  /// writes both back into the `OBSTACLE` it was handed.
+  fn fixup_via_collisions(
+    &self,
+    world: &World,
+    context: &AlgoContext<'_>,
+    node: NodeId,
+    current: &Line,
+    obstacle: ItemId,
+  ) -> (ItemId, i32) {
+    let layer = current.layer();
+    let Some(item) = world.item(obstacle) else {
+      return (obstacle, 0);
+    };
+
+    // :1527
+    if let ItemBody::Via(body) = item.body() {
+      let Some(reference) =
+        world.find_joint(node, body.pos(), item.layer(), item.net())
+      else {
+        return (obstacle, 0);
+      };
+      let Some(joint) = world.joint(reference) else {
+        return (obstacle, 0);
+      };
+      let widest = joint
+        .links()
+        .iter()
+        .filter_map(|link| match world.item(*link)?.body() {
+          ItemBody::Segment(segment) => Some(segment.width()),
+          _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+
+      // :1551
+      if widest > 0 && widest >= body.diameter(item.layers(), layer) {
+        return (obstacle, widest + FANOUT_WIDTH_SLACK);
+      }
+
+      return (obstacle, 0);
+    }
+
+    // :1563
+    let ItemBody::Segment(segment) = item.body() else {
+      return (obstacle, 0);
+    };
+
+    let seg = segment.seg();
+    let width = segment.width();
+    let segment_layer = item.layer();
+    let ends = [seg.a, seg.b];
+
+    for end in ends {
+      // :1570. KiCad reads `ja->Via()` without checking that the joint
+      // exists; a missing joint is skipped here.
+      let Some(via) = world
+        .find_joint(node, end, segment_layer, item.net())
+        .and_then(|reference| world.joint(reference))
+        .and_then(|joint| joint.via(world.items()))
+      else {
+        continue;
+      };
+      let Some(stored) = world.item(via) else {
+        continue;
+      };
+      let ItemBody::Via(body) = stored.body() else {
+        continue;
+      };
+
+      // :1580. A via wider than the track needs no help.
+      if body.diameter(stored.layers(), segment_layer) > width {
+        continue;
+      }
+
+      // :1583
+      let mut test = stored.clone();
+
+      if let ItemBody::Via(body) = test.body_mut() {
+        body.set_diameter(stored.layers(), crate::item::Via::ALL_LAYERS, width);
+      }
+
+      let probe = current.rule_item(world, PROBE_UID);
+      let head = LineHead::new(
+        ItemRef::unstored(&probe),
+        current,
+        current.via_item(world),
+      );
+
+      // :1587
+      if collide_line_items(
+        world.items(),
+        ItemRef::unstored(&test),
+        &head,
+        context.resolver,
+        &CollisionSearchOptions::default(),
+      )
+      .is_some()
+      {
+        // :1591
+        return (via, width + FANOUT_WIDTH_SLACK);
+      }
+    }
+
+    (obstacle, 0)
+  }
+
+  /// Re-attach a via that earlier shoving detached from a track.
+  ///
+  /// Port of `patchTadpoleVia`,
+  /// `pcbnew/router/pns_shove.cpp:1599`, called on both reverse collision
+  /// branches (`:1727`, `:1762`). When the current line's last point sits
+  /// on a joint that carries a colliding via and the line does not
+  /// already end with one, the via is linked in so that the pair behaves
+  /// as a unit again.
+  ///
+  /// KiCad's version always returns false and both call sites ignore the
+  /// answer; this returns whether it linked anything, which the caller
+  /// also ignores and a test can read.
+  ///
+  /// KiCad mutates the local copy of the stack top, not the stacked line,
+  /// so the patch lives exactly as long as the iteration does. That is
+  /// reproduced: `current` here is the iteration's own copy.
+  fn patch_tadpole_via(
+    &self,
+    world: &World,
+    context: &AlgoContext<'_>,
+    node: NodeId,
+    current: &mut Line,
+  ) -> bool {
+    // :1601
+    let Some(last) = current.last_point() else {
+      return false;
+    };
+
+    let Some(via) = world
+      .find_joint(node, last, current.layer(), current.net())
+      .and_then(|reference| world.joint(reference))
+      .and_then(|joint| joint.via(world.items()))
+    else {
+      return false;
+    };
+
+    if current.ends_with_via() {
+      return false;
+    }
+
+    let Some(stored) = world.item(via) else {
+      return false;
+    };
+
+    // :1620
+    let colliding = world
+      .check_colliding(
+        node,
+        ItemRef::stored(via, stored),
+        context.resolver,
+        &CollisionSearchOptions {
+          limit_count: Some(1),
+          ..CollisionSearchOptions::default()
+        },
+      )
+      .is_some();
+
+    if !colliding {
+      return false;
+    }
+
+    let ItemBody::Via(body) = stored.body() else {
+      return false;
+    };
+    let pos = body.pos();
+
+    // :1624
+    current.link_via(via, pos);
+
+    true
+  }
+
   // -----------------------------------------------------------------
   // The main loop
   // -----------------------------------------------------------------
@@ -2007,13 +3515,15 @@ impl Shove {
   /// decrease outward from [`HEAD_RANK`] and a cycle would need an item
   /// to outrank its own pusher.
   ///
-  /// `TODO(part 2)`: `fixupViaCollisions` at `:1700`,
-  /// `patchTadpoleVia` at `:1727` and `:1762`, the via and arc branches
-  /// on both sides of the rank test, and the solid branch at `:1859`
-  /// along with the `SH_TRY_WALK` escalation at `:1825` that reaches it.
-  /// Each of them answers [`ShoveStatus::Incomplete`] here rather than
-  /// guessing, so a head that meets a pad in this revision fails the way
-  /// a head that cannot be shoved does.
+  /// # The escalation ladder
+  ///
+  /// A handler that answers [`ShoveStatus::TryWalk`] means "this cannot
+  /// be moved", and every such answer is turned into
+  /// `Shove::on_colliding_solid` here (`:1826`, `:1841`, `:1855`), so
+  /// a locked track, a locked via and a via the settings forbid moving
+  /// all end up with the current line walking around them.
+  ///
+  /// `TODO(arcs)`: the arc branches at `:1793` and `:1833`.
   fn shove_iteration(
     &self,
     world: &mut World,
@@ -2035,8 +3545,8 @@ impl Shove {
         ..CollisionSearchOptions::default()
       };
 
-      // `TODO(part 2)`: the `SHP_IGNORE` filter at `:1654`, which nothing
-      // in KiCad's tree ever switches on; see [`ShovePolicy::IGNORE`].
+      // Not built: the `SHP_IGNORE` filter at `:1654`, which nothing in
+      // KiCad's tree ever switches on; see [`ShovePolicy::IGNORE`].
       nearest = world.nearest_obstacle(
         node,
         &current,
@@ -2056,11 +3566,14 @@ impl Shove {
       return (ShoveStatus::Ok, vec![ShoveEffect::RetireLine]);
     };
 
-    // `TODO(part 2)`: `fixupViaCollisions` at `:1700`.
-
-    let Some(obstacle_item) = nearest.item else {
+    let Some(found) = nearest.item else {
       return (ShoveStatus::Incomplete, Vec::new());
     };
+
+    // :1698. The pre-pass that may rewrite the obstacle from a segment to
+    // the via that holds its end.
+    let (obstacle_item, max_fanout_width) =
+      self.fixup_via_collisions(world, context, node, &current, found);
 
     let Some((kind, obstacle_rank)) = world
       .item(obstacle_item)
@@ -2071,7 +3584,7 @@ impl Shove {
 
     trace(context, || {
       format!(
-        "shove: iter {iteration} obstacle rank {obstacle_rank} current rank {}",
+        "shove: iter {iteration} obstacle {kind:?} rank {obstacle_rank} current rank {}",
         current.rank(world)
       )
     });
@@ -2084,70 +3597,219 @@ impl Shove {
       && obstacle_rank >= 0
       && obstacle_rank > current.rank(world);
 
-    if !kind.of_kind(Kind::SEGMENT) {
-      // `TODO(part 2)`: the solid branch at `:1859`, the via branches at
-      // `:1737`, `:1743` and `:1847`, and the arc branches at `:1793` and
-      // `:1833`.
-      trace(context, || {
-        format!("shove: obstacle kind {kind:?} needs part 2")
+    if reverse {
+      return self.reverse_collision(
+        world,
+        context,
+        node,
+        current,
+        obstacle_item,
+        kind,
+        max_fanout_width,
+        effects,
+      );
+    }
+
+    // :1820. A lower ranking obstacle, or a solid.
+    let (status, pushed) = if kind.of_kind(Kind::SEGMENT) {
+      // :1823
+      self.on_colliding_segment(world, context, node, &current, obstacle_item)
+    } else if kind.of_kind(Kind::VIA) {
+      // :1847
+      let next_rank = current.rank(world) - 1;
+
+      self.on_colliding_via(
+        world,
+        context,
+        node,
+        &ViaPusher::Line(&current),
+        obstacle_item,
+        max_fanout_width,
+        next_rank,
+      )
+    } else if kind.of_kind(Kind::SOLID | Kind::HOLE) {
+      // :1859
+      self.on_colliding_solid(
+        world,
+        context,
+        node,
+        &current,
+        obstacle_item,
+        max_fanout_width,
+      )
+    } else {
+      // :1870, KiCad's `default: break`, which leaves `st` at `SH_NULL`
+      // and lets the loop treat the iteration as a failure.
+      (ShoveStatus::Incomplete, Vec::new())
+    };
+
+    // :1826, :1841 and :1855. Whatever refused to move is walked around.
+    if status == ShoveStatus::TryWalk {
+      let (status, pushed) = self.on_colliding_solid(
+        world,
+        context,
+        node,
+        &current,
+        obstacle_item,
+        max_fanout_width,
+      );
+
+      effects.extend(pushed);
+
+      return (status, effects);
+    }
+
+    effects.extend(pushed);
+
+    (status, effects)
+  }
+
+  /// The branch `Shove::shove_iteration` takes when the obstacle
+  /// outranks the current line.
+  ///
+  /// `pcbnew/router/pns_shove.cpp:1721` to `:1815`, split out so that the
+  /// iteration stays readable. The rule is "the earlier decision wins",
+  /// so the current line is the one that yields.
+  #[allow(clippy::too_many_arguments)]
+  fn reverse_collision(
+    &self,
+    world: &mut World,
+    context: &AlgoContext<'_>,
+    node: NodeId,
+    current: Line,
+    obstacle_item: ItemId,
+    kind: Kind,
+    max_fanout_width: i32,
+    mut effects: Vec<ShoveEffect>,
+  ) -> (ShoveStatus, Vec<ShoveEffect>) {
+    let mut current = current;
+
+    if kind.of_kind(Kind::VIA) {
+      // :1727
+      self.patch_tadpole_via(world, context, node, &mut current);
+
+      // :1730. Two vias cannot both stay put, so a real via to via
+      // collision is a forward shove of the obstacle after all.
+      let via_to_via = current.via_item(world).is_some_and(|via| {
+        world.item(obstacle_item).is_some_and(|obstacle| {
+          crate::collide::collide_items(
+            world.items(),
+            ItemRef::stored(obstacle_item, obstacle),
+            via,
+            context.resolver,
+            &CollisionSearchOptions::default(),
+          )
+          .is_some()
+        })
       });
 
+      let (status, pushed) = if via_to_via {
+        // :1737
+        let next_rank = world.item(obstacle_item).map_or(-1, Item::rank) + 1;
+
+        self.on_colliding_via(
+          world,
+          context,
+          node,
+          &ViaPusher::Line(&current),
+          obstacle_item,
+          max_fanout_width,
+          next_rank,
+        )
+      } else {
+        // :1743
+        self.on_reverse_colliding_via(
+          world,
+          context,
+          node,
+          &current,
+          obstacle_item,
+          max_fanout_width,
+        )
+      };
+
+      effects.extend(pushed);
+
+      return (status, effects);
+    }
+
+    if !kind.of_kind(Kind::SEGMENT) {
+      // :1810, KiCad's `assert( false )` for a reverse collision with
+      // anything else. `TODO(arcs)`: the arc branch at `:1793`.
       return (ShoveStatus::Incomplete, Vec::new());
     }
 
-    if reverse {
-      // :1753. The current line ran into something it already shoved, so
-      // the roles swap: the obstacle's line becomes the pusher.
-      let reverse_line =
-        world.assemble_line(node, obstacle_item, None, true, false, true);
+    // :1753. The obstacle's line becomes the pusher.
+    let reverse_line =
+      world.assemble_line(node, obstacle_item, None, true, false, true);
 
-      // :1758 and :1759.
-      effects.push(ShoveEffect::PopLine);
-      effects.extend(
-        reverse_line
-          .links()
-          .iter()
-          .map(|link| ShoveEffect::Unwind(*link)),
-      );
+    // :1758, :1759 and :1760.
+    effects.push(ShoveEffect::PopLine);
+    effects.extend(
+      reverse_line
+        .links()
+        .iter()
+        .map(|link| ShoveEffect::Unwind(*link)),
+    );
+    self.patch_tadpole_via(world, context, node, &mut current);
 
-      // `TODO(part 2)`: `patchTadpoleVia` at `:1762` and the via branch
-      // at `:1766`.
+    // :1762. A head whose via is what actually touches the segment shoves
+    // the via that segment hangs off, not the line.
+    let via_hits_segment = current.via_item(world).is_some_and(|via| {
+      world.item(obstacle_item).is_some_and(|obstacle| {
+        crate::collide::collide_items(
+          world.items(),
+          ItemRef::stored(obstacle_item, obstacle),
+          via,
+          context.resolver,
+          &CollisionSearchOptions::default(),
+        )
+        .is_some()
+      })
+    });
 
+    let (status, pushed) = if via_hits_segment {
+      // :1770. KiCad looks the via up again by handle, and answers
+      // `SH_INCOMPLETE` when the node no longer has it.
+      match self.via_at_line_end(world, node, &current) {
+        Some(via) => {
+          let next_rank = reverse_line.rank(world) + 1;
+
+          self.on_colliding_via(
+            world,
+            context,
+            node,
+            &ViaPusher::Line(&reverse_line),
+            via,
+            max_fanout_width,
+            next_rank,
+          )
+        }
+        None => (ShoveStatus::Incomplete, Vec::new()),
+      }
+    } else {
       // :1779
       let next_rank = reverse_line.rank(world) + 1;
-      let (status, pushed) = self.on_colliding_line(
+
+      self.on_colliding_line(
         world,
         context,
         node,
         &reverse_line,
         &current,
         next_rank,
-      );
-
-      effects.extend(pushed);
-
-      // :1782. KiCad pushes the reverse line whatever the shove answered;
-      // a failed iteration discards the whole branch, so the difference
-      // is unobservable.
-      effects.push(ShoveEffect::PushLine {
-        line: Box::new(reverse_line),
-        below_top: false,
-      });
-
-      return (status, effects);
-    }
-
-    // :1823
-    let (status, pushed) =
-      self.on_colliding_segment(world, context, node, &current, obstacle_item);
-
-    if status == ShoveStatus::TryWalk {
-      // `TODO(part 2)`: `onCollidingSolid` at `:1826`, which re-routes the
-      // **current** line around the obstacle instead of moving it.
-      return (ShoveStatus::Incomplete, Vec::new());
-    }
+      )
+    };
 
     effects.extend(pushed);
+
+    // :1782. KiCad pushes the reverse line whatever the shove answered;
+    // a failed iteration discards the whole branch, so the difference
+    // is unobservable.
+    effects.push(ShoveEffect::PushLine {
+      line: Box::new(reverse_line),
+      below_top: false,
+    });
 
     (status, effects)
   }
@@ -2204,9 +3866,19 @@ impl Shove {
             PushMode::None => true,
             PushMode::Top => self.push_line_stack(world, new, false),
             PushMode::BelowTop => self.push_line_stack(world, new, true),
+            PushMode::PopThenTop => {
+              self.pop_line_stack(world);
+
+              self.push_line_stack(world, new, false)
+            }
           };
 
           if !stacked {
+            return false;
+          }
+        }
+        ShoveEffect::MoveVia(movement) => {
+          if !self.apply_via_movement(world, node, *movement) {
             return false;
           }
         }
@@ -2214,6 +3886,147 @@ impl Shove {
     }
 
     true
+  }
+
+  /// Carry out one [`ShoveEffect::MoveVia`].
+  ///
+  /// The mutating half of `pushOrShoveVia`,
+  /// `pcbnew/router/pns_shove.cpp:1115` to `:1166`, in KiCad's order:
+  /// unwind the old via, replace it, push a proxy line when nothing hangs
+  /// off it, and then per fanout branch unwind, replace, link the new
+  /// via, unwind again, rank and stack.
+  ///
+  /// Answers false for a refused stack push, which is KiCad's
+  /// `SH_INCOMPLETE` (`:1125`, `:1156`).
+  fn apply_via_movement(
+    &mut self,
+    world: &mut World,
+    node: NodeId,
+    movement: ViaMovement,
+  ) -> bool {
+    let ViaMovement {
+      old_via,
+      new_via,
+      dragged,
+      rank,
+      dont_unwind_stack,
+    } = movement;
+
+    // :1115
+    if !dont_unwind_stack {
+      self.unwind_line_stack(world, old_via);
+    }
+
+    // :1118, `replaceItems`.
+    let Some(pushed) = self.replace_via(world, node, old_via, *new_via) else {
+      return false;
+    };
+
+    // :1120. A stitching via with no fanout would otherwise be forgotten
+    // by the main loop, so it goes on the stack as a line of its own.
+    if dragged.is_empty() {
+      let Some(item) = world.item(pushed) else {
+        return false;
+      };
+      let proxy = Line::from_linked_via(pushed, item);
+
+      return self.push_line_stack(world, proxy, false);
+    }
+
+    // :1129
+    for (mut before, mut after) in dragged {
+      if !dont_unwind_stack {
+        self.unwind_line(world, &before);
+      }
+
+      // :1160. A branch that collapsed to nothing is simply removed.
+      if after.segment_count() == 0 {
+        world.remove_line(node, &mut before);
+
+        continue;
+      }
+
+      // :1137
+      after.clear_links();
+
+      let entry =
+        self.replace_line(world, node, &mut before, &mut after, true, true);
+
+      // :1139
+      let pos = after.last_point().unwrap_or_default();
+
+      after.link_via(pushed, pos);
+
+      if !dont_unwind_stack {
+        self.unwind_line(world, &after);
+      }
+
+      // :1145
+      after.set_rank(world, rank);
+      // :1150, "fixme: it's inelegant".
+      self.root_lines.entry_mut(entry).new_line = Some(after.clone());
+
+      // :1156
+      if !self.push_line_stack(world, after, false) {
+        return false;
+      }
+    }
+
+    true
+  }
+
+  /// Swap one via in the node for another, and keep the root line index
+  /// pointing at the right entry.
+  ///
+  /// Port of `replaceItems`, `pcbnew/router/pns_shove.cpp:52`, for the
+  /// only pair of items that ever reaches it. `None` for a stale handle,
+  /// which KiCad cannot represent.
+  fn replace_via(
+    &mut self,
+    world: &mut World,
+    node: NodeId,
+    old: ItemId,
+    new_via: Item,
+  ) -> Option<ItemId> {
+    // :54, `ChangedArea( VIA*, VIA* )` (`pcbnew/router/pns_via.cpp:291`):
+    // a via that did not move contributes nothing.
+    let moved = world
+      .item(old)
+      .is_some_and(|stored| via_pos_of(stored) != via_pos_of(&new_via));
+
+    if moved
+      && let Some(area) = world
+        .item(old)
+        .and_then(|stored| stored.bbox(0))
+        .zip(new_via.bbox(0))
+        .map(|(before, after)| before.merge(after))
+    {
+      self.affected_area = Some(match self.affected_area {
+        Some(previous) => previous.merge(area),
+        None => area,
+      });
+    }
+
+    // :63
+    let old_uid = world.item(old)?.uid();
+    let entry = match self.root_lines.find_by_uid(old_uid) {
+      Some(entry) => entry,
+      None => self
+        .root_lines
+        .alloc(None, ShovePolicy::DEFAULT, &[old_uid]),
+    };
+
+    // :76. `World::add_via` drills a hole for a via that carries none,
+    // which is what `Shove::push_or_shove_via` leaves it needing.
+
+    let pushed = world.replace(node, old, new_via);
+    let new_uid = world.item(pushed)?.uid();
+
+    // :66 and :79.
+    self.root_lines.entry_mut(entry).new_via = Some(pushed);
+    self.root_lines.bind(entry, &[new_uid]);
+
+    Some(pushed)
   }
 
   /// Resolve collisions until there are none left or the budget runs out.
@@ -2294,11 +4107,27 @@ impl Shove {
     self.line_stack.clear();
     self.optimizer_queue.clear();
 
-    // :2413
+    // :2413. A via head contributes the via it names, looked up in the
+    // node the session currently stands on, as a line that carries
+    // nothing but that via.
+    let node_before = self.current_node;
     let head_set: Vec<Line> = self
       .heads
       .iter()
-      .map(|head| head.orig_head.clone())
+      .filter_map(|head| match (&head.orig_head, head.the_via) {
+        (Some(line), _) => Some(line.clone()),
+        (None, Some(handle)) => {
+          let via = world.find_via_by_handle(
+            node_before,
+            handle.pos,
+            handle.layers,
+            handle.net,
+          )?;
+
+          world.item(via).map(|item| Line::from_linked_via(via, item))
+        }
+        (None, None) => None,
+      })
       .collect();
 
     // :2429
@@ -2318,8 +4147,12 @@ impl Shove {
       // :2440
       world.clear_ranks(current, MarkerFlags::CLEARED_BY_CLEAR_RANKS);
 
-      // `TODO(part 2)`: the via drag head at `:2442`.
-      status = self.add_head_to_node(world, current, index);
+      // :2442
+      status = if self.heads[index].orig_head.is_some() {
+        self.add_head_to_node(world, current, index)
+      } else {
+        self.add_via_head_to_node(world, context, current, index)
+      };
 
       if status != ShoveStatus::Ok {
         break;
@@ -2357,6 +4190,16 @@ impl Shove {
       // because the lines in them hold raw pointers into it. Here they
       // hold generational handles that would simply stop resolving, and
       // they are cleared anyway: a stale line is still nonsense.
+      // :2578. A via head goes back to where the run found it, and the
+      // caller is told the handle changed so that it re-reads it.
+      for head in &mut self.heads {
+        if let Some(previous) = head.prev_via {
+          head.the_via = Some(previous);
+          head.geometry_modified = true;
+          self.heads_modified = true;
+        }
+      }
+
       self.line_stack.clear();
       self.optimizer_queue.clear();
       // :2598
@@ -2381,9 +4224,13 @@ impl Shove {
   /// not move" checks inside `Shove::shove_line_to_hull_set` then hold
   /// on their own.
   ///
-  /// `TODO(part 2)`: the head via clone at `:2505`, which ranks a copy of
-  /// the head's via alongside the head and indexes it under the head's
-  /// root entry (`:2518`).
+  /// A head that ends with a via has that via **stored** here (`:2505`):
+  /// the caller's copy is one the line owns and no node holds, and the
+  /// shove needs a real item so that later iterations can collide with
+  /// it, rank it and, if something outranks it, move it. Both the
+  /// original and the working copy are re-linked to the stored one, and
+  /// its uid is indexed under the head's root entry (`:2518`) so that
+  /// `Shove::remove_heads` takes it back out again.
   fn add_head_to_node(
     &mut self,
     world: &mut World,
@@ -2391,20 +4238,24 @@ impl Shove {
     index: usize,
   ) -> ShoveStatus {
     {
-      let entry = &mut self.heads[index];
+      let Some(entry) = self.heads[index].orig_head.as_mut() else {
+        return ShoveStatus::Incomplete;
+      };
 
       debug_assert!(
-        !entry.orig_head.is_linked(),
+        !entry.is_linked(),
         "a head arrives with its links cleared (pns_shove.cpp:2464)"
       );
 
       // :2465
-      world.add_line(node, &mut entry.orig_head, true);
+      world.add_line(node, entry, true);
     }
 
-    let orig_head = self.heads[index].orig_head.clone();
     let policy = self.heads[index].policy;
-    let mut head = orig_head.clone();
+    let mut head = match self.heads[index].orig_head.clone() {
+      Some(head) => head,
+      None => return ShoveStatus::Incomplete,
+    };
 
     // :2481
     if head.segment_count() == 0 && !head.ends_with_via() {
@@ -2430,6 +4281,39 @@ impl Shove {
     // :2501
     head.set_rank(world, HEAD_RANK);
 
+    // :2503. The head's own via becomes an item of the node, ranked with
+    // the head and linked from both copies.
+    let mut head_via = None;
+
+    if let Some(LineVia::Owned(via)) = head.via().cloned() {
+      let mut stored = via;
+      let uid = world.next_uid();
+
+      stored.set_uid(uid);
+      stored.set_rank(HEAD_RANK);
+
+      let ItemBody::Via(body) = stored.body() else {
+        return ShoveStatus::Incomplete;
+      };
+      let pos = body.pos();
+      let id = world.add_via(node, stored);
+
+      head.remove_via();
+      head.link_via(id, pos);
+
+      if let Some(orig) = self.heads[index].orig_head.as_mut() {
+        orig.remove_via();
+        orig.link_via(id, pos);
+      }
+
+      head_via = Some(id);
+    }
+
+    let orig_head = match self.heads[index].orig_head.clone() {
+      Some(head) => head,
+      None => return ShoveStatus::Incomplete,
+    };
+
     // :2512
     let root = self.touch_root_line(world, &orig_head);
     let entry = self.root_lines.entry_mut(root);
@@ -2437,9 +4321,74 @@ impl Shove {
     entry.is_head = true;
     entry.root_line = Some(root_shape_of(&orig_head));
     entry.policy = policy;
+    self.heads[index].root_entry = Some(root);
+
+    // :2518
+    if let Some(via) = head_via
+      && let Some(uid) = world.item(via).map(Item::uid)
+    {
+      self.root_lines.bind(root, &[uid]);
+    }
 
     // :2540
     if self.push_line_stack(world, head, false) {
+      ShoveStatus::Ok
+    } else {
+      ShoveStatus::Incomplete
+    }
+  }
+
+  /// Put one via drag head into the branch and shove it to its new
+  /// position.
+  ///
+  /// The via head half of `Run`'s per head body,
+  /// `pcbnew/router/pns_shove.cpp:2445` to `:2461`. Unlike a line head,
+  /// nothing is added: the via already exists in the node and the head is
+  /// the request to move it, so the body is a
+  /// [`Shove::push_or_shove_via`] at rank `0` with the stacks left alone
+  /// (`:2459`).
+  ///
+  /// Rank `0` is what makes the wave descend the right way: every track
+  /// the drag pushes gets `-1` and so on, and the dragged via itself is
+  /// below every line head at [`HEAD_RANK`].
+  fn add_via_head_to_node(
+    &mut self,
+    world: &mut World,
+    context: &AlgoContext<'_>,
+    node: NodeId,
+    index: usize,
+  ) -> ShoveStatus {
+    let (Some(handle), Some(new_pos)) =
+      (self.heads[index].the_via, self.heads[index].via_new_pos)
+    else {
+      return ShoveStatus::Incomplete;
+    };
+
+    // :2447
+    let Some(via) =
+      world.find_via_by_handle(node, handle.pos, handle.layers, handle.net)
+    else {
+      return ShoveStatus::Incomplete;
+    };
+
+    // :2453
+    let root = self.touch_root_line_of_item(world, via);
+
+    self.root_lines.entry_mut(root).old_via = Some(via);
+    self.root_lines.entry_mut(root).policy = self.heads[index].policy;
+    self.heads[index].dragged_via = Some(via);
+
+    let force = new_pos - handle.pos;
+
+    // :2459
+    let (status, effects) =
+      self.push_or_shove_via(world, context, node, via, force, 0, true);
+
+    if status != ShoveStatus::Ok {
+      return status;
+    }
+
+    if self.apply_effects(world, node, effects) {
       ShoveStatus::Ok
     } else {
       ShoveStatus::Incomplete
@@ -2458,22 +4407,51 @@ impl Shove {
   /// dereference; a head whose entry has gone is skipped here.
   fn reconstruct_heads(&mut self, world: &World) {
     for index in 0..self.heads.len() {
-      let orig_head = self.heads[index].orig_head.clone();
-      let Some(root) = self.find_root_line(world, &orig_head) else {
-        continue;
-      };
+      match self.heads[index].orig_head.clone() {
+        Some(orig_head) => {
+          // :2309, through the entry the head was given rather than
+          // through its links; see [`HeadEntry::root_entry`].
+          let Some(root) = self.heads[index]
+            .root_entry
+            .or_else(|| self.find_root_line(world, &orig_head))
+          else {
+            continue;
+          };
+          let entry = self.root_lines.entry(root);
 
-      let entry = self.root_lines.entry(root);
+          // :2316
+          if let Some(new_line) = entry.new_line.clone() {
+            let modified = entry
+              .root_line
+              .as_ref()
+              .is_none_or(|root_line| !new_line.compare_geometry(root_line));
 
-      // :2316
-      if let Some(new_line) = entry.new_line.clone() {
-        let modified = entry
-          .root_line
-          .as_ref()
-          .is_none_or(|root_line| !new_line.compare_geometry(root_line));
+            self.heads[index].new_head = Some(new_line);
+            self.heads[index].geometry_modified = modified;
+          }
+        }
+        // :2400. A via head reports where its via ended up, which is the
+        // one thing a via dragger reads back.
+        None => {
+          let Some(dragged) = self.heads[index].dragged_via else {
+            continue;
+          };
+          let Some(uid) = world.item(dragged).map(Item::uid) else {
+            continue;
+          };
+          let Some(root) = self.root_lines.find_by_uid(uid) else {
+            continue;
+          };
+          let entry = self.root_lines.entry(root);
 
-        self.heads[index].new_head = Some(new_line);
-        self.heads[index].geometry_modified = modified;
+          // :2404 and :2417.
+          if let Some(new_via) = entry.new_via {
+            self.heads[index].the_via = ViaHandle::of(world, new_via);
+            self.heads[index].geometry_modified = true;
+          } else if let Some(old_via) = entry.old_via {
+            self.heads[index].the_via = ViaHandle::of(world, old_via);
+          }
+        }
       }
 
       // :2360
@@ -2782,6 +4760,18 @@ fn nearest_hull_point(
   best.map(|(_, point)| point)
 }
 
+/// Where a via item sits, or the origin for anything else.
+///
+/// `VIA::Pos` (`pcbnew/router/pns_via.h:203`) read off an [`Item`], which
+/// `Shove::replace_via` needs to reproduce `VIA::ChangedArea`'s "did it
+/// actually move" test (`pcbnew/router/pns_via.cpp:293`).
+fn via_pos_of(item: &Item) -> Vec2 {
+  match item.body() {
+    ItemBody::Via(body) => body.pos(),
+    _ => Vec2::new(0, 0),
+  }
+}
+
 /// Put an obstacle's own via back after the hull walk.
 ///
 /// The `aResultLine.AppendVia( *obsVia )` of `ShoveObstacleLine`
@@ -2797,9 +4787,10 @@ fn nearest_hull_point(
 /// shove wants: the via is a real item the node holds and the shove is
 /// not trying to make a second one.
 ///
-/// `TODO(part 2)`: no line in this revision ends with a via, because
-/// `World::assemble_line` never attaches one, so this is untested until
-/// the via heads land.
+/// `World::assemble_line` never attaches a via, so the obstacle side only
+/// ever carries one when a caller put it there:
+/// `Shove::on_reverse_colliding_via` does (`:1368`), and so does the
+/// head, whose via is linked by `Shove::add_head_to_node`.
 fn restore_via(line: &mut Line, via: LineVia) {
   match via {
     LineVia::Owned(item) => line.append_via(item),
@@ -2854,6 +4845,25 @@ mod tests {
     }
 
     (world, items)
+  }
+
+  /// A via of the test width at a point, stored in a node.
+  fn add_test_via(world: &mut World, node: NodeId, at: Vec2) -> ItemId {
+    let uid = world.next_uid();
+    let mut item = Item::new(
+      uid,
+      ItemBody::Via(crate::item::Via::new(
+        at,
+        WIDTH * 2,
+        WIDTH,
+        crate::item::ViaType::Through,
+      )),
+    );
+
+    item.set_layers_and_flash_all(LayerRange::new(0, 1));
+    item.set_net(Some(NetId(99)));
+
+    world.add_via(node, item)
   }
 
   /// A line of one point that links one stored item, which is enough for
@@ -2927,28 +4937,93 @@ mod tests {
 
   #[test]
   fn unwinding_drops_exactly_the_lines_that_reference_the_item() {
-    let (_world, items) = world_with_segments(2);
+    let (world, items) = world_with_segments(2);
     let mut stack = LineStack::new();
 
     stack.push(line_linking(items[0]));
     stack.push(line_linking(items[1]));
 
     assert_eq!(
-      unwind_action(&line_linking(items[0]), items[0]),
+      unwind_action(&line_linking(items[0]), items[0], false),
       UnwindAction::Drop
     );
     assert_eq!(
-      unwind_action(&line_linking(items[0]), items[1]),
+      unwind_action(&line_linking(items[0]), items[1], false),
       UnwindAction::Keep
     );
 
-    stack.retain_not_referencing(items[0]);
+    stack.unwind(&world, items[0]);
 
     assert_eq!(stack.len(), 1);
     assert!(
       stack
         .last()
         .is_some_and(|line| line.contains_link(items[1]))
+    );
+  }
+
+  #[test]
+  fn unwinding_a_segment_degrades_a_tadpole_to_its_via() {
+    let (mut world, items) = world_with_segments(1);
+    let root = world.root();
+    let via = add_test_via(&mut world, root, Vec2::new(1000000, 0));
+    let mut tadpole = line_linking(items[0]);
+
+    tadpole.set_shape(LineChain::from_slice(
+      &[Vec2::new(0, 0), Vec2::new(1000000, 0)],
+      false,
+    ));
+    tadpole.link_via(via, Vec2::new(1000000, 0));
+
+    // `pns_shove.cpp:1397`: a line that ends with a via keeps the via
+    // when one of its segments is unwound, so cross layer collisions
+    // still see it.
+    assert_eq!(
+      unwind_action(&tadpole, items[0], false),
+      UnwindAction::DegradeToViaStub
+    );
+    // Unwinding the via itself has nothing left to degrade to.
+    assert_eq!(unwind_action(&tadpole, via, true), UnwindAction::Drop);
+
+    let mut stack = LineStack::new();
+
+    stack.push(tadpole);
+    stack.unwind(&world, items[0]);
+
+    let stub = stack.last().expect("the tadpole was kept as a stub");
+
+    assert_eq!(stub.point_count(), 0);
+    assert!(stub.ends_with_via());
+    assert!(stub.contains_link(via));
+    assert!(!stub.contains_link(items[0]));
+
+    stack.unwind(&world, via);
+    assert!(stack.is_empty());
+  }
+
+  #[test]
+  fn a_via_handle_survives_the_item_being_replaced() {
+    let (mut world, _items) = world_with_segments(1);
+    let root = world.root();
+    let at = Vec2::new(500000, 500000);
+    let via = add_test_via(&mut world, root, at);
+    let handle = ViaHandle::of(&world, via).expect("the via was just added");
+
+    assert_eq!(handle.pos, at);
+    assert_eq!(
+      world.find_via_by_handle(root, handle.pos, handle.layers, handle.net),
+      Some(via)
+    );
+
+    // A handle for a via that is not there answers nothing.
+    assert_eq!(
+      world.find_via_by_handle(
+        root,
+        Vec2::new(0, 900000),
+        handle.layers,
+        handle.net
+      ),
+      None
     );
   }
 

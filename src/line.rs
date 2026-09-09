@@ -124,7 +124,7 @@
 //!   [`Line::chain_mut`] here.
 
 use crate::geometry::box2::Box2;
-use crate::geometry::direction45::{AngleType, Direction45};
+use crate::geometry::direction45::{AngleType, CornerMode, Direction45};
 use crate::geometry::hull::hull_intersection;
 use crate::geometry::line_chain::LineChain;
 use crate::geometry::seg::Seg;
@@ -999,6 +999,119 @@ impl Line {
     self.links.reverse();
   }
 
+  /// Move one corner of the line and rebuild the 45 degree geometry
+  /// around it.
+  ///
+  /// Port of `DragCorner` (`pcbnew/router/pns_line.cpp:884`) with
+  /// `aFreeAngle` false and no preferred ending direction, which is what
+  /// its shove call site passes: the via fanout drag
+  /// (`pcbnew/router/pns_shove.cpp:1101`) uses both defaults. The free
+  /// angle branch (`dragCornerFree`, `:857`) belongs to the dragger and
+  /// is not built here.
+  ///
+  /// The three cases are `dragCorner45`'s (`:823`): dragging the first
+  /// point rebuilds the reversed chain, dragging the last point rebuilds
+  /// the chain as it stands, and dragging a middle corner rebuilds both
+  /// halves and joins them.
+  ///
+  /// `at` is a **point** index. An index past the last point leaves the
+  /// line alone, where KiCad would read out of range.
+  pub fn drag_corner(&mut self, at: Vec2, index: usize) {
+    if index >= self.chain.point_count() {
+      return;
+    }
+
+    let width = self.chain.width();
+    let snapped = self.snap_dragged_corner(at, index);
+    let last = self.chain.point_count() - 1;
+
+    // :830
+    let mut path = if index == 0 {
+      let mut dragged = drag_corner_internal(&self.chain.reversed(), snapped);
+
+      dragged.reverse();
+
+      dragged
+    } else if index == self.chain.segment_count() {
+      // :834
+      drag_corner_internal(&self.chain, snapped)
+    } else {
+      // :845
+      let head = self.chain.slice(0, index).unwrap_or_default();
+      let tail = self.chain.slice(index, last).unwrap_or_default().reversed();
+      let mut first = drag_corner_internal(&head, snapped);
+      let mut second = drag_corner_internal(&tail, snapped);
+
+      second.reverse();
+      first.append_chain(&second);
+
+      first
+    };
+
+    // :851
+    path.simplify(0);
+    path.set_width(width);
+
+    self.chain = path;
+  }
+
+  /// Pull a dragged corner onto the intersection of two of the line's own
+  /// segments, when one is close enough.
+  ///
+  /// Port of `snapDraggedCorner`,
+  /// `pcbnew/router/pns_line.cpp:1143`. It looks at the four segments
+  /// around the dragged corner, intersects every obtuse pair of them as
+  /// **lines** rather than as segments, and takes the nearest
+  /// intersection within [`Line::snap_threshold`].
+  ///
+  /// A line whose threshold is zero, which is every line this crate
+  /// builds unless a host sets one, short circuits to the point it was
+  /// given (`:1153`).
+  fn snap_dragged_corner(&self, at: Vec2, index: usize) -> Vec2 {
+    if self.snap_threshold <= 0 {
+      return at;
+    }
+
+    let segment_count = self.chain.segment_count();
+
+    if segment_count == 0 {
+      return at;
+    }
+
+    // :1146
+    let start = index.saturating_sub(2);
+    let end = (index + 2).min(segment_count - 1);
+    let mut best: Option<(i32, Vec2)> = None;
+
+    for outer in start..=end {
+      let a = self.chain.segment(outer);
+
+      for inner in start..outer {
+        let b = self.chain.segment(inner);
+
+        // :1163
+        if !Direction45::from_seg(&a, false)
+          .is_obtuse(Direction45::from_seg(&b, false))
+        {
+          continue;
+        }
+
+        let Some(point) = a.intersect_lines(&b) else {
+          continue;
+        };
+        let distance = (point - at).euclidean_norm();
+
+        if distance < self.snap_threshold
+          && best.is_none_or(|(closest, _)| distance < closest)
+        {
+          best = Some((distance, point));
+        }
+      }
+    }
+
+    best.map_or(at, |(_, point)| point)
+  }
+
   /// How many corners of the given kinds the line turns.
   ///
   /// Port of `CountCorners`, `pcbnew/router/pns_line.cpp:218`: every
@@ -1535,6 +1648,140 @@ const fn next_shape(point_count: usize, index: usize) -> isize {
 /// visits one position twice only ever resolves to its first visit.
 fn find_vertex(vertices: &[WalkVertex], pos: Vec2) -> Option<usize> {
   vertices.iter().position(|vertex| vertex.pos == pos)
+}
+
+/// Rebuild the tail of a chain so that it ends at a point.
+///
+/// Port of `dragCornerInternal`, `pcbnew/router/pns_line.cpp:722`, with
+/// no preferred ending direction, which is what
+/// [`Line::drag_corner`]'s only caller asks for. It walks the chain
+/// backwards looking for the last corner from which a 45 degree trace to
+/// the new point either leaves in the same direction as the segment it
+/// replaces, or turns obtusely away from the segment before it; the chain
+/// up to that corner is kept and the trace is appended.
+///
+/// KiCad builds both start postures at `:757` and classifies them at
+/// `:763`, but `BuildInitialTrace` overrides the posture whenever the
+/// direction it is called on is defined
+/// (`libs/kimath/src/geometry/direction_45.cpp` and
+/// [`Direction45::build_initial_trace`]), so the two candidates are the
+/// same chain. The loop is transcribed as it stands rather than halved,
+/// because that is where a later corner mode or a preferred ending
+/// direction would make them differ again.
+///
+/// The fallback at `:813` starts the trace at the chain's **first**
+/// point, throwing the whole chain away; that looks like a bug and it is
+/// the shipped behaviour.
+fn drag_corner_internal(origin: &LineChain, at: Vec2) -> LineChain {
+  let trace = |from: Vec2, diagonal: bool| {
+    LineChain::from_points(
+      Direction45::default().build_initial_trace(
+        from,
+        at,
+        diagonal,
+        CornerMode::Mitered45,
+      ),
+      false,
+    )
+  };
+
+  // :729. KiCad asserts a non empty chain and then reads point 0.
+  if origin.point_count() == 0 {
+    return LineChain::new();
+  }
+
+  // :731
+  if origin.point_count() == 1 {
+    return trace(origin.point(0), false);
+  }
+
+  // :735
+  if origin.segment_count() == 1 {
+    let direction = Direction45::from_seg(&origin.segment(0), false);
+
+    return trace(origin.point(0), direction.is_diagonal());
+  }
+
+  // :745. `d` is assigned 1 unconditionally one line below its
+  // initialiser, so the loop always starts at the last segment.
+  let mut picked: Option<(usize, LineChain)> = None;
+
+  for index in (0..origin.segment_count()).rev() {
+    let d_start = Direction45::from_seg(&origin.segment(index), false);
+    let p_start = origin.point(index);
+    let d_prev = if index > 0 {
+      Direction45::from_seg(&origin.segment(index - 1), false)
+    } else {
+      Direction45::default()
+    };
+
+    // :755
+    let mut candidates: Vec<(Direction45, LineChain)> = Vec::new();
+
+    for posture in 0..2 {
+      let path = trace_from(&d_start, p_start, at, posture == 1);
+
+      if path.segment_count() < 1 {
+        continue;
+      }
+
+      candidates.push((Direction45::from_seg(&path.segment(0), false), path));
+    }
+
+    // :784. The candidate that leaves the way the replaced segment did.
+    if let Some((_, path)) = candidates
+      .iter()
+      .find(|(direction, _)| *direction == d_start)
+    {
+      picked = Some((index, path.clone()));
+
+      break;
+    }
+
+    // :797. Otherwise the one that turns obtusely off the segment before.
+    if let Some((_, path)) = candidates
+      .iter()
+      .find(|(direction, _)| direction.is_obtuse(d_prev))
+    {
+      picked = Some((index, path.clone()));
+
+      break;
+    }
+  }
+
+  // :806
+  if let Some((index, tail)) = picked {
+    let mut path = origin.slice(0, index).unwrap_or_default();
+
+    path.append_chain(&tail);
+
+    return path;
+  }
+
+  // :813
+  let last = origin.point_count() - 1;
+  let direction = Direction45::from_vector(
+    origin.point(last) - origin.point(last - 1),
+    false,
+  );
+
+  trace(origin.point(0), direction.is_diagonal())
+}
+
+/// One `BuildInitialTrace` call of [`drag_corner_internal`].
+///
+/// `pcbnew/router/pns_line.cpp:757`, on the direction of the segment
+/// being replaced rather than on a default constructed one.
+fn trace_from(
+  direction: &Direction45,
+  from: Vec2,
+  to: Vec2,
+  diagonal: bool,
+) -> LineChain {
+  LineChain::from_points(
+    direction.build_initial_trace(from, to, diagonal, CornerMode::Mitered45),
+    false,
+  )
 }
 
 impl Line {
@@ -2656,5 +2903,76 @@ mod tests {
     };
 
     assert_eq!(body.seg(), Seg::new(Vec2::new(0, 0), Vec2::new(0, 0)));
+  }
+
+  /// An L shaped chain: east then north east, which is what the fanout of
+  /// a via looks like once it has been reversed so the via end is last.
+  fn dragged_line() -> Line {
+    let mut line = Line::new();
+
+    line.set_width(WIDTH);
+    line.set_shape(LineChain::from_slice(
+      &[
+        Vec2::new(0, 0),
+        Vec2::new(100000, 0),
+        Vec2::new(200000, 100000),
+      ],
+      false,
+    ));
+
+    line
+  }
+
+  #[test]
+  fn dragging_the_last_corner_keeps_the_first_point_and_the_grid() {
+    let mut line = dragged_line();
+    let target = Vec2::new(250000, 200000);
+
+    line.drag_corner(target, line.point_count() - 1);
+
+    assert_eq!(line.point(0), Vec2::new(0, 0));
+    assert_eq!(line.last_point(), Some(target));
+    assert_eq!(line.width(), WIDTH);
+
+    for index in 0..line.segment_count() {
+      let seg = line.segment(index);
+      let delta = seg.b - seg.a;
+
+      assert!(
+        delta.x == 0 || delta.y == 0 || delta.x.abs() == delta.y.abs(),
+        "segment {index} left the 45 degree grid"
+      );
+    }
+  }
+
+  #[test]
+  fn dragging_the_first_corner_keeps_the_last_point() {
+    let mut line = dragged_line();
+    let target = Vec2::new(-100000, -100000);
+
+    line.drag_corner(target, 0);
+
+    assert_eq!(line.point(0), target);
+    assert_eq!(line.last_point(), Some(Vec2::new(200000, 100000)));
+  }
+
+  #[test]
+  fn dragging_a_corner_past_the_end_leaves_the_line_alone() {
+    let mut line = dragged_line();
+    let before = line.shape().points().to_vec();
+
+    line.drag_corner(Vec2::new(1, 1), line.point_count());
+
+    assert_eq!(line.shape().points().to_vec(), before);
+  }
+
+  #[test]
+  fn a_snap_threshold_of_zero_leaves_the_dragged_point_where_it_was() {
+    // `pns_line.cpp:1153`, the short circuit every line this crate builds
+    // takes unless a host sets a threshold.
+    let line = dragged_line();
+    let at = Vec2::new(123, 456);
+
+    assert_eq!(line.snap_dragged_corner(at, 1), at);
   }
 }
