@@ -60,3 +60,8 @@ Deferred during LibrePCB step 4 (2026-09-09):
 - Expose `Router::assign_host_ids` over the FFI before step 5: without it a second route in the same session does not recognise the board objects the first commit became.
 - Add `clang-format` to `dev/Containerfile` so LibrePCB C++ can be formatted in the container; step 4's files were formatted by hand.
 - `dev/librepcb-in-container.sh cargo clippy --lib` on rust-core skips the `ffi` module; document `--features ffi` wherever the check is listed.
+
+Deferred during LibrePCB step 5 (2026-09-09):
+
+- `BoardPnsHostRef` and `BoardPnsNewItem::net` hold const pointers because the snapshot is built from a `const Board&`, while every editor command takes non const references, so `CmdBoardApplyPnsCommit` casts in three places. Either build the snapshot from `Board&` or keep the casts and say why in the header.
+- `BoardPnsNewItem` is one struct carrying both a segment's and a via's fields; a `std::variant` would make the invalid states unrepresentable.
