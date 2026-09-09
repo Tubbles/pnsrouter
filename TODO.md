@@ -50,7 +50,6 @@ Deferred during milestone 4 (shove):
 
 Deferred during the KiCad replay work (2026-09-09):
 
-- A `.kicad_dru` reader with `has_user_defined_physical_constraint` and physical clearance rules would let `issue24132-shove-same-net-via` reach its golden; it is a KiCad rule language feature LibrePCB does not have.
 - Keepout zones are counted and skipped by the snapshot converter (`tests/support/kicad_snapshot.rs`); `Item` carries no keepout mark yet. None of the replayed boards has one.
 - A tier 3 comparison (net names and per item geometry against `addedItems`) is cheap once the gaps above close.
 

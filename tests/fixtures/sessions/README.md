@@ -43,6 +43,6 @@ They are produced by `tests/kicad_replay.rs`, which reads a case out of `tests/f
 
 The same warning applies as above: a changed commit diff is a change of routing behaviour.
 
-Their value is that the recording carries its own `WorldSnapshot`, so once the file exists the engine is pinned against a real board independently of the KiCad readers. A change to `tests/support/kicad_snapshot.rs` moves the tier assertions in `tests/kicad_replay.rs` and leaves these two alone; a change to the engine moves these two.
+Their value is that the recording carries its own `WorldSnapshot`, so once the file exists the engine is pinned against a real board independently of the board reader. The rule resolver is the exception: `the_kicad_session_fixtures_replay_to_the_commits_stored_in_them` builds one from the live case, so a change to what `tests/support/kicad_snapshot.rs` or `tests/support/kicad_dru.rs` resolve moves these files too, and the recorded `max-clearance` line moves with it.
 
-Neither fixture reproduces KiCad's own answer for its case. `backspace1` matches the golden counts stored in the log; `issue24132-shove-same-net-via` does not, because that case ships a `pns.kicad_dru` whose net blind 2 mm physical clearance between a track and a via is what makes KiCad's shove move the board's via, and this crate reads no `.kicad_dru`. The difference is recorded in the `#[ignore]` reason of that case's tier 2 test.
+Both fixtures now reproduce KiCad's own added and removed counts for their case. `issue24132-shove-same-net-via` reaches its four added and one removed only because the case's `pns.kicad_dru` is read: its net blind 2 mm physical clearance between a track and a via is what makes the shove move the board's via even on the via's own net.

@@ -20,4 +20,6 @@ A case names its board by content hash rather than by file name, so a case canno
 
 `tests/support/` reads the boards and the logs into a neutral intermediate representation and `tests/kicad_fixtures.rs` pins what is in them.
 
-`tests/support/kicad_snapshot.rs` turns a board and its `.kicad_pro` into a `WorldSnapshot` and a rule resolver, `tests/support/kicad_replay.rs` drives a `Router` from a log, and `tests/kicad_replay.rs` asserts the result in tiers. Its module documentation carries the case to board mapping, which had to be recovered by intersecting KIID sets because the hash a log names its board by cannot be recomputed here.
+`tests/support/kicad_snapshot.rs` turns a board and its `.kicad_pro` into a `WorldSnapshot` and a rule resolver, `tests/support/kicad_dru.rs` adds the custom design rules of the one case that has them, `tests/support/kicad_replay.rs` drives a `Router` from a log, and `tests/kicad_replay.rs` asserts the result in tiers. Its module documentation carries the case to board mapping, which had to be recovered by intersecting KIID sets because the hash a log names its board by cannot be recomputed here.
+
+The `pns.kicad_dru` of `issue24132-shove-same-net-via` is what makes that case's golden what it is: its net blind 2 mm physical clearance between a track and a via is why KiCad's shove moves the board's one via even though the route is on the via's own net. All four replayable cases match their goldens.

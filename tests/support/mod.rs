@@ -13,6 +13,8 @@
 //!   [`json`].
 //! - `<case>/*.settings`, the router settings for the case, also JSON and
 //!   also read by [`pns_log`].
+//! - `<case>/*.kicad_dru`, the custom design rules one case ships, read
+//!   by [`kicad_dru`] on the same s-expression reader.
 //!
 //! Everything here stops at a neutral intermediate representation: rows of
 //! numbers, strings and enums with no dependency on the router crate.
@@ -30,6 +32,7 @@
 #![allow(dead_code)]
 
 pub mod json;
+pub mod kicad_dru;
 pub mod kicad_pcb;
 pub mod kicad_replay;
 pub mod kicad_snapshot;

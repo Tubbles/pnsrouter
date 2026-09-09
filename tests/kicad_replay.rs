@@ -14,10 +14,11 @@
 //!    behind violates the rules it ran under. Asserted for every case
 //!    whose events this crate can replay.
 //! 2. **The counts of added and removed items equal the golden stored in
-//!    the log.** Asserted where it holds; where it does not, the test is
-//!    `#[ignore]`d with the measured and the expected numbers in the
-//!    reason string, so `cargo test -- --ignored` still shows the
-//!    difference instead of the suite quietly agreeing with itself.
+//!    the log.** All four replayable cases reach it. Should one stop, the
+//!    convention is to `#[ignore]` its tier 2 test with the measured and
+//!    the expected numbers in the reason string, so
+//!    `cargo test -- --ignored` still shows the difference instead of the
+//!    suite quietly agreeing with itself.
 //!
 //! Exact geometry, note 05's tier 3, is deliberately not attempted. The
 //! golden is a multiset of vertices produced by a different
@@ -63,6 +64,15 @@
 //! milestone 8), so those tests are `#[ignore]`d with that reason and
 //! their bodies check only that the case loads and that its board mapping
 //! resolves.
+//!
+//! # The rules a case is replayed under
+//!
+//! `support::kicad_snapshot::KicadRules` resolves the `.kicad_pro`'s net
+//! classes and board minima, and, for the one case that ships a
+//! `.kicad_dru`, the subset of KiCad's rule language
+//! `support::kicad_dru` models. A rule outside that subset is dropped and
+//! raises `KicadRules::has_unsupported_design_rules`, which is the flag
+//! an ignore reason would cite; nothing in the corpus trips it today.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -297,22 +307,22 @@ fn issue24132_shove_same_net_via_replays_without_a_violation() {
   assert_tier_one(&replay_case(&case));
 }
 
-/// Tier 2 for the case above.
+/// Tier 2 for the case above, and the only one that depends on a
+/// `.kicad_dru`.
 ///
-/// The gap is the `.kicad_dru` this crate does not read. That file
-/// declares a net blind `physical_clearance` of 2 mm between a track and
-/// a via, which is what forces KiCad's shove to move the board's one via
-/// out of the way even though the route is on the via's own net: its
-/// golden is the moved via, the hole that came with it and two segments,
-/// against one removed via. Without the rule the same net pair is exempt
-/// (`pcbnew/router/pns_item.cpp:127`, `pns_kicad_iface.cpp:968`), the via
-/// never moves, and the two segments are all that is left. Reading
-/// `.kicad_dru` and answering
-/// `RuleResolver::has_user_defined_physical_constraint` would close it.
+/// The case ships one, and its single rule declares a net blind
+/// `physical_clearance` of 2 mm between a track and a via. That is what
+/// makes the golden four added items and one removed: the rule reaches
+/// the pair even though the route is on the via's own net, so the shove
+/// moves the board's one via aside and the commit is the moved via, the
+/// hole that came with it and two segments, against the via it replaced.
+/// Two things have to line up for that, and this test is where both are
+/// checked end to end: the ladder folds the physical rung in outside its
+/// same net guard (`pcbnew/router/pns_kicad_iface.cpp:960`, `:968`), and
+/// `RuleResolver::has_user_defined_physical_constraint` answers true so
+/// the collision code does not take the same net short circuit first
+/// (`pcbnew/router/pns_item.cpp:127`, `:188`).
 #[test]
-#[ignore = "measured added 2 (2 segment, 0 via, 0 hole) versus golden 4, \
-            measured removed 0 versus golden 1: the .kicad_dru physical \
-            clearance that moves the via is not read"]
 fn issue24132_shove_same_net_via_matches_the_golden() {
   assert_tier_two(&replay_case(&load("issue24132-shove-same-net-via")));
 }

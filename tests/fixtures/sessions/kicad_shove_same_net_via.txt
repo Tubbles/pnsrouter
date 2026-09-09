@@ -5,7 +5,7 @@
 pnsrouter-session 1
 
 # snapshot <copper-layer-count> <max-clearance>
-snapshot 2 600000
+snapshot 2 2100000
 
 # item <host> <net> <layers> <locked> <routable> <free-pad> <compound> <flash> <drill> <geometry>
 item 1 1 0 0 0 1 0 0 flash-default no-drill solid rect 114000000 74450000 1400000 1025000 0 114700000 74962500 0 0 90.0 0
@@ -415,3 +415,4 @@ event stop-routing
 commit
 added segment 124000000 73087500 118587500 73087500 0 200000 2 0 0 -
 added segment 118587500 73087500 118500000 73000000 1 200000 2 0 0 -
+updated 11 via 116100000 72737325 600000 300000 through 2 0 1 11

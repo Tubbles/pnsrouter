@@ -85,6 +85,7 @@ use pnsrouter::snapshot::{
 };
 
 use super::json::{self, JsonValue};
+use super::kicad_dru::{ConstraintKind, DesignRules, ItemType, RuleItem};
 use super::kicad_pcb::{
   KicadBoard, KicadGraphic, KicadPad, KicadSegment, KicadVia, PadDrill,
   PadKind, PadShape, Point, rotate_point,
@@ -259,29 +260,34 @@ pub struct BoardRules {
   pub min_through_hole_diameter: i32,
 }
 
-/// A [`RuleResolver`] over a KiCad project's net classes and board rules.
+/// A [`RuleResolver`] over a KiCad project's net classes, board rules and
+/// custom design rules.
 ///
 /// The ladder in [`KicadRules::clearance`] is
 /// `PNS_PCBNEW_RULE_RESOLVER::Clearance`
 /// (`pcbnew/router/pns_kicad_iface.cpp:865` to `:983`) with each
-/// `QueryConstraint` call replaced by the value the project file holds:
+/// `QueryConstraint` call replaced by the value the project files hold:
 /// `CT_HOLE_TO_HOLE` by [`BoardRules::min_hole_to_hole`],
 /// `CT_HOLE_CLEARANCE` by [`BoardRules::min_hole_clearance`],
 /// `CT_CLEARANCE` by the net class clearance folded with
-/// [`BoardRules::min_clearance`] through `max`, and `CT_EDGE_CLEARANCE`
-/// by [`BoardRules::min_copper_edge_clearance`].
+/// [`BoardRules::min_clearance`] through `max` and then overridden by a
+/// matching `clearance` rule of the `.kicad_dru`, `CT_EDGE_CLEARANCE` by
+/// [`BoardRules::min_copper_edge_clearance`], and the two physical rungs
+/// (`:951`, `:960`) by [`super::kicad_dru`].
 ///
 /// # What is not supported
 ///
-/// - **Custom `.kicad_dru` rules.** The one case in the corpus that
-///   ships any, `issue24132-shove-same-net-via`, declares a
-///   `physical_clearance` of 2 mm between a track and a via. A physical
-///   rule is net blind, so KiCad's ladder applies it even to a same net
-///   pair (`:960`) and
-///   [`RuleResolver::has_user_defined_physical_constraint`] then stops
-///   the collision code taking its same net short circuit
-///   (`pcbnew/router/pns_item.cpp:127`). Neither is reproduced, so that
-///   case is replayed under a materially weaker rule set than KiCad's.
+/// - **A `.kicad_dru` rule outside the modelled subset**, which is
+///   dropped and raises [`KicadRules::has_unsupported_design_rules`]; see
+///   [`super::kicad_dru`] for what the subset is.
+/// - **The parent class of a hole.** A `.kicad_dru` condition reads the
+///   hole's parent pad or via (`HOLE::BoardItem`,
+///   `pcbnew/router/pns_hole.h:74`) and [`RuleResolver`] hands a
+///   resolver no arena to follow [`pnsrouter::item::Item::parent_pad_via`]
+///   with, so a hole answers `Via` here, which is also KiCad's fallback
+///   for a parentless one (`getBoardItem`, `:516`). Every pad in the one
+///   board that has design rules is surface mount, so no hole on it has
+///   a pad for a parent.
 /// - **Per pad clearance overrides** (`:2367`), which no board in the
 ///   corpus sets.
 /// - **`IsNonPlatedSlot`**, which needs the parent pad's drill shape
@@ -297,7 +303,10 @@ pub struct KicadRules {
   board: BoardRules,
   /// The class each net of [`KicadBoard::nets`] resolves to, by index.
   net_class: Vec<usize>,
-  /// Whether the project shipped a `.kicad_dru` this resolver ignores.
+  /// The custom design rules, empty for a case that ships no
+  /// `.kicad_dru`.
+  design_rules: DesignRules,
+  /// Whether the `.kicad_dru` held a rule this resolver dropped.
   pub has_unsupported_design_rules: bool,
 }
 
@@ -380,8 +389,27 @@ impl KicadRules {
       default_class,
       board: board_rules,
       net_class,
+      design_rules: DesignRules::default(),
       has_unsupported_design_rules: false,
     })
+  }
+
+  /// Take on the custom design rules of a `.kicad_dru`.
+  ///
+  /// The engine reads no files, so the case loader reads the text and
+  /// hands it over here. KiCad's harness does the same thing in
+  /// `PNS_LOG_FILE::Load`, which derives the rules path from the log path
+  /// and gives it to `DRC_ENGINE::InitEngine`
+  /// (`qa/tools/pns/pns_log_file.cpp:551`); a case with no such file gets
+  /// an engine with implicit rules only (`:555`).
+  pub fn set_design_rules(&mut self, design_rules: DesignRules) {
+    self.has_unsupported_design_rules = design_rules.has_unsupported();
+    self.design_rules = design_rules;
+  }
+
+  /// The custom design rules this resolver answers with.
+  pub const fn design_rules(&self) -> &DesignRules {
+    &self.design_rules
   }
 
   /// KiCad's own defaults, for a case that ships no project file.
@@ -397,6 +425,7 @@ impl KicadRules {
       net_class: vec![0; board.nets.len()],
       classes,
       board: BoardRules::default(),
+      design_rules: DesignRules::default(),
       has_unsupported_design_rules: false,
     }
   }
@@ -426,23 +455,65 @@ impl KicadRules {
       .unwrap_or_else(|| &self.classes[self.default_class])
   }
 
-  /// The copper to copper clearance between two nets.
+  /// One side of a `.kicad_dru` query.
+  fn rule_item<'rules>(&'rules self, item: ItemRef<'_>) -> RuleItem<'rules> {
+    RuleItem {
+      item_type: rule_item_type(item.item()),
+      net_class: &self.class_of(item.item().net()).name,
+    }
+  }
+
+  /// The `min` a `.kicad_dru` constraint of this kind resolves the pair
+  /// to, [`None`] when no rule of that kind matches.
+  fn design_rule_minimum(
+    &self,
+    kind: ConstraintKind,
+    a: ItemRef<'_>,
+    b: Option<ItemRef<'_>>,
+  ) -> Option<i32> {
+    if self.design_rules.rules.is_empty() {
+      return None;
+    }
+
+    self
+      .design_rules
+      .constraint(kind, self.rule_item(a), b.map(|b| self.rule_item(b)))
+      .and_then(|constraint| constraint.min)
+  }
+
+  /// The copper to copper clearance between two items.
   ///
-  /// The maximum over the board minimum and both classes, which is what
-  /// KiCad's DRC engine resolves a `CT_CLEARANCE` query for a pair to.
-  fn copper_clearance(&self, a: Option<NetId>, b: Option<NetId>) -> i32 {
+  /// The maximum over the board minimum and both net classes, which is
+  /// what KiCad's DRC engine resolves a `CT_CLEARANCE` query for a pair
+  /// to, unless a `clearance` rule of the `.kicad_dru` matches. That rule
+  /// **replaces** the net class value rather than joining it: the file's
+  /// rules are loaded after the implicit ones and the last match wins
+  /// (`pcbnew/drc/drc_engine.cpp:1048`, `:1860`), which is also why the
+  /// implicit net class rules are sorted by clearance before they are
+  /// added (`:445`) so that the larger of two classes fires last.
+  fn copper_clearance(&self, a: ItemRef<'_>, b: Option<ItemRef<'_>>) -> i32 {
+    if let Some(min) = self.design_rule_minimum(ConstraintKind::Clearance, a, b)
+    {
+      return min;
+    }
+
     self
       .board
       .min_clearance
-      .max(self.class_of(a).clearance)
-      .max(self.class_of(b).clearance)
+      .max(self.class_of(a.item().net()).clearance)
+      .max(self.class_of(b.and_then(|b| b.item().net())).clearance)
   }
 
   /// The largest clearance this resolver can ever return.
   ///
   /// KiCad accumulates the same number as `worstClearance`
-  /// (`pcbnew/router/pns_kicad_iface.cpp:2300`) and hands it to
-  /// `SetMaxClearance` (`:2452`).
+  /// (`pcbnew/router/pns_kicad_iface.cpp:2300`), which is
+  /// `BOARD_DESIGN_SETTINGS::GetBiggestClearanceValue`
+  /// (`pcbnew/board_design_settings.cpp:1795`) folding in the worst
+  /// `clearance`, `physical_clearance` and `physical_hole_clearance` any
+  /// rule can give, and hands it to `SetMaxClearance` (`:2452`).
+  /// Understating it would lose the pair the physical rule exists for in
+  /// the broad phase.
   pub fn worst_clearance(&self) -> i32 {
     let mut worst = self
       .board
@@ -453,6 +524,14 @@ impl KicadRules {
 
     for class in &self.classes {
       worst = worst.max(class.clearance);
+    }
+
+    for kind in [
+      ConstraintKind::Clearance,
+      ConstraintKind::PhysicalClearance,
+      ConstraintKind::PhysicalHoleClearance,
+    ] {
+      worst = worst.max(self.design_rules.worst_minimum(kind));
     }
 
     worst
@@ -549,12 +628,41 @@ fn is_copper(item: &Item) -> bool {
   !is_board_edge(item)
 }
 
+/// The class name a `.kicad_dru` condition sees as `A.Type`.
+///
+/// KiCad gives the DRC engine the item's parent board item, or, for a
+/// router temporary that has none, a dummy of the matching board class
+/// (`getBoardItem`, `pcbnew/router/pns_kicad_iface.cpp:505`), and
+/// `A.Type` is that class's name in `EDA_ITEM_DESC`
+/// (`common/eda_item.cpp:557`). The three groupings below are that
+/// switch: a segment and a line both become a `PCB_TRACK` (`:524`), an
+/// arc a `PCB_ARC` whose name is also `Track`, and a via **or a hole** a
+/// `PCB_VIA` (`:516`). See the [`KicadRules`] documentation for why a
+/// hole cannot ask its own parent here.
+fn rule_item_type(item: &Item) -> ItemType {
+  let kind = item.kind();
+
+  if kind == Kind::SEGMENT || kind == Kind::LINE || kind == Kind::ARC {
+    ItemType::Track
+  } else if kind == Kind::VIA || kind == Kind::HOLE {
+    ItemType::Via
+  } else if is_board_edge(item) {
+    ItemType::Graphic
+  } else {
+    ItemType::Pad
+  }
+}
+
 impl RuleResolver for KicadRules {
   /// The ladder of `PNS_PCBNEW_RULE_RESOLVER::Clearance`,
   /// `pcbnew/router/pns_kicad_iface.cpp:865`, with the layer loop
-  /// collapsed because every rule here is the same on every layer, and
-  /// with the two physical clearance rungs (`:950`, `:960`) left out;
-  /// see the type documentation.
+  /// collapsed because every rule here is the same on every layer.
+  ///
+  /// The two physical rungs (`:951`, `:960`) sit outside the `!sameNet`
+  /// guard the copper rung is under, which is the whole point of them: a
+  /// physical rule is net blind. Their value then keeps the same net
+  /// short circuit at `:968` from firing, because that one only turns a
+  /// pair off when the accumulated clearance is still zero.
   fn clearance(
     &self,
     a: ItemRef<'_>,
@@ -587,15 +695,30 @@ impl RuleResolver for KicadRules {
       && !same_net
       && !free_pad
     {
-      result = result.max(
-        self.copper_clearance(a.item().net(), b.and_then(|b| b.item().net())),
-      );
+      result = result.max(self.copper_clearance(a, b));
     }
 
     // :941, net blind: an edge clearance applies whatever the nets are.
     if is_board_edge(a.item()) || b.is_some_and(|b| is_board_edge(b.item())) {
       result = result.max(self.board.min_copper_edge_clearance);
     }
+
+    // :951, the hole half of the net blind pair. `isHole` (`:444`) is
+    // the kind test, which is what `is_drilled_hole` answers here too.
+    if a_hole || b_hole {
+      result = result.max(
+        self
+          .design_rule_minimum(ConstraintKind::PhysicalHoleClearance, a, b)
+          .unwrap_or(0),
+      );
+    }
+
+    // :960, and this one applies to every pair there is.
+    result = result.max(
+      self
+        .design_rule_minimum(ConstraintKind::PhysicalClearance, a, b)
+        .unwrap_or(0),
+    );
 
     if (same_net || free_pad) && result == 0 {
       // :968
@@ -616,9 +739,16 @@ impl RuleResolver for KicadRules {
     0
   }
 
-  /// Never: no `.kicad_dru` is parsed, see the type documentation.
+  /// Whether the `.kicad_dru` holds a conditional physical rule.
+  ///
+  /// Port of `PNS_PCBNEW_RULE_RESOLVER::HasUserDefinedPhysicalConstraint`
+  /// (`pcbnew/router/pns_kicad_iface.cpp:851`), which forwards to
+  /// `DRC_ENGINE::HasUserDefinedPhysicalConstraint`
+  /// (`pcbnew/drc/drc_engine.cpp:2449`). KiCad memoises it because the
+  /// collision inner loop asks on every pair; there is nothing to
+  /// memoise here, the answer is a walk of at most a handful of rules.
   fn has_user_defined_physical_constraint(&self) -> bool {
-    false
+    self.design_rules.has_conditional_physical_constraint()
   }
 
   /// Never a keepout: rule areas are not synced, see
@@ -1375,7 +1505,166 @@ fn flatten_arc(start: Point, mid: Point, end: Point) -> Vec<Point> {
 
 #[cfg(test)]
 mod tests {
+  use std::path::{Path, PathBuf};
+
+  use pnsrouter::item::{Segment, Via};
+
+  use super::super::kicad_dru;
+  use super::super::kicad_pcb::read_board;
   use super::*;
+
+  /// A file of the one corpus case that ships design rules.
+  fn case_file(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+      .join("tests/fixtures/kicad/pns_regressions")
+      .join(name)
+  }
+
+  /// Read that case's board, project and design rules into a resolver.
+  fn rules_of_the_design_rules_case() -> KicadRules {
+    let board_text =
+      std::fs::read_to_string(case_file("boards/shove_same_net_via.kicad_pcb"))
+        .expect("the corpus board is readable");
+    let board = read_board("shove_same_net_via.kicad_pcb", &board_text)
+      .expect("it parses");
+    let project = std::fs::read_to_string(case_file(
+      "issue24132-shove-same-net-via/pns.kicad_pro",
+    ))
+    .expect("the project file is readable");
+    let mut rules =
+      KicadRules::from_project(Some(&project), &board).expect("it parses");
+    let design_rules = std::fs::read_to_string(case_file(
+      "issue24132-shove-same-net-via/pns.kicad_dru",
+    ))
+    .expect("the design rules are readable");
+
+    rules.set_design_rules(
+      kicad_dru::parse(&design_rules).expect("the design rules parse"),
+    );
+    rules
+  }
+
+  /// A track on `net`.
+  fn track(uid: u64, net: NetId) -> Item {
+    let mut item = Item::new(
+      uid,
+      ItemBody::Segment(Segment::new(
+        Seg::new(Vec2::new(0, 0), Vec2::new(1_000_000, 0)),
+        200_000,
+      )),
+    );
+
+    item.set_net(Some(net));
+    item.set_layers_and_flash_all(LayerRange::single(0));
+    item
+  }
+
+  /// A via on `net`.
+  fn via(uid: u64, net: NetId) -> Item {
+    let mut item = Item::new(
+      uid,
+      ItemBody::Via(Via::new(
+        Vec2::new(0, 0),
+        600_000,
+        300_000,
+        ViaType::Through,
+      )),
+    );
+
+    item.set_net(Some(net));
+    item.set_layers_and_flash_all(LayerRange::new(0, 1));
+    item
+  }
+
+  /// The corpus's `.kicad_dru` reaches the clearance ladder, and reaches
+  /// it net blind.
+  ///
+  /// Its one rule gives a track and a via 2 mm, and because a physical
+  /// constraint sits outside the `!sameNet` guard
+  /// (`pcbnew/router/pns_kicad_iface.cpp:960`) the pair keeps that value
+  /// even on one net, which is what stops the same net short circuit at
+  /// `:968` from turning the pair off. A pair the condition does not name
+  /// is untouched and keeps the net class clearance.
+  #[test]
+  fn the_physical_clearance_rule_applies_to_a_same_net_track_and_via() {
+    let rules = rules_of_the_design_rules_case();
+    let net = NetId(1);
+    let track_item = track(0, net);
+    let via_item = via(1, net);
+    let other_track = track(2, net);
+    let foreign_track = track(3, NetId(2));
+
+    assert!(rules.has_user_defined_physical_constraint());
+    // The broad phase has to reach as far as the rule can push.
+    assert_eq!(rules.worst_clearance(), 2_000_000);
+
+    assert_eq!(
+      rules.clearance(
+        ItemRef::unstored(&track_item),
+        Some(ItemRef::unstored(&via_item)),
+        false
+      ),
+      Some(2_000_000)
+    );
+    // And in the order the rule does not spell out.
+    assert_eq!(
+      rules.clearance(
+        ItemRef::unstored(&via_item),
+        Some(ItemRef::unstored(&track_item)),
+        false
+      ),
+      Some(2_000_000)
+    );
+    // Two tracks on one net match no rule, so `:968` still fires.
+    assert_eq!(
+      rules.clearance(
+        ItemRef::unstored(&track_item),
+        Some(ItemRef::unstored(&other_track)),
+        false
+      ),
+      None
+    );
+    // Two tracks on different nets keep the net class clearance, 0.2 mm
+    // in this project.
+    assert_eq!(
+      rules.clearance(
+        ItemRef::unstored(&track_item),
+        Some(ItemRef::unstored(&foreign_track)),
+        false
+      ),
+      Some(200_000)
+    );
+    // A one sided query cannot satisfy the rule's `B` term.
+    assert_eq!(
+      rules.clearance(ItemRef::unstored(&track_item), None, false),
+      Some(200_000)
+    );
+  }
+
+  /// A project with no `.kicad_dru` answers exactly as it did before one
+  /// could be read.
+  #[test]
+  fn a_case_without_design_rules_keeps_the_net_class_ladder() {
+    let mut rules = rules_of_the_design_rules_case();
+
+    rules.set_design_rules(DesignRules::default());
+
+    let net = NetId(1);
+    let track_item = track(0, net);
+    let via_item = via(1, net);
+
+    assert!(!rules.has_user_defined_physical_constraint());
+    assert!(!rules.has_unsupported_design_rules);
+    assert_eq!(rules.worst_clearance(), 500_000);
+    assert_eq!(
+      rules.clearance(
+        ItemRef::unstored(&track_item),
+        Some(ItemRef::unstored(&via_item)),
+        false
+      ),
+      None
+    );
+  }
 
   /// A pattern that is a plain name matches only that name.
   #[test]

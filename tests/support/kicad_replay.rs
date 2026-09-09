@@ -67,6 +67,7 @@ use pnsrouter::settings::{
   OptimizerEffort, RouterMode, RoutingSettings, Sizes,
 };
 
+use super::kicad_dru;
 use super::kicad_pcb::{KicadBoard, read_board};
 use super::kicad_snapshot::{HostMap, KicadRules, snapshot_from_board};
 use super::pns_log::{
@@ -170,7 +171,18 @@ impl LoadedCase {
         message: error.to_string(),
       })?;
 
-    rules.has_unsupported_design_rules = case.design_rules_path.is_some();
+    // `PNS_LOG_FILE::Load` derives the rules path from the log path and
+    // gives it to the DRC engine when it exists
+    // (`qa/tools/pns/pns_log_file.cpp:551`).
+    if let Some(path) = &case.design_rules_path {
+      let design_rules =
+        kicad_dru::parse(&read_file(path)?).map_err(|error| CaseError {
+          path: path.clone(),
+          message: error.to_string(),
+        })?;
+
+      rules.set_design_rules(design_rules);
+    }
 
     Ok(Self {
       name: case.name.clone(),
