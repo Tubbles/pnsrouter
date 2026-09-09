@@ -951,11 +951,7 @@ impl JointMap {
     let item_layers = item_ref.layers();
     let key = JointKey { pos, net };
 
-    loop {
-      let Some(bucket) = self.by_key.get(&key) else {
-        break;
-      };
-
+    while let Some(bucket) = self.by_key.get(&key) {
       let found = bucket.iter().copied().enumerate().find(|(_, id)| {
         self
           .arena

@@ -291,7 +291,7 @@ pub fn collide(a: &Shape, b: &Shape, clearance: i32) -> Option<ShapeCollision> {
 /// The vector displaces **`b`**. Calling with the operands mirrored gives
 /// the negated vector. Applying it to `b` and asking again gives no
 /// collision in the closed form cells (circle against circle and circle
-/// against rectangle). In the cells that go through [`pushout_force`] it
+/// against rectangle). In the cells that go through the circle pushout search it
 /// can leave `b` exactly at the clearance or, on a multi segment chain,
 /// still overlapping: the pushout search stops on `Seg::distance_to_point`
 /// while the collision predicate measures to the rounded nearest point,
