@@ -82,3 +82,9 @@ Deferred during LibrePCB step 7 (2026-09-09):
 - `BoardPnsPreviewVia::style` beyond Collision is invisible: `PrimitiveCircleGraphicsItem` has no lighter colour mode.
 - `BoardPnsViolation::clearance` and `forcedLayer` have no consumer; either draw a marker or drop them.
 - `BoardPnsHostRef` needs `operator==` and `qHash` so frames can be diffed as sets; `BoardPnsPreviewItem::layer` can be null for an out of range dense index and is silently skipped.
+
+Deferred during LibrePCB step 8 (2026-09-09):
+
+- Raise the Slint contract additions with upstream before any PR: `EditorTool.route-trace`, `RouterMode`, two `TabAction` values, two `Board2dTabData` properties, one helper. They are additive but `types.slint` is shared with every tab.
+- Corner mode could move into `BoardPnsRouter::Settings` so a rebuilt session starts where the user left it without the state re-toggling it.
+- Step 9 manual test on the laptop: all three modes on a two layer and a four layer board, DRC before and after, plus the twelve step scripts from steps 6 to 8 in this session's transcript (right click was replaced by the tool button and Shift+W in step 8).
