@@ -140,28 +140,34 @@ Inputs are already snapped points; snapping is host work. `PreviewFrame` is retu
 ```
 src/
   lib.rs
-  geometry/   vec2, seg, box2, direction45, line_chain, shape, collision, hull, math
-  item.rs     ItemId, Item, bodies, LayerRange, NetId, markers
-  index.rs    spatial index
-  joint.rs    JointMap
-  node.rs     World, Node, branch, commit, queries
-  line.rs     Line, assemble, walkaround on one hull
-  rules.rs    RuleResolver, FixedClearance, caches
-  settings.rs RoutingSettings, Sizes, enums
+  arena.rs       generational arena, ArenaId
+  geometry/      vec2, math, seg, box2, direction45, line_chain, shape, collision, hull
+  item.rs        Item, bodies, ItemId, LayerRange, LayerMask, NetId, HostId, markers
+  rules.rs       RuleResolver, FixedClearance
+  collide.rs     item level collision ladder, line heads, obstacles
+  index.rs       spatial index (rstar) per layer
+  joint.rs       JointMap
+  node.rs        World, Node, branch, commit, queries, nearest obstacle, caches
+  line.rs        Line, walkaround on one hull, links
+  topology.rs    connectivity queries, leading ratline
+  settings.rs    RoutingSettings, Sizes, enums
+  algo_base.rs   AlgoContext (resolver, settings, debug)
+  debug.rs       DebugDecorator, NoDebug
   walkaround.rs
-  shove.rs
-  optimizer.rs
-  placer/     line_placer, mouse_trail, fixed_tail
-  router.rs   session facade, PreviewFrame, CommitDiff
-  debug.rs    DebugDecorator, event log
-  topology.rs cluster assembly (minimal)
+  optimizer.rs   merge passes, pad breakouts, fanout cleanup
+  mouse_trail.rs posture solver
+  shove.rs       effect list shove, springback stack
+  placer/        line_placer, fixed_tail
+  snapshot.rs    WorldSnapshot and the world builder
+  router.rs      session facade, PreviewFrame, CommitDiff
+  eventlog.rs    session recording, replay, text format
+tests/           integration scenarios per module, property tests, fixture readers for
+                 KiCad boards and router logs (tests/support), golden session recordings
 ```
-
-Modules are added milestone by milestone. A module does not appear in `lib.rs` before it has tests.
 
 ## 10. Dependencies
 
-Minimal runtime dependencies (the upstream maintainer asked for minimal dependencies). The one runtime dependency so far is `rstar` for the per layer R-trees of the spatial index (pure Rust, the insertion bbox is stored alongside the handle; it pulls in eight small transitive crates). Ordered maps are `BTreeMap`, bit sets are hand rolled newtypes, so `indexmap`, `bitflags` and `smallvec` were not needed. No `geo`, no clipper binding, no polygon boolean crate. Dev dependencies for property tests are fine.
+Minimal runtime dependencies (the upstream maintainer asked for minimal dependencies). The one runtime dependency is `rstar` for the per layer R-trees of the spatial index (pure Rust, the insertion bbox is stored alongside the handle; it pulls in eight small transitive crates). Ordered maps are `BTreeMap`, bit sets are hand rolled newtypes, so `indexmap`, `bitflags` and `smallvec` were not needed. No `geo`, no clipper binding, no polygon boolean crate. The only dev dependency is `proptest`.
 
 ## 11. Deviations from KiCad
 

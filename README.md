@@ -4,7 +4,7 @@ Interactive push and shove PCB router library, written in Rust. The design follo
 
 ## Status
 
-Pre-alpha. The repository contains the project plan, the design and reference notes on the KiCad implementation. There is no routing code yet.
+Pre-alpha, headless engine complete for single net routing. The crate routes in all three modes (highlight collisions, walk around, shove) with via placement, layer switching, undo and the optimizer, exposes a host facing session API (`router::Router`) fed by a plain data board snapshot and answering with preview frames and commit diffs, and records sessions for replay. Not yet in a released version; no host integration is finished (the LibrePCB side is in progress on a fork branch, see doc/librepcb-integration.md). Every ported routine cites its KiCad origin; tolerance sensitive routines were diffed against compiled transcriptions of the C++.
 
 ## Scope of the first milestone
 
