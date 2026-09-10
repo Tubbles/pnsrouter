@@ -74,11 +74,13 @@ use crate::item::{
   Provenance, ViaType,
 };
 use crate::line::Line;
+use crate::meander::{LengthTarget, MeanderSettings, TuningStatus};
 use crate::multi_dragger::MultiDragger;
 use crate::node::{NodeId, World};
 use crate::placer::Placer;
 use crate::placer::diff_pair_placer::{DiffPairPlacer, PairError};
 use crate::placer::line_placer::LinePlacer;
+use crate::placer::meander_placer::{MeanderPlacer, TuningError};
 use crate::rules::{ItemRef, RuleResolver};
 use crate::settings::{RoutingSettings, Sizes};
 use crate::snapshot::{HostIndex, WorldSnapshot};
@@ -111,6 +113,31 @@ pub enum RouterState {
   Idle,
   /// A single track placement is running. `ROUTE_TRACK`.
   RouteTrack,
+
+  /// A single track is being length tuned.
+  ///
+  /// KiCad has no such state: `ROUTER::StartRouting` puts every mode into
+  /// `ROUTE_TRACK` and the three tuning modes are told apart by
+  /// `ROUTER::Mode()` alone (`pcbnew/router/pns_router.cpp:451` to
+  /// `:483`), so its `Move`, `FixRoute` and `GetUpdatedItems` all take
+  /// the placer branch whichever placer it is. The state is separate here
+  /// because the facade has separate entry points and because the
+  /// commands have to be told apart in both directions:
+  /// [`Router::amplitude_step`] and [`Router::spacing_step`] refuse a
+  /// routing session, and [`Router::undo_last_segment`],
+  /// [`Router::switch_layer`], [`Router::toggle_via_placement`],
+  /// [`Router::flip_posture`], [`Router::finish`] and
+  /// [`Router::continue_from_end`] refuse a tuning one. KiCad reaches the
+  /// same place for the first four by way of a placer that overrides none
+  /// of them (note 08 section 5.8); the last two it does not gate at all,
+  /// and `Finish` on a tuning session would drive it at a ratsnest anchor
+  /// that means nothing to a tuner.
+  ///
+  /// [`Router::move_to`], [`Router::fix_route`],
+  /// [`Router::pending_update`], [`Router::stop_routing`] and
+  /// [`Router::abort_routing`] all take the placer branch, exactly as
+  /// they do for [`RouterState::RouteTrack`].
+  TuneSingle,
   /// An existing track, corner or via is being dragged. `DRAG_SEGMENT`.
   ///
   /// Entered by [`Router::start_dragging`]
@@ -236,6 +263,28 @@ pub enum StartError {
   /// placement and not by routing rules (`:359`).
   PairGapMismatch,
 
+  /// A tuning session was asked for with no object to tune.
+  ///
+  /// The `!aStartItem` half of "Please select a track whose length you
+  /// want to tune." (`pcbnew/router/pns_meander_placer.cpp:71`). A
+  /// tuning session **requires** an object where a single track
+  /// placement does not: there is nothing to lengthen otherwise.
+  TuningNeedsStartItem,
+
+  /// The object a tuning session was asked to tune is not a track.
+  ///
+  /// The `!OfKind( SEGMENT_T | ARC_T )` half of the same message
+  /// (`pcbnew/router/pns_meander_placer.cpp:71`). A pad, a via or a hole
+  /// is refused.
+  NotATrack(ItemId),
+
+  /// The topology walk found no copper for a tuning session to measure.
+  ///
+  /// KiCad has no such refusal; see
+  /// [`crate::placer::meander_placer::TuningError::NoTuningPath`] for why
+  /// it is one here.
+  NoTuningPath,
+
   /// The object under the drag is not something a drag can move.
   ///
   /// Port of the `default:` of `DRAGGER::Start`
@@ -244,6 +293,17 @@ pub enum StartError {
   /// of `startDragArc`'s refusal, which has no counterpart while this
   /// crate has no arcs.
   NotDraggable(ItemId),
+}
+
+/// The three ways a tuning session refuses to start, as a host sees them.
+impl From<TuningError> for StartError {
+  fn from(error: TuningError) -> Self {
+    match error {
+      TuningError::NeedsStartItem => StartError::TuningNeedsStartItem,
+      TuningError::NotATrack(item) => StartError::NotATrack(item),
+      TuningError::NoTuningPath => StartError::NoTuningPath,
+    }
+  }
 }
 
 /// The three ways pair identification fails, as a host sees them.
@@ -462,6 +522,20 @@ pub struct PreviewFrame {
   /// [`PreviewFrame::moved_solids`] with the offset to draw them at.
   pub hidden: Vec<HostId>,
 
+  /// The tuning readout, when the session is a length tuning session.
+  ///
+  /// KiCad's host reads `TuningStatus()` and `TuningLengthResult()` off
+  /// the placer after every `Move`
+  /// (`pcbnew/generators/pcb_tuning_pattern.cpp:1321`, `:1322`) and
+  /// composes them into the string it shows (`:1351`). Always [`None`]
+  /// while anything else is running.
+  ///
+  /// Boxed because a frame is returned by value from every
+  /// [`Router::move_to`] and a [`TuningInfo`] carries a whole
+  /// [`MeanderSettings`], which no routing or dragging frame has any use
+  /// for.
+  pub tuning: Option<Box<TuningInfo>>,
+
   /// Board objects the host must draw at an offset instead of where they
   /// are.
   ///
@@ -481,6 +555,49 @@ pub struct PreviewFrame {
   /// what it needs and it is the same offset the tool uses for everything
   /// else the component carries.
   pub moved_solids: Vec<(HostId, Vec2)>,
+}
+
+/// What a host shows a user during a length tuning session.
+///
+/// The four values `PCB_TUNING_PATTERN::Update` reads back off the placer
+/// (`pcbnew/generators/pcb_tuning_pattern.cpp:1319` to `:1322`) plus the
+/// target they are read against, which KiCad's host already has because
+/// it is the one that set it.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct TuningInfo {
+  /// How the tuned line stands against its target. `TuningStatus()`
+  /// (`pcbnew/router/pns_meander_placer_base.h:76`), which the host turns
+  /// into "too long", "too short" or "tuned" (`pcb_tuning_pattern.cpp:1328`).
+  pub status: TuningStatus,
+
+  /// The length the last move produced, in nanometres.
+  /// `TuningLengthResult()` (`pns_meander_placer_base.h:61`). It is a
+  /// skew rather than a length for the skew placer, which arrives with
+  /// the next slice.
+  pub result: i64,
+
+  /// How far that has moved from the length the session started at.
+  ///
+  /// `TuningLengthDelta()` (`:70`), [`None`] when `HasBaseline()` (`:68`)
+  /// is false, which without the delay half means the path measured zero.
+  pub delta: Option<i64>,
+
+  /// The window [`TuningInfo::status`] was decided against.
+  ///
+  /// This is what `doMove` actually compared, which is not the same thing
+  /// as [`MeanderSettings::target_length`]: an unconstrained target is
+  /// resolved to KiCad's `LENGTH_UNCONSTRAINED` triple before the
+  /// comparison; see [`crate::placer::meander_placer::MeanderPlacer::move_to`].
+  pub target: LengthTarget,
+
+  /// The settings after the move, so that a host can persist the initial
+  /// side flip.
+  ///
+  /// KiCad's host reads the whole settings block back for exactly this
+  /// reason (`pcbnew/generators/pcb_tuning_pattern.cpp:1319`), because
+  /// `flipInitialSide` writes into it from inside the shape generator
+  /// (`pcbnew/router/pns_meander.cpp:287`).
+  pub settings: MeanderSettings,
 }
 
 // ---------------------------------------------------------------------
@@ -1507,6 +1624,138 @@ impl Router {
     Ok(self.frame())
   }
 
+  /// Begin length tuning the track under a point.
+  ///
+  /// Port of `ROUTER::StartRouting` (`pcbnew/router/pns_router.cpp:434`)
+  /// for `PNS_MODE_TUNE_SINGLE`, which news a `MEANDER_PLACER` (`:453`)
+  /// and then runs the same four calls it runs for a routing placer
+  /// (`:467` to `:470`). Two of those four, `UpdateSizes` and `SetLayer`,
+  /// are no ops on a meander placer, so the sizes and the layer the host
+  /// just imported are dropped on the floor there; neither is in this
+  /// signature for that reason.
+  ///
+  /// A third entry point rather than a mode field, for the reason note 07
+  /// section 12.4 gives and [`Router::start_routing_diff_pair`] repeats:
+  /// the preconditions really are different. A tuning session needs the
+  /// object to tune and no layer at all, because `CurrentLayer()` is read
+  /// off the clicked segment (`pcbnew/router/pns_meander_placer.cpp:435`).
+  ///
+  /// The settings arrive here rather than through a setter because KiCad's
+  /// host pushes a whole `MEANDER_SETTINGS` into the placer before every
+  /// move (`pcbnew/generators/pcb_tuning_pattern.cpp:1298`) and there is
+  /// no sensible default for the one field that matters, the target
+  /// length. [`Router::amplitude_step`] and [`Router::spacing_step`] are
+  /// the two live adjustments the host binds to keys; the flip the shape
+  /// generator makes to the initial side comes back on
+  /// [`TuningInfo::settings`].
+  ///
+  /// # No start gate
+  ///
+  /// `isStartingPointRoutable` (`pcbnew/router/pns_router.cpp:294`) has
+  /// no arm for any of the three tuning modes, so none of the refusals
+  /// [`Router::is_starting_point_routable`] makes applies here. The only
+  /// gate is the placer's own `Start`.
+  ///
+  /// # Errors
+  ///
+  /// [`StartError::AlreadyRouting`],
+  /// [`StartError::UnknownStartItem`] for an object the snapshot does not
+  /// describe, and everything
+  /// [`crate::placer::meander_placer::TuningError`] carries.
+  pub fn start_tuning(
+    &mut self,
+    at: Vec2,
+    item: HostId,
+    settings: MeanderSettings,
+  ) -> Result<PreviewFrame, StartError> {
+    self.record(SessionEvent::StartTuning { at, item, settings });
+
+    if self.routing_in_progress() {
+      return Err(StartError::AlreadyRouting);
+    }
+
+    let root = self.world.root();
+    let start_item = self
+      .resolve_host_item(root, at, item, None)
+      .ok_or(StartError::UnknownStartItem(item))?;
+
+    // :453
+    let mut placer = MeanderPlacer::new(&self.world, root, settings);
+    let context = AlgoContext {
+      resolver: self.resolver.as_ref(),
+      settings: &self.settings,
+      debug: self.debug.as_ref(),
+    };
+
+    // :473
+    placer.start(&mut self.world, &context, at, Some(start_item))?;
+
+    self.placer = Some(Placer::Meander(Box::new(placer)));
+    self.state = RouterState::TuneSingle;
+
+    Ok(self.frame())
+  }
+
+  /// Nudge the meander amplitude by one step and re-run the last move.
+  ///
+  /// Port of `PCB_ACTIONS::amplIncrease` and `amplDecrease`
+  /// (`pcbnew/generators/pcb_tuning_pattern.cpp:2785`), which call
+  /// `MEANDER_PLACER_BASE::AmplitudeStep( +/-1 )`
+  /// (`pcbnew/router/pns_meander_placer_base.cpp:96`), copy the new
+  /// maximum amplitude back onto the board item and then re-run `Update`,
+  /// which is a fresh `Move`.
+  ///
+  /// The re-run is the caller's here: this changes the settings and
+  /// answers whether it did, and the host follows with a
+  /// [`Router::move_to`] at the same point. `sign` is a direction and not
+  /// a distance; the distance is [`MeanderSettings::step`].
+  ///
+  /// False when no tuning session is running, which is every routing and
+  /// dragging state.
+  pub fn amplitude_step(&mut self, sign: i32) -> bool {
+    self.record(SessionEvent::AmplitudeStep { sign });
+
+    if self.state != RouterState::TuneSingle {
+      return false;
+    }
+
+    let Some(placer) = self.placer.as_mut() else {
+      return false;
+    };
+
+    placer.amplitude_step(sign);
+
+    true
+  }
+
+  /// Nudge the meander spacing by one step and re-run the last move.
+  ///
+  /// Port of `PCB_ACTIONS::spacingIncrease` and `spacingDecrease`
+  /// (`pcbnew/generators/pcb_tuning_pattern.cpp:2764`), which call
+  /// `MEANDER_PLACER_BASE::SpacingStep( +/-1 )`
+  /// (`pcbnew/router/pns_meander_placer_base.cpp:105`). See
+  /// [`Router::amplitude_step`] for the shape of both.
+  ///
+  /// The new spacing is floored by the tuned track's width plus its
+  /// clearance, so a decrease can be refused by the floor and still
+  /// answer true: the answer is "a tuning session took this", not "the
+  /// value changed".
+  pub fn spacing_step(&mut self, sign: i32) -> bool {
+    self.record(SessionEvent::SpacingStep { sign });
+
+    if self.state != RouterState::TuneSingle {
+      return false;
+    }
+
+    let Some(placer) = self.placer.as_mut() else {
+      return false;
+    };
+
+    placer.spacing_step(sign);
+
+    true
+  }
+
   /// Begin dragging an existing object.
   ///
   /// Port of `ROUTER::StartDragging( aP, ITEM_SET, aDragMode )`
@@ -1739,8 +1988,9 @@ impl Router {
     match self.state {
       // :508
       RouterState::Idle => return PreviewFrame::default(),
-      // :501
-      RouterState::RouteTrack => {
+      // :501. A tuning session takes the same branch, exactly as
+      // `ROUTER::Move` does (`:502`).
+      RouterState::RouteTrack | RouterState::TuneSingle => {
         let end_item = self.resolve_end_item(at, end);
 
         if let Some(placer) = self.placer.as_mut() {
@@ -1820,7 +2070,9 @@ impl Router {
       // :933
       RouterState::Idle => FixOutcome::Continue(PreviewFrame::default()),
       // :922
-      RouterState::RouteTrack => self.fix_placement(at, end, force_finish),
+      RouterState::RouteTrack | RouterState::TuneSingle => {
+        self.fix_placement(at, end, force_finish)
+      }
       // :928, :929. Both drag states reach the dragger's `FixRoute`.
       RouterState::DragSegment | RouterState::DragComponent => {
         self.fix_drag(force_finish)
@@ -2201,7 +2453,7 @@ impl Router {
     let node = match self.state {
       RouterState::Idle => None,
       // :839
-      RouterState::RouteTrack => {
+      RouterState::RouteTrack | RouterState::TuneSingle => {
         self.placer.as_ref().map(|placer| placer.current_node(true))
       }
       // :844, plus the `DRAG_COMPONENT` branch KiCad lacks.
@@ -2849,6 +3101,7 @@ fn preview_frame(
   let mut frame = PreviewFrame {
     ratline: placer.leading_rat_line().cloned(),
     ratline_n: placer.leading_rat_line_n().cloned(),
+    tuning: tuning_info(placer),
     ..PreviewFrame::default()
   };
 
@@ -2883,6 +3136,27 @@ fn preview_frame(
   append_node_delta(&mut frame, world, index, node, resolver);
 
   frame
+}
+
+/// The tuning readout of a placer, when it is a tuning placer.
+///
+/// The four reads `PCB_TUNING_PATTERN::Update` makes off the placer after
+/// every `Move` (`pcbnew/generators/pcb_tuning_pattern.cpp:1319` to
+/// `:1322`), gathered into one value. [`None`] for the two routing
+/// placers, which answer [`None`] to every one of them.
+fn tuning_info(placer: &Placer) -> Option<Box<TuningInfo>> {
+  let settings = *placer.meander_settings()?;
+
+  Some(Box::new(TuningInfo {
+    status: placer.tuning_status()?,
+    result: placer.tuning_length_result()?,
+    delta: placer.tuning_length_delta(),
+    // The window the status was decided against; see [`TuningInfo::target`].
+    target: settings
+      .target_length()
+      .unwrap_or_else(LengthTarget::unconstrained),
+    settings,
+  }))
 }
 
 /// Build the frame a host draws after one drag event.

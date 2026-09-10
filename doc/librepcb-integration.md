@@ -406,6 +406,26 @@ Three things, and none of them is in the crate.
 
 One gesture would be missing and would stay missing: there is no differential pair **dragger** to wire up, because KiCad has none either. Selecting both traces and using the multi drag is what a KiCad user gets, and `Router::start_dragging` already does that.
 
+### 3.8 Length tuning, and where the host side differs from KiCad's
+
+The engine can tune the length of a single trace as of milestone 11 (`router::Router::start_tuning`), and nothing in LibrePCB drives it yet. The interesting part is that copying KiCad's host design would be the wrong move here, and the reason is worth writing down before anyone starts.
+
+**KiCad's tuning is not a router tool mode.** The three hotkeys `7`, `8` and `9` activate `DRAWING_TOOL::PlaceTuningPattern` (`pcbnew/generators/pcb_tuning_pattern.cpp:2497`), not the router tool, and what they create is a `PCB_GENERATOR` board item: a group of tracks plus the settings that produced them, saved in the board file, re-editable later. The router is something that generator drives from inside its own edit loop. `EditStart` syncs the world and refreshes the target from the design rules, `Update` runs `StopRouting`, resets the copper to the pattern's stored baseline, `StartRouting`, `UpdateSettings`, one `Move`, and reads the status and the length back, all on **every mouse move**, and `EditFinish` runs one `FixRoute` and sorts the router's commit into what belongs in the group and what is the reconstructed remainder of the original track. That whole arrangement exists to make a tuning pattern a persistent, re-editable board object.
+
+**LibrePCB has no such object**, and giving it one is a file format change, which is upstream's call. So the cheap version is a tool mode: a state in the board editor FSM that starts a session on the clicked trace, moves with the cursor, and fixes on the second click, exactly as `BoardEditorState_DrawTrace` already does for a route. That gives one shot tuning with no re-editable artefact, which is what LibrePCB's existing length matching request (LibrePCB#820) actually asks for. The distinction to decide up front is which of the two is being built, because it changes where the settings live: a tool mode keeps them in `PnsRouterSettings` beside the routing ones, where a persistent pattern would have to store a copy per pattern.
+
+Four things the tool mode would need, none of them in the crate.
+
+**The target length.** `MeanderSettings::target_length` is the one field with no sensible default, and the engine never asks for it: KiCad's host reads a `CT_LENGTH` design rule constraint and pushes the answer in (`pcb_tuning_pattern.cpp:709`). LibrePCB has no length constraint, so the target starts as a toolbar number the user types, and a later netclass property would feed the same field. Note that `rules::RuleResolver::constraint` **is** consulted, once per session, for `ConstraintType::Clearance`; a resolver that answers nothing there gets the track width back as the clearance, which is KiCad's own fallback and only matters when the spacing setting is below twice the width.
+
+**The four dimensions the user edits.** Minimum and maximum amplitude, spacing and the amplitude step, plus the corner radius percentage and the single sided flag. `MeanderSettings::new` refuses two of them, a step that is not positive and `MeanderStyle::Round`, so the toolbar has to surface the error rather than assume the settings were taken. Round corners need arcs and arcs are on hold, so the corner style control is a placeholder that offers one value.
+
+**The two live adjustments.** `Router::amplitude_step` and `Router::spacing_step` are what KiCad binds to `amplIncrease`/`amplDecrease` and `spacingIncrease`/`spacingDecrease`; each changes the settings and the caller then re-runs the move at the same point, which is what makes the preview follow. They are the only two commands a tuning session takes: backspace, the via key, the layer keys and posture all do nothing, because none of KiCad's meander placers overrides them.
+
+**The readout.** `PreviewFrame::tuning` carries the status, the length, the delta from the length the session started at and the settings back. KiCad draws it as a floating label beside the pattern with the current length, the minimum and the maximum and the words "too long", "too short" or "tuned"; the status bar is the cheap place for it in LibrePCB. Reading the settings back matters for one field only, `initial_side`: the shape generator flips it when a meander only fits on the other side of the base line, and a host that does not carry the flip forward gets a different shape on the next session.
+
+The commit applier needs no change: a tuning session commits segments on one net, and the original track arrives as an update of the same host object rather than a removal plus an addition, which the applier already handles.
+
 ## 4. The commit applier
 
 ### 4.1 The shape of the problem

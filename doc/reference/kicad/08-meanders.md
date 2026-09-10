@@ -867,7 +867,7 @@ Start( P, startItem ):
 
 `GetSnappedStartPoint` (`pcbnew/router/pns_helpers.cpp:187`) is `Seg::NearestPoint` for a segment and the nearer of the two anchors for an arc.
 
-`AssembleTuningPath` (`pns_topology.cpp:787`) is a longest path walk out of both ends of the assembled line, stopping at pads, with two in place fixups afterwards: `OptimiseTraceInPad` on every line touching a terminal or intermediate pad (`:928`, `:974`) and `OptimiseTraceInVia` on the lines either side of every via (`:1010`). Both mutate the path's chains, which is why `CalculateRoutedPathLength` is asked not to repeat them. It differs from `AssembleTrivialPath` (`:461`) by walking through pads rather than terminating at them and by choosing the longest branch at a junction rather than refusing to guess.
+`AssembleTuningPath` (`pns_topology.cpp:787`) is a longest path walk out of both ends of the assembled line, through intermediate pads and stopping at the terminal pads, with two in place fixups afterwards: `OptimiseTraceInPad` on every line touching a terminal or intermediate pad (`:928`, `:974`) and `OptimiseTraceInVia` on the lines either side of every via (`:1010`). Both mutate the path's chains, which is why `CalculateRoutedPathLength` is asked not to repeat them. It differs from `AssembleTrivialPath` (`:461`) by walking through pads rather than terminating at them and by choosing the longest branch at a junction rather than refusing to guess.
 
 Note that the placer removes only `m_originLine` from its branch (`:102`), not the whole tuned path. Everything else on the path stays and is what `CheckFit` collides against.
 

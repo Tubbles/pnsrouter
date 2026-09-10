@@ -4,9 +4,10 @@
 //!
 //! KiCad's `PLACEMENT_ALGO` (`pcbnew/router/pns_placement_algo.h:44`) is
 //! the abstract base the router holds one of: the single track placer,
-//! the differential pair placer and the three meander placers. Two of the
-//! five are ported, [`line_placer::LinePlacer`] and
-//! [`diff_pair_placer::DiffPairPlacer`], and neither implements a trait.
+//! the differential pair placer and the three meander placers. Three of
+//! the five are ported, [`line_placer::LinePlacer`],
+//! [`diff_pair_placer::DiffPairPlacer`] and
+//! [`meander_placer::MeanderPlacer`], and none implements a trait.
 //! Note 03 section 9.2 asks for that: the set of placers is closed by the
 //! router mode, so [`Placer`], an enum wrapping them, is a better fit than
 //! a trait object, and it removes the downcast KiCad's `Finish` and
@@ -16,20 +17,33 @@
 //!
 //! [`fixed_tail`] is the undo stack of note 03 section 3.1, which
 //! [`line_placer::LinePlacer::undo_last_segment`] rolls a placement back
-//! through. A pair has no such stack; see
-//! [`diff_pair_placer::DiffPairPlacer::undo_last_segment`].
+//! through. Neither a pair nor a tuning session has such a stack; see
+//! [`diff_pair_placer::DiffPairPlacer::undo_last_segment`] and
+//! [`meander_placer::MeanderPlacer::undo_last_segment`].
+//!
+//! # What only a meander placer answers
+//!
+//! [`Placer::tuning_status`], [`Placer::tuning_length_result`] and
+//! [`Placer::tuned_path`] are the readout a tuning session exists for, and
+//! they answer [`None`] for the two routing placers. So do
+//! [`Placer::meander_settings`] and the two live adjustments
+//! [`Placer::amplitude_step`] and [`Placer::spacing_step`]. Note 08
+//! section 11.4.
 
 use crate::algo_base::AlgoContext;
 use crate::geometry::line_chain::LineChain;
 use crate::geometry::vec2::Vec2;
 use crate::item::{ItemId, NetId};
 use crate::line::Line;
+use crate::meander::{MeanderSettings, TuningStatus};
 use crate::node::{NodeId, World};
 use crate::settings::Sizes;
+use crate::topology::PathItem;
 
 pub mod diff_pair_placer;
 pub mod fixed_tail;
 pub mod line_placer;
+pub mod meander_placer;
 
 /// Which placement algorithm a session is running.
 ///
@@ -50,6 +64,12 @@ pub enum Placer {
   Line(Box<line_placer::LinePlacer>),
   /// Two coupled tracks. `DIFF_PAIR_PLACER`.
   DiffPair(Box<diff_pair_placer::DiffPairPlacer>),
+  /// One track, lengthened to a target. `MEANDER_PLACER`.
+  ///
+  /// `DP_MEANDER_PLACER` and `MEANDER_SKEW_PLACER` are the two variants
+  /// still missing from KiCad's set of five; they arrive with the second
+  /// half of milestone 11.
+  Meander(Box<meander_placer::MeanderPlacer>),
 }
 
 impl Placer {
@@ -60,6 +80,15 @@ impl Placer {
   /// `StartRouting`; the placer that was built carries it here.
   pub const fn is_diff_pair(&self) -> bool {
     matches!(self, Placer::DiffPair(_))
+  }
+
+  /// Whether this is a length tuning session.
+  ///
+  /// KiCad's three tuning modes (`pcbnew/router/pns_router.h:70` to
+  /// `:72`) picked the placer; the placer that was built carries the
+  /// answer here.
+  pub const fn is_tuning(&self) -> bool {
+    matches!(self, Placer::Meander(_))
   }
 
   /// `PLACEMENT_ALGO::Move` (`pcbnew/router/pns_placement_algo.h:59`).
@@ -73,6 +102,7 @@ impl Placer {
     match self {
       Placer::Line(placer) => placer.move_to(world, context, at, end_item),
       Placer::DiffPair(placer) => placer.move_to(world, context, at, end_item),
+      Placer::Meander(placer) => placer.move_to(world, context, at, end_item),
     }
   }
 
@@ -98,6 +128,12 @@ impl Placer {
       Placer::DiffPair(placer) => {
         placer.fix_route(world, context, force_finish)
       }
+      // The meander placer reads neither the point nor the end item
+      // either, and fixes whatever the last move produced
+      // (`pcbnew/router/pns_meander_placer.cpp:364`).
+      Placer::Meander(placer) => {
+        placer.fix_route(world, at, end_item, force_finish)
+      }
     }
   }
 
@@ -112,6 +148,7 @@ impl Placer {
     match self {
       Placer::Line(placer) => placer.undo_last_segment(world, context),
       Placer::DiffPair(placer) => placer.undo_last_segment(),
+      Placer::Meander(placer) => placer.undo_last_segment(),
     }
   }
 
@@ -126,6 +163,7 @@ impl Placer {
     match self {
       Placer::Line(placer) => placer.set_layer(world, context, layer),
       Placer::DiffPair(placer) => placer.set_layer(world, context, layer),
+      Placer::Meander(placer) => placer.set_layer(layer),
     }
   }
 
@@ -144,6 +182,7 @@ impl Placer {
     match self {
       Placer::Line(placer) => placer.toggle_via(enabled),
       Placer::DiffPair(placer) => placer.toggle_via(world, context, enabled),
+      Placer::Meander(placer) => placer.toggle_via(enabled),
     }
   }
 
@@ -153,6 +192,7 @@ impl Placer {
     match self {
       Placer::Line(placer) => placer.flip_posture(),
       Placer::DiffPair(placer) => placer.flip_posture(world, context),
+      Placer::Meander(placer) => placer.flip_posture(),
     }
   }
 
@@ -165,7 +205,7 @@ impl Placer {
   pub fn set_ortho_mode(&mut self, ortho: bool) {
     match self {
       Placer::Line(placer) => placer.set_ortho_mode(ortho),
-      Placer::DiffPair(_) => {}
+      Placer::DiffPair(_) | Placer::Meander(_) => {}
     }
   }
 
@@ -173,7 +213,7 @@ impl Placer {
   /// (`pcbnew/router/pns_placement_algo.h:104`).
   pub fn update_sizes(&mut self, sizes: Sizes) {
     match self {
-      Placer::Line(_) => {}
+      Placer::Line(_) | Placer::Meander(_) => {}
       Placer::DiffPair(placer) => placer.update_sizes(sizes),
     }
   }
@@ -184,6 +224,7 @@ impl Placer {
     match self {
       Placer::Line(placer) => placer.commit_placement(world),
       Placer::DiffPair(placer) => placer.commit_placement(world),
+      Placer::Meander(placer) => placer.commit_placement(world),
     }
   }
 
@@ -193,6 +234,7 @@ impl Placer {
     match self {
       Placer::Line(placer) => placer.traces(),
       Placer::DiffPair(placer) => placer.traces(),
+      Placer::Meander(placer) => placer.traces(),
     }
   }
 
@@ -207,6 +249,7 @@ impl Placer {
     match self {
       Placer::Line(placer) => placer.trace(),
       Placer::DiffPair(placer) => placer.traces().into_iter().next(),
+      Placer::Meander(placer) => placer.traces().into_iter().next(),
     }
   }
 
@@ -218,6 +261,9 @@ impl Placer {
       // The pair placer ignores the flag, as the single placer does
       // (`pcbnew/router/pns_diff_pair_placer.cpp:428`).
       Placer::DiffPair(placer) => placer.current_node(),
+      // The meander placer ignores it too
+      // (`pcbnew/router/pns_meander_placer.cpp:60`).
+      Placer::Meander(placer) => placer.current_node(),
     }
   }
 
@@ -226,6 +272,7 @@ impl Placer {
     match self {
       Placer::Line(placer) => placer.last_node(),
       Placer::DiffPair(placer) => placer.last_node(),
+      Placer::Meander(placer) => placer.last_node(),
     }
   }
 
@@ -244,6 +291,11 @@ impl Placer {
         .then(|| placer.last_node())
         .flatten(),
       Placer::DiffPair(placer) => placer.fixed_node(),
+      // The same answer for the same reason: a tuning session that only
+      // moved has taken the track it was going to tune out of its own
+      // branch and put nothing back, so committing that branch would
+      // delete the track (`pcbnew/router/pns_meander_placer.cpp:102`).
+      Placer::Meander(placer) => placer.fixed_node(),
     }
   }
 
@@ -253,6 +305,7 @@ impl Placer {
     match self {
       Placer::Line(placer) => placer.current_start(),
       Placer::DiffPair(placer) => placer.current_start(),
+      Placer::Meander(placer) => placer.current_start(),
     }
   }
 
@@ -262,6 +315,8 @@ impl Placer {
     match self {
       Placer::Line(placer) => placer.current_end(),
       Placer::DiffPair(placer) => placer.current_end(),
+      // Always the origin, never the cursor; erratum E1.
+      Placer::Meander(placer) => placer.current_end(),
     }
   }
 
@@ -272,13 +327,14 @@ impl Placer {
     match self {
       Placer::Line(placer) => placer.current_net(),
       Placer::DiffPair(placer) => placer.current_nets().and_then(|nets| nets.0),
+      Placer::Meander(placer) => placer.current_nets(),
     }
   }
 
   /// The second of `CurrentNets`, which only a pair has.
   pub fn current_net_n(&self) -> Option<NetId> {
     match self {
-      Placer::Line(_) => None,
+      Placer::Line(_) | Placer::Meander(_) => None,
       Placer::DiffPair(placer) => placer.current_nets().and_then(|nets| nets.1),
     }
   }
@@ -289,6 +345,7 @@ impl Placer {
     match self {
       Placer::Line(placer) => placer.current_layer(),
       Placer::DiffPair(placer) => placer.current_layer(),
+      Placer::Meander(placer) => placer.current_layer(),
     }
   }
 
@@ -298,6 +355,7 @@ impl Placer {
     match self {
       Placer::Line(placer) => placer.is_placing_via(),
       Placer::DiffPair(placer) => placer.is_placing_via(),
+      Placer::Meander(placer) => placer.is_placing_via(),
     }
   }
 
@@ -307,6 +365,7 @@ impl Placer {
     match self {
       Placer::Line(placer) => placer.has_placed_anything(),
       Placer::DiffPair(placer) => placer.has_placed_anything(),
+      Placer::Meander(placer) => placer.has_placed_anything(),
     }
   }
 
@@ -316,6 +375,8 @@ impl Placer {
     match self {
       Placer::Line(placer) => placer.leading_rat_line(),
       Placer::DiffPair(placer) => placer.leading_rat_line(),
+      // A meander placer never draws one: it is not going anywhere.
+      Placer::Meander(_) => None,
     }
   }
 
@@ -325,8 +386,83 @@ impl Placer {
   /// (`pcbnew/router/pns_diff_pair_placer.cpp:914`).
   pub fn leading_rat_line_n(&self) -> Option<&LineChain> {
     match self {
-      Placer::Line(_) => None,
+      Placer::Line(_) | Placer::Meander(_) => None,
       Placer::DiffPair(placer) => placer.leading_rat_line_n(),
+    }
+  }
+
+  // -----------------------------------------------------------------
+  // Length tuning
+  // -----------------------------------------------------------------
+
+  /// `MEANDER_PLACER_BASE::TuningStatus`
+  /// (`pcbnew/router/pns_meander_placer_base.h:76`), which only a tuning
+  /// session has.
+  pub fn tuning_status(&self) -> Option<TuningStatus> {
+    match self {
+      Placer::Line(_) | Placer::DiffPair(_) => None,
+      Placer::Meander(placer) => placer.tuning_status(),
+    }
+  }
+
+  /// `MEANDER_PLACER_BASE::TuningLengthResult` (`:61`), a length here and
+  /// a skew for the skew placer that arrives with the next slice.
+  pub fn tuning_length_result(&self) -> Option<i64> {
+    match self {
+      Placer::Line(_) | Placer::DiffPair(_) => None,
+      Placer::Meander(placer) => placer.tuning_length_result(),
+    }
+  }
+
+  /// `MEANDER_PLACER_BASE::TuningLengthDelta` (`:70`), [`None`] when
+  /// `HasBaseline()` (`:68`) is false.
+  pub fn tuning_length_delta(&self) -> Option<i64> {
+    match self {
+      Placer::Line(_) | Placer::DiffPair(_) => None,
+      Placer::Meander(placer) => placer.tuning_length_delta(),
+    }
+  }
+
+  /// `MEANDER_PLACER_BASE::TunedPath` (`:125`), the run of copper the
+  /// tuned length is measured over, which the host draws as a highlight.
+  pub fn tuned_path(&self) -> Option<&[PathItem]> {
+    match self {
+      Placer::Line(_) | Placer::DiffPair(_) => None,
+      Placer::Meander(placer) => Some(placer.tuned_path()),
+    }
+  }
+
+  /// `MEANDER_PLACER_BASE::MeanderSettings`
+  /// (`pcbnew/router/pns_meander_placer_base.cpp:301`).
+  pub const fn meander_settings(&self) -> Option<&MeanderSettings> {
+    match self {
+      Placer::Line(_) | Placer::DiffPair(_) => None,
+      Placer::Meander(placer) => Some(placer.meander_settings()),
+    }
+  }
+
+  /// `MEANDER_PLACER_BASE::UpdateSettings` (`:131`). Ignored by the two
+  /// routing placers, which have no meander settings.
+  pub const fn update_meander_settings(&mut self, settings: MeanderSettings) {
+    match self {
+      Placer::Line(_) | Placer::DiffPair(_) => {}
+      Placer::Meander(placer) => placer.set_settings(settings),
+    }
+  }
+
+  /// `MEANDER_PLACER_BASE::AmplitudeStep` (`:96`).
+  pub fn amplitude_step(&mut self, sign: i32) {
+    match self {
+      Placer::Line(_) | Placer::DiffPair(_) => {}
+      Placer::Meander(placer) => placer.amplitude_step(sign),
+    }
+  }
+
+  /// `MEANDER_PLACER_BASE::SpacingStep` (`:105`).
+  pub fn spacing_step(&mut self, sign: i32) {
+    match self {
+      Placer::Line(_) | Placer::DiffPair(_) => {}
+      Placer::Meander(placer) => placer.spacing_step(sign),
     }
   }
 }

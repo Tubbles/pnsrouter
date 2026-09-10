@@ -101,6 +101,10 @@ use crate::geometry::shape::{Shape, SimplePolygon};
 use crate::geometry::vec2::Vec2;
 use crate::item::{HostId, Kind, LayerMask, LayerRange, NetId, ViaType};
 use crate::line::Line;
+use crate::meander::{
+  CornerStyle, LengthTarget, MeanderSettings, MeanderSettingsRequest,
+  MeanderSide, MeanderStyle,
+};
 use crate::router::{
   CommitDiff, ContinueOutcome, FixOutcome, NewGeometry, NewItem, Router,
 };
@@ -173,6 +177,43 @@ pub enum SessionEvent {
     start: Option<HostId>,
     /// The copper layer to route on.
     layer: i32,
+  },
+
+  /// [`Router::start_tuning`].
+  ///
+  /// KiCad has no such event either, for the same reason
+  /// [`SessionEvent::StartRoutingDiffPair`] has none: `ROUTER_MODE` is
+  /// not in its log format at all, which is why its regression corpus
+  /// holds no tuning case and why one cannot be recorded there (note 08
+  /// section 10.5).
+  ///
+  /// The whole [`MeanderSettings`] block travels with the event, because
+  /// the geometry a tuning session produces is a function of it and a
+  /// replay that cannot reproduce the settings cannot reproduce the
+  /// geometry. The object is not optional: a tuning session refuses to
+  /// start without one.
+  StartTuning {
+    /// The point the tuned stretch starts at, before snapping.
+    at: Vec2,
+    /// The track to tune.
+    item: HostId,
+    /// The dimensions the meanders are drawn to.
+    settings: MeanderSettings,
+  },
+
+  /// [`Router::amplitude_step`]. Not logged by KiCad, whose host binds it
+  /// to a key and re-runs the whole generator update
+  /// (`pcbnew/generators/pcb_tuning_pattern.cpp:2785`).
+  AmplitudeStep {
+    /// Positive to grow the amplitude, negative to shrink it.
+    sign: i32,
+  },
+
+  /// [`Router::spacing_step`]. Likewise unlogged
+  /// (`pcbnew/generators/pcb_tuning_pattern.cpp:2764`).
+  SpacingStep {
+    /// Positive to widen the spacing, negative to narrow it.
+    sign: i32,
   },
 
   /// [`Router::start_dragging`]. `EVT_START_DRAG` and
@@ -521,6 +562,17 @@ fn apply(
       if router.start_routing_diff_pair(*at, *start, *layer).is_ok() {
         *frames_count += 1;
       }
+    }
+    SessionEvent::StartTuning { at, item, settings } => {
+      if router.start_tuning(*at, *item, *settings).is_ok() {
+        *frames_count += 1;
+      }
+    }
+    SessionEvent::AmplitudeStep { sign } => {
+      router.amplitude_step(*sign);
+    }
+    SessionEvent::SpacingStep { sign } => {
+      router.spacing_step(*sign);
     }
     SessionEvent::StartDragging {
       at,
@@ -1034,6 +1086,76 @@ fn sizes_lines(out: &mut String, block: usize, sizes: &Sizes) {
   }
 }
 
+/// The `-` or `<min> <opt> <max>` of one optional length target.
+///
+/// [`LengthTarget`] is three independent numbers rather than a
+/// [`crate::meander::LENGTH_UNCONSTRAINED`] sentinel, so an absent target
+/// needs a spelling of its own; `-` is the format's one sentinel
+/// everywhere else too.
+fn length_target_text(target: Option<LengthTarget>) -> String {
+  target.map_or_else(
+    || "-".to_string(),
+    |target| format!("{} {} {}", target.min, target.opt, target.max),
+  )
+}
+
+/// Every `meander <block> <key> <value>` line of one block.
+///
+/// The eleven fields of [`MeanderSettings`]. There is no block zero for
+/// the router's own value the way [`settings_lines`] and [`sizes_lines`]
+/// have one, because a [`Router`] has no meander settings of its own:
+/// every block is the payload of one [`SessionEvent::StartTuning`], and
+/// they are numbered from zero in the order those events appear.
+fn meander_lines(out: &mut String, block: usize, settings: &MeanderSettings) {
+  let corner_style = match settings.corner_style() {
+    CornerStyle::Chamfer => "chamfer",
+  };
+  let initial_side = match settings.initial_side() {
+    MeanderSide::Left => "left",
+    MeanderSide::Default => "default",
+    MeanderSide::Right => "right",
+  };
+  let lengths = [
+    ("min-amplitude", settings.min_amplitude()),
+    ("max-amplitude", settings.max_amplitude()),
+    ("spacing", settings.spacing()),
+    ("step", settings.step()),
+    (
+      "corner-radius-percentage",
+      settings.corner_radius_percentage(),
+    ),
+  ];
+  let flags = [
+    ("single-sided", settings.single_sided()),
+    ("keep-endpoints", settings.keep_endpoints()),
+  ];
+
+  for (key, value) in lengths {
+    line(out, &format!("meander {block} {key} {value}"));
+  }
+
+  for (key, value) in flags {
+    line(out, &format!("meander {block} {key} {}", u8::from(value)));
+  }
+
+  line(out, &format!("meander {block} corner-style {corner_style}"));
+  line(out, &format!("meander {block} initial-side {initial_side}"));
+  line(
+    out,
+    &format!(
+      "meander {block} target-length {}",
+      length_target_text(settings.target_length())
+    ),
+  );
+  line(
+    out,
+    &format!(
+      "meander {block} target-skew {}",
+      length_target_text(settings.target_skew())
+    ),
+  );
+}
+
 /// One `event` line.
 ///
 /// `sizes_block` and `settings_block` are the indices the next
@@ -1044,6 +1166,7 @@ fn event_text(
   event: &SessionEvent,
   sizes_block: usize,
   settings_block: usize,
+  meander_block: usize,
 ) -> String {
   match event {
     SessionEvent::StartRouting { at, start, layer } => format!(
@@ -1056,6 +1179,17 @@ fn event_text(
       vec2_text(*at),
       optional(start.map(|host| host.0))
     ),
+    SessionEvent::StartTuning { at, item, .. } => format!(
+      "event start-tuning {} {} {meander_block}",
+      vec2_text(*at),
+      item.0
+    ),
+    SessionEvent::AmplitudeStep { sign } => {
+      format!("event amplitude-step {sign}")
+    }
+    SessionEvent::SpacingStep { sign } => {
+      format!("event spacing-step {sign}")
+    }
     SessionEvent::StartDragging {
       at,
       items,
@@ -1140,6 +1274,7 @@ impl SessionRecording {
   ///      <free-pad> <compound> <flash> <drill> <geometry>
   /// settings <block> <key> <value>
   /// sizes <block> <key> <value>
+  /// meander <block> <key> <value>
   /// event <name> <fields...>
   /// commit
   /// removed <host>
@@ -1174,6 +1309,9 @@ impl SessionRecording {
   /// ```text
   /// start-routing <x> <y> <start-host> <layer>
   /// start-routing-diff-pair <x> <y> <start-host> <layer>
+  /// start-tuning <x> <y> <item-host> <meander-block>
+  /// amplitude-step <sign>
+  /// spacing-step <sign>
   /// start-dragging <x> <y> <free-angle> <count> <host>...
   /// move-to <x> <y> <end-host>
   /// fix-route <x> <y> <end-host> <force-finish>
@@ -1199,6 +1337,16 @@ impl SessionRecording {
   /// fixture may list only what it cares about; the writer always lists
   /// everything.
   ///
+  /// `meander` has **no block zero of its own**: a router carries no
+  /// meander settings, so every block is one `start-tuning` event's
+  /// payload and they are numbered from zero in the order those events
+  /// appear. A `meander` block is checked by
+  /// [`MeanderSettings::new`] as it is read, so a file with a
+  /// non positive step or a round corner style is a parse error rather
+  /// than a settings value nothing downstream can honour. Its
+  /// `target-length` and `target-skew` values are either `-` or a
+  /// `<min> <opt> <max>` triple.
+  ///
   /// Booleans are `0` and `1`, enums are words, and every number is an
   /// integer except a solid's orientation in degrees and
   /// [`RoutingSettings::walkaround_hug_length_threshold`], the two `f64`s
@@ -1208,12 +1356,16 @@ impl SessionRecording {
     let mut out = String::new();
     let mut sizes_blocks: Vec<&Sizes> = vec![&self.sizes];
     let mut settings_blocks: Vec<&RoutingSettings> = vec![&self.settings];
+    let mut meander_blocks: Vec<&MeanderSettings> = Vec::new();
 
     for event in &self.events {
       match event {
         SessionEvent::SetSizes { sizes } => sizes_blocks.push(sizes),
         SessionEvent::SetSettings { settings } => {
           settings_blocks.push(settings);
+        }
+        SessionEvent::StartTuning { settings, .. } => {
+          meander_blocks.push(settings);
         }
         _ => {}
       }
@@ -1270,9 +1422,15 @@ impl SessionRecording {
       sizes_lines(&mut out, block, sizes);
     }
 
+    for (block, settings) in meander_blocks.iter().enumerate() {
+      line(&mut out, "");
+      meander_lines(&mut out, block, settings);
+    }
+
     if !self.events.is_empty() {
       let mut sizes_block = 0;
       let mut settings_block = 0;
+      let mut meander_block = 0;
 
       line(&mut out, "");
       line(&mut out, "# event <name> <fields>");
@@ -1284,7 +1442,16 @@ impl SessionRecording {
           _ => {}
         }
 
-        line(&mut out, &event_text(event, sizes_block, settings_block));
+        line(
+          &mut out,
+          &event_text(event, sizes_block, settings_block, meander_block),
+        );
+
+        // The meander blocks are numbered from zero, so the counter
+        // advances **after** the event that named the block.
+        if matches!(event, SessionEvent::StartTuning { .. }) {
+          meander_block += 1;
+        }
       }
     }
 
@@ -1487,6 +1654,21 @@ impl<'a> Tokens<'a> {
     let index = self.number("a parent shape index")?;
 
     Ok(Seg::with_index(a, b, index))
+  }
+
+  /// `-`, or a `<min> <opt> <max>` triple.
+  fn length_target(&mut self) -> Result<Option<LengthTarget>, ParseError> {
+    if self.words.get(self.taken).copied() == Some("-") {
+      self.taken += 1;
+
+      return Ok(None);
+    }
+
+    let min = self.number("a target length")?;
+    let opt = self.number("a target length")?;
+    let max = self.number("a target length")?;
+
+    Ok(Some(LengthTarget::explicit(min, opt, max)))
   }
 
   /// `-`, or a host id.
@@ -1753,6 +1935,8 @@ enum BlockKind {
   Sizes,
   /// A [`RoutingSettings`] block, named by `event set-settings`.
   Settings,
+  /// A [`MeanderSettings`] block, named by `event start-tuning`.
+  Meander,
 }
 
 /// An event whose payload is still a block reference.
@@ -1775,8 +1959,11 @@ struct PendingBlock {
 enum ParsedEvent {
   /// An event with its whole payload.
   Ready(SessionEvent),
-  /// `set-sizes` or `set-settings`, with the block it named.
+  /// `set-sizes` or `set-settings`, whose whole payload is the block.
   Block(BlockKind, usize),
+  /// `start-tuning`, whose payload is partly on the line and partly in
+  /// the block it names.
+  WithBlock(Box<SessionEvent>, BlockKind, usize),
 }
 
 /// The block at an index, created from its defaults when it is new.
@@ -1925,6 +2112,60 @@ fn parse_sizes_key(
   Ok(())
 }
 
+/// Apply one `meander <block> <key> <value>` record.
+///
+/// The block is a [`MeanderSettingsRequest`] rather than a
+/// [`MeanderSettings`] because the latter's fields are private behind
+/// [`MeanderSettings::new`], which is the boundary that refuses a non
+/// positive step and the round corner style. [`resolve_block`] runs that
+/// check once the whole block has been read.
+fn parse_meander_key(
+  tokens: &mut Tokens<'_>,
+  settings: &mut MeanderSettingsRequest,
+) -> Result<(), ParseError> {
+  match tokens.word("a meander key")? {
+    "min-amplitude" => settings.min_amplitude = tokens.number("a length")?,
+    "max-amplitude" => settings.max_amplitude = tokens.number("a length")?,
+    "spacing" => settings.spacing = tokens.number("a length")?,
+    "step" => settings.step = tokens.number("a length")?,
+    "corner-radius-percentage" => {
+      settings.corner_radius_percentage = tokens.number("a percentage")?;
+    }
+    "single-sided" => settings.single_sided = tokens.flag("a setting")?,
+    "keep-endpoints" => settings.keep_endpoints = tokens.flag("a setting")?,
+    "corner-style" => {
+      settings.corner_style = match tokens.word("a corner style")? {
+        "chamfer" => MeanderStyle::Chamfer,
+        // Written by no writer here, and read so that a host bridging
+        // from KiCad's stored `rounded` flag gets the refusal
+        // [`MeanderSettings::new`] makes rather than a parse error with
+        // no explanation.
+        "round" => MeanderStyle::Round,
+        other => {
+          return Err(tokens.error(format!("`{other}` is not a corner style")));
+        }
+      };
+    }
+    "initial-side" => {
+      settings.initial_side = match tokens.word("a meander side")? {
+        "left" => MeanderSide::Left,
+        "default" => MeanderSide::Default,
+        "right" => MeanderSide::Right,
+        other => {
+          return Err(tokens.error(format!("`{other}` is not a meander side")));
+        }
+      };
+    }
+    "target-length" => settings.target_length = tokens.length_target()?,
+    "target-skew" => settings.target_skew = tokens.length_target()?,
+    other => {
+      return Err(tokens.error(format!("`{other}` is not a meander key")));
+    }
+  }
+
+  Ok(())
+}
+
 /// Read one `event` record, leaving a block reference unresolved.
 fn parse_event(tokens: &mut Tokens<'_>) -> Result<ParsedEvent, ParseError> {
   let event = match tokens.word("an event name")? {
@@ -1948,6 +2189,27 @@ fn parse_event(tokens: &mut Tokens<'_>) -> Result<ParsedEvent, ParseError> {
         layer: tokens.number("a layer index")?,
       }
     }
+    "start-tuning" => {
+      let at = tokens.vec2("a point")?;
+      let item: u64 = tokens.number("a host id")?;
+      let block = tokens.block("a meander block")?;
+
+      return Ok(ParsedEvent::WithBlock(
+        Box::new(SessionEvent::StartTuning {
+          at,
+          item: HostId(item),
+          settings: MeanderSettings::default(),
+        }),
+        BlockKind::Meander,
+        block,
+      ));
+    }
+    "amplitude-step" => SessionEvent::AmplitudeStep {
+      sign: tokens.number("a step direction")?,
+    },
+    "spacing-step" => SessionEvent::SpacingStep {
+      sign: tokens.number("a step direction")?,
+    },
     "start-dragging" => {
       let at = tokens.vec2("a point")?;
       let free_angle = tokens.flag("a free angle flag")?;
@@ -2060,6 +2322,7 @@ fn parse_recording(text: &str) -> Result<SessionRecording, ParseError> {
   let mut exclusions: Vec<Shape> = Vec::new();
   let mut settings_blocks: Vec<Option<RoutingSettings>> = Vec::new();
   let mut sizes_blocks: Vec<Option<Sizes>> = Vec::new();
+  let mut meander_blocks: Vec<Option<MeanderSettingsRequest>> = Vec::new();
   let mut events: Vec<SessionEvent> = Vec::new();
   let mut pending: Vec<PendingBlock> = Vec::new();
   let mut results: Vec<CommitDiff> = Vec::new();
@@ -2124,6 +2387,11 @@ fn parse_recording(text: &str) -> Result<SessionRecording, ParseError> {
 
         parse_sizes_key(&mut tokens, block_at(&mut sizes_blocks, block))?;
       }
+      "meander" => {
+        let block = tokens.block("a meander block")?;
+
+        parse_meander_key(&mut tokens, block_at(&mut meander_blocks, block))?;
+      }
       "event" => match parse_event(&mut tokens)? {
         ParsedEvent::Ready(event) => events.push(event),
         ParsedEvent::Block(kind, block) => {
@@ -2140,7 +2408,21 @@ fn parse_recording(text: &str) -> Result<SessionRecording, ParseError> {
             BlockKind::Settings => SessionEvent::SetSettings {
               settings: RoutingSettings::default(),
             },
+            BlockKind::Meander => SessionEvent::StartTuning {
+              at: Vec2::new(0, 0),
+              item: HostId(0),
+              settings: MeanderSettings::default(),
+            },
           });
+        }
+        ParsedEvent::WithBlock(event, kind, block) => {
+          pending.push(PendingBlock {
+            event: events.len(),
+            kind,
+            block,
+            line: number,
+          });
+          events.push(*event);
         }
       },
       "commit" => results.push(CommitDiff::default()),
@@ -2183,7 +2465,13 @@ fn parse_recording(text: &str) -> Result<SessionRecording, ParseError> {
   }
 
   for entry in pending {
-    resolve_block(&mut events, &entry, &settings_blocks, &sizes_blocks)?;
+    resolve_block(
+      &mut events,
+      &entry,
+      &settings_blocks,
+      &sizes_blocks,
+      &meander_blocks,
+    )?;
   }
 
   let (copper_layer_count, max_clearance) = snapshot_header
@@ -2227,6 +2515,7 @@ fn resolve_block(
   entry: &PendingBlock,
   settings_blocks: &[Option<RoutingSettings>],
   sizes_blocks: &[Option<Sizes>],
+  meander_blocks: &[Option<MeanderSettingsRequest>],
 ) -> Result<(), ParseError> {
   match entry.kind {
     BlockKind::Sizes => {
@@ -2261,6 +2550,33 @@ fn resolve_block(
         events.get_mut(entry.event)
       {
         *settings = *block;
+      }
+    }
+    BlockKind::Meander => {
+      let block = meander_blocks
+        .get(entry.block)
+        .and_then(Option::as_ref)
+        .ok_or_else(|| {
+          ParseError::new(
+            entry.line,
+            format!("no `meander {}` block is defined", entry.block),
+          )
+        })?;
+
+      // The two invariants [`MeanderSettings::new`] enforces are checked
+      // here rather than at the `meander` records, because a block is
+      // only complete once the last of them has been read.
+      let checked = MeanderSettings::new(*block).map_err(|error| {
+        ParseError::new(
+          entry.line,
+          format!("`meander {}` is not usable: {error}", entry.block),
+        )
+      })?;
+
+      if let Some(SessionEvent::StartTuning { settings, .. }) =
+        events.get_mut(entry.event)
+      {
+        *settings = checked;
       }
     }
   }
@@ -2474,6 +2790,194 @@ mod tests {
 
     assert_eq!(read, recording, "{text}");
     assert_eq!(replay(&read, diff_pair_rules()).diffs, vec![recorded]);
+  }
+
+  /// The single track fixture of note 08 section 14.2, cut to what a
+  /// round trip needs: two pads and one straight track between them.
+  ///
+  /// `tests/meander_placer.rs` carries the whole board with its obstacle
+  /// and its constraint answering resolver; this one only has to make a
+  /// tuning session that commits something.
+  fn tuning_board() -> WorldSnapshot {
+    let mut snapshot = WorldSnapshot::new(1, World::DEFAULT_MAX_CLEARANCE);
+    let pad = |id: u64, at: Vec2| {
+      WorldItem::new(
+        HostId(id),
+        Some(NetId(1)),
+        LayerRange::single(0),
+        WorldGeometry::Solid {
+          shape: Shape::circle(at, 150_000),
+          pos: at,
+          offset: Vec2::new(0, 0),
+          orientation_degrees: 0.0,
+          anchors: Vec::new(),
+        },
+      )
+    };
+
+    snapshot.items.push(pad(1, Vec2::new(0, 0)));
+    snapshot.items.push(pad(2, Vec2::new(8_000_000, 0)));
+    snapshot.items.push(WorldItem::new(
+      HostId(3),
+      Some(NetId(1)),
+      LayerRange::single(0),
+      WorldGeometry::Segment {
+        seg: Seg::new(Vec2::new(0, 0), Vec2::new(8_000_000, 0)),
+        width: 200_000,
+      },
+    ));
+
+    snapshot
+  }
+
+  /// A tuning session records, survives the text format and replays to
+  /// the same commit.
+  ///
+  /// The acceptance criterion of `doc/work/011-meanders.md`.
+  /// [`SessionEvent::StartTuning`] carries a whole [`MeanderSettings`]
+  /// block, and [`SessionEvent::AmplitudeStep`] and
+  /// [`SessionEvent::SpacingStep`] change the geometry between two moves,
+  /// so this is what pins the three writers and their readers against
+  /// each other.
+  #[test]
+  fn a_tuning_session_replays_to_the_same_commit() {
+    let snapshot = tuning_board();
+    let sizes = Sizes {
+      track_width: 200_000,
+      board_min_track_width: 100_000,
+      min_clearance: 100_000,
+      ..Sizes::default()
+    };
+    let rules = || -> Box<dyn RuleResolver> {
+      Box::new(FixedClearance::uniform(100_000))
+    };
+    let settings = MeanderSettings::new(MeanderSettingsRequest {
+      keep_endpoints: true,
+      target_length: Some(LengthTarget::around(10_000_000)),
+      ..MeanderSettingsRequest::default()
+    })
+    .expect("the default request is chamfered and has a positive step");
+    let from = Vec2::new(1_000_000, 0);
+    let to = Vec2::new(7_000_000, 0);
+    let mut router =
+      Router::new(&snapshot, rules(), RoutingSettings::default(), sizes);
+
+    router.start_recording(&snapshot);
+    router
+      .start_tuning(from, HostId(3), settings)
+      .expect("the fixture track is a track");
+    router.move_to(to, None);
+    router.amplitude_step(-1);
+    router.spacing_step(1);
+    router.move_to(to, None);
+
+    let recorded = match router.fix_route(to, None, true) {
+      FixOutcome::Finished(diff) => diff,
+      FixOutcome::Continue(_) => panic!("a tuning fix always finishes"),
+    };
+    let recording = router.take_recording().expect("a recording was running");
+
+    assert!(
+      matches!(
+        recording.events.first(),
+        Some(SessionEvent::StartTuning { settings: recorded, .. })
+          if *recorded == settings
+      ),
+      "{:?}",
+      recording.events.first()
+    );
+    assert!(!recorded.added.is_empty(), "{recorded:?}");
+
+    let text = recording.to_text();
+    let read = SessionRecording::from_text(&text).expect(&text);
+
+    assert_eq!(read, recording, "{text}");
+    assert_eq!(replay(&read, rules()).diffs, vec![recorded]);
+  }
+
+  /// A `meander` block the settings constructor refuses is a parse error
+  /// naming the event's line, not a settings value nothing downstream can
+  /// honour.
+  #[test]
+  fn a_meander_block_with_a_zero_step_is_refused() {
+    let error = SessionRecording::from_text(
+      "pnsrouter-session 1\nsnapshot 1 800000\n\
+       event start-tuning 0 0 3 0\nmeander 0 step 0\n",
+    )
+    .expect_err("a zero step was accepted");
+
+    assert_eq!(error.line, 3);
+    assert!(error.message.contains("step"), "{error}");
+  }
+
+  /// The corner style and both length targets survive the trip through
+  /// text, including the `-` an unconstrained target is written as.
+  #[test]
+  fn every_meander_field_survives_the_trip_through_text() {
+    let settings = MeanderSettings::new(MeanderSettingsRequest {
+      min_amplitude: 111_111,
+      max_amplitude: 2_222_222,
+      spacing: 333_333,
+      step: 44_444,
+      corner_style: MeanderStyle::Chamfer,
+      corner_radius_percentage: 55,
+      single_sided: true,
+      initial_side: MeanderSide::Right,
+      keep_endpoints: true,
+      target_length: Some(LengthTarget::explicit(1, 2, 3)),
+      target_skew: None,
+    })
+    .expect("a positive step and chamfered corners");
+    let mut recording = empty();
+
+    recording.events.push(SessionEvent::StartTuning {
+      at: Vec2::new(-5, 7),
+      item: HostId(11),
+      settings,
+    });
+    recording
+      .events
+      .push(SessionEvent::AmplitudeStep { sign: -1 });
+    recording.events.push(SessionEvent::SpacingStep { sign: 1 });
+
+    let text = recording.to_text();
+
+    assert_eq!(SessionRecording::from_text(&text), Ok(recording), "{text}");
+  }
+
+  /// Two tuning sessions in one recording get one `meander` block each,
+  /// numbered from zero, and each event names its own.
+  #[test]
+  fn two_tuning_starts_get_a_block_each() {
+    let first = MeanderSettings::new(MeanderSettingsRequest {
+      spacing: 600_000,
+      ..MeanderSettingsRequest::default()
+    })
+    .expect("a positive step");
+    let second = MeanderSettings::new(MeanderSettingsRequest {
+      spacing: 700_000,
+      ..MeanderSettingsRequest::default()
+    })
+    .expect("a positive step");
+    let mut recording = empty();
+
+    recording.events.push(SessionEvent::StartTuning {
+      at: Vec2::new(0, 0),
+      item: HostId(1),
+      settings: first,
+    });
+    recording.events.push(SessionEvent::StopRouting);
+    recording.events.push(SessionEvent::StartTuning {
+      at: Vec2::new(1, 1),
+      item: HostId(2),
+      settings: second,
+    });
+
+    let text = recording.to_text();
+
+    assert!(text.contains("event start-tuning 0 0 1 0"), "{text}");
+    assert!(text.contains("event start-tuning 1 1 2 1"), "{text}");
+    assert_eq!(SessionRecording::from_text(&text), Ok(recording), "{text}");
   }
 
   #[test]

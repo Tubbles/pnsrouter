@@ -26,8 +26,6 @@
 //!
 //! # What is not here
 //!
-//! - `AssembleTuningPath`, `walkTuningPath` and `findLinesFromVia`
-//!   (`:787`, `:611`, `:536`): length tuning only.
 //! - `AssembleDiffPair` and the `DP_PARALLELITY_THRESHOLD` machinery
 //!   (`:1036`): differential pairs only.
 //! - `ShortestConnectionLength`, declared at
@@ -39,12 +37,15 @@
 
 use std::collections::{BTreeSet, VecDeque};
 
+use crate::collide::CollisionSearchOptions;
+use crate::geometry::collision;
 use crate::geometry::line_chain::LineChain;
+use crate::geometry::shape::Shape;
 use crate::geometry::vec2::Vec2;
 use crate::item::{Item, ItemBody, ItemId, Kind, LayerRange};
 use crate::line::Line;
 use crate::node::{JointRef, NodeId, World};
-use crate::rules::RuleResolver;
+use crate::rules::{ItemRef, RuleResolver};
 
 /// How many depth first states [`follow_branch`] may expand.
 ///
@@ -900,6 +901,542 @@ fn follow_branch(
 }
 
 // ---------------------------------------------------------------------
+// AssembleTuningPath
+// ---------------------------------------------------------------------
+
+/// How many walk states [`walk_tuning_path`] may expand.
+///
+/// KiCad bounds the same search with the wall clock timeout
+/// [`FOLLOW_BRANCH_STATE_BUDGET`] also replaces
+/// (`pcbnew/router/pns_topology.cpp:617`, tested at `:640`), and for the
+/// same reason: the walk enumerates every simple path out of the seed
+/// line, so a dense mesh is exponential. `DESIGN.md` section 8 forbids
+/// reading the clock inside an algorithm, so the budget is a state count.
+const WALK_TUNING_PATH_STATE_BUDGET: usize = 10_000;
+
+/// What one [`walk_tuning_path`] call found.
+///
+/// Port of `TOPOLOGY::WALK_RESULT`, `pcbnew/router/pns_topology.h:117`.
+/// Its constructor starts the length at **minus one** (`:125`), not at
+/// zero, so a branch that walked nowhere still replaces the initial value
+/// and clears the pad. `WalkResult::nothing` reproduces that.
+#[derive(Clone, Debug)]
+pub struct WalkResult {
+  /// The lines and vias along the branch, in walk order. `m_items`
+  /// (`:119`).
+  pub items: Vec<PathItem>,
+  /// The pad the branch ended on. `m_endPad` (`:120`).
+  pub end_pad: Option<ItemId>,
+  /// How long the branch is, in nanometres. `m_length` (`:121`).
+  pub length: i64,
+}
+
+impl WalkResult {
+  /// The value KiCad's constructor installs, the negative length
+  /// included.
+  const fn nothing() -> Self {
+    Self {
+      items: Vec::new(),
+      end_pad: None,
+      // :125
+      length: -1,
+    }
+  }
+}
+
+/// One frame of [`walk_tuning_path`]'s explicit stack.
+///
+/// Port of the local `STATE` struct,
+/// `pcbnew/router/pns_topology.cpp:620`.
+struct WalkState {
+  /// The point the walk stands on.
+  endpoint: Vec2,
+  /// What the path has collected so far.
+  path_items: Vec<PathItem>,
+  /// How long that is.
+  path_length: i64,
+  /// Everything this path has already consumed, so it cannot fold back.
+  visited: BTreeSet<ItemId>,
+}
+
+/// What [`assemble_tuning_path`] walked.
+///
+/// KiCad returns the `ITEM_SET` and writes the two terminal pads through
+/// the `SOLID** aStartPad` and `SOLID** aEndPad` out parameters
+/// (`pcbnew/router/pns_topology.h:78`), which its one caller passes
+/// (`pcbnew/router/pns_meander_placer.cpp:85`); the three travel together
+/// here.
+#[derive(Clone, Debug, Default)]
+pub struct TuningPath {
+  /// The path from one terminal to the other, in order, with the seed
+  /// line in the middle.
+  pub items: Vec<PathItem>,
+  /// The pad the leftward walk ended on, KiCad's `*aStartPad`.
+  pub start_pad: Option<ItemId>,
+  /// The pad the rightward walk ended on, KiCad's `*aEndPad`.
+  pub end_pad: Option<ItemId>,
+}
+
+/// The total copper length of a path, in nanometres.
+///
+/// The replacement for `MEANDER_PLACER_BASE::lineLength`
+/// (`pcbnew/router/pns_meander_placer_base.cpp:307`), which forwards to
+/// the host hook `ROUTER_IFACE::CalculateRoutedPathLength`
+/// (`pcbnew/router/pns_router.h:124`). This crate has no such interface,
+/// and note 08 section 11.2 item 3 asks for a free function over the item
+/// set instead: the sum of every line's chain length, and nothing for a
+/// via. KiCad's own `if( aItems.Empty() ) return 0` (`:309`) is the empty
+/// sum.
+///
+/// Four terms of KiCad's number are deliberately absent, and each of them
+/// is genuinely zero here rather than approximated:
+///
+/// - **pad to die length.** `Start` adds `SOLID::GetPadToDie` for each
+///   terminal pad (`pcbnew/router/pns_meander_placer.cpp:92`, `:98`).
+///   Nothing on this crate's [`Item`] carries one, so the term is zero.
+/// - **via height.** KiCad's length calculator adds the stackup distance
+///   a via travels. A via is a point here.
+/// - **the pad entry and via entry fixups.** `AssembleTuningPath` runs
+///   `OptimiseTraceInPad` and `OptimiseTraceInVia` over the path's chains
+///   in place (`pcbnew/router/pns_topology.cpp:928`, `:1010`), which is
+///   why the host is then told not to repeat them
+///   (`pcbnew/router/pns_kicad_iface.cpp:3183`). Both live in KiCad's
+///   board code and not in the router; see [`assemble_tuning_path`].
+/// - **propagation delay**, the whole `lineDelay` half
+///   (`pcbnew/router/pns_meander_placer_base.cpp:317`), which needs a
+///   stackup model.
+///
+/// A host that wants any of them folds its own term into the target it
+/// asks for. `doc/log/2026-09-10.md` records the decision.
+#[must_use]
+pub fn path_length(items: &[PathItem]) -> i64 {
+  items
+    .iter()
+    .map(|item| match item {
+      PathItem::Line(line) => line.shape().length(),
+      // A via is a point, so it contributes nothing.
+      PathItem::Via(_) => 0,
+    })
+    .sum()
+}
+
+/// Every line that leaves a via, for a walk to continue along.
+///
+/// Port of `TOPOLOGY::findLinesFromVia`,
+/// `pcbnew/router/pns_topology.cpp:536`. It is a spatial query rather
+/// than a joint lookup because a track may end **inside** a via's pad
+/// without reaching its centre, in which case there is no joint to walk
+/// through; that is the case `OptimiseTraceInVia` exists to measure.
+///
+/// The anchor test at `:571` has two branches in KiCad, one that asks the
+/// board's `LENGTH_DELAY_CALCULATION::IsPointInsideViaPad` (`:583`) and a
+/// fallback that tests the router's own via shape (`:589`). Only the
+/// fallback is ported: the first needs a `PCB_VIA` and a board layer,
+/// neither of which exists here.
+///
+/// `visited` keeps the walk from turning round, and the local `assembled`
+/// set keeps two links of the same run from producing the same line twice
+/// (`:567`, `:600`).
+fn find_lines_from_via(
+  world: &World,
+  node: NodeId,
+  resolver: &dyn RuleResolver,
+  via: ItemId,
+  visited: &BTreeSet<ItemId>,
+) -> Vec<Line> {
+  let mut result = Vec::new();
+
+  let Some(via_item) = world.item(via) else {
+    return result;
+  };
+  let net = via_item.net();
+
+  // :540 to :546
+  let options = CollisionSearchOptions {
+    different_nets_only: false,
+    override_clearance: Some(0),
+    kind_mask: Kind::SEGMENT | Kind::ARC,
+    ..CollisionSearchOptions::default()
+  };
+  let obstacles = world.query_colliding(
+    node,
+    ItemRef::stored(via, via_item),
+    resolver,
+    &options,
+  );
+
+  // :588. The shape the fallback anchor test runs against.
+  let via_shape = via_item.shape(via_item.layers().start());
+  let mut assembled: BTreeSet<ItemId> = BTreeSet::new();
+
+  // :557
+  for obstacle in obstacles {
+    let Some(candidate) = obstacle.item else {
+      continue;
+    };
+    let Some(item) = world.item(candidate) else {
+      continue;
+    };
+
+    // :559
+    if item.net() != net {
+      continue;
+    }
+
+    // :564, :567
+    if visited.contains(&candidate) || assembled.contains(&candidate) {
+      continue;
+    }
+
+    // :571 to :596. At least one anchor has to sit inside the via's pad.
+    let Some(shape) = via_shape.as_ref() else {
+      continue;
+    };
+    let inside = (0..item.anchor_count()).any(|index| {
+      collision::collides(
+        shape.as_ref(),
+        &Shape::circle(item.anchor(index), 0),
+        0,
+      )
+    });
+
+    if !inside {
+      continue;
+    }
+
+    // :598
+    let line = world.assemble_line(node, candidate, None, false, true, true);
+
+    // :600 to :603
+    assembled.extend(line.links().iter().copied());
+    result.push(line);
+  }
+
+  result
+}
+
+/// One continuation of a walk, as a fresh stack frame.
+///
+/// The body shared by `pcbnew/router/pns_topology.cpp:686` to `:703` and
+/// `:729` to `:752`: pick the far end of the continuation, extend the
+/// path with it, add its length, and mark every one of its links
+/// consumed. `via` is the via to push ahead of the line, which only the
+/// via branch has (`:736`).
+fn walk_forward(
+  current: &WalkState,
+  line: Line,
+  via: Option<ItemId>,
+) -> Option<WalkState> {
+  let first = (line.point_count() > 0).then(|| line.point(0))?;
+  let last = line.last_point()?;
+  let endpoint = current.endpoint;
+
+  // :690, :731. The nearer end is where the walk came in, so the far end
+  // is where it goes next. A tie sends the walk to the last point.
+  let start_near = (first - endpoint).squared_euclidean_norm()
+    <= (last - endpoint).squared_euclidean_norm();
+  let mut visited = current.visited.clone();
+
+  visited.extend(line.links().iter().copied());
+
+  let mut path_items = current.path_items.clone();
+
+  if let Some(via) = via {
+    path_items.push(PathItem::Via(via));
+  }
+
+  // :745. `OptimiseTraceInVia` is not ported, so a continuation measures
+  // as it is drawn; see [`path_length`].
+  let path_length = current.path_length + line.shape().length();
+
+  path_items.push(PathItem::Line(Box::new(line)));
+
+  Some(WalkState {
+    endpoint: if start_near { last } else { first },
+    path_items,
+    path_length,
+    visited,
+  })
+}
+
+/// Walk out of one end of a line, through pads and vias, keeping the
+/// longest branch.
+///
+/// Port of `TOPOLOGY::walkTuningPath`,
+/// `pcbnew/router/pns_topology.cpp:611`. It is the length tuning
+/// counterpart of `follow_branch` and differs from it in three ways,
+/// all of which follow from what a tuned length is:
+///
+/// - it walks **through** a pad instead of stopping at one (`:676`), so a
+///   signal that passes through a series component is tuned end to end,
+///   and it records the pad it passed as the branch's terminal (`:669`);
+/// - it walks through a via by way of `find_lines_from_via` rather than
+///   through the via's joint, so a track that stops inside a via's pad is
+///   still followed (`:722`);
+/// - the visited set is **per path** and grows as the walk goes (`:676`,
+///   `:701`), where `followBranch`'s is shared and never grows, so this
+///   walk cannot pass the same copper twice.
+///
+/// The wall clock timeout at `:633` becomes
+/// `WALK_TUNING_PATH_STATE_BUDGET`.
+pub fn walk_tuning_path(
+  world: &World,
+  node: NodeId,
+  resolver: &dyn RuleResolver,
+  start_line: &Line,
+  start_from_back: bool,
+  visited: &BTreeSet<ItemId>,
+) -> WalkResult {
+  let mut best = WalkResult::nothing();
+  let net = start_line.net();
+
+  // :629
+  let Some(endpoint) = (if start_from_back {
+    start_line.last_point()
+  } else {
+    (start_line.point_count() > 0).then(|| start_line.point(0))
+  }) else {
+    return best;
+  };
+
+  // :630 to :634
+  let mut stack = vec![WalkState {
+    endpoint,
+    path_items: Vec::new(),
+    path_length: 0,
+    visited: visited.clone(),
+  }];
+  let mut budget = WALK_TUNING_PATH_STATE_BUDGET;
+
+  // :636
+  while let Some(mut current) = stack.pop() {
+    // :638 to :646
+    if budget == 0 {
+      break;
+    }
+
+    budget -= 1;
+
+    // :651
+    let hits = world.hit_test(node, current.endpoint);
+
+    // :655 to :663
+    let pad = hits.iter().copied().find(|id| {
+      world.item(*id).is_some_and(|item| {
+        item.of_kind(Kind::SOLID)
+          && item.net() == net
+          && !current.visited.contains(id)
+      })
+    });
+
+    if let Some(pad) = pad {
+      // :667 to :673
+      if current.path_length > best.length {
+        best.length = current.path_length;
+        best.items.clone_from(&current.path_items);
+        best.end_pad = Some(pad);
+      }
+
+      // :676, "continue through an in-line pad so tuning spans the whole
+      // net".
+      current.visited.insert(pad);
+
+      // :678 to :703
+      for id in &hits {
+        let Some(item) = world.item(*id) else {
+          continue;
+        };
+
+        // :680 to :684
+        if !item.of_kind(Kind::SEGMENT | Kind::ARC) {
+          continue;
+        }
+
+        if item.net() != net || current.visited.contains(id) {
+          continue;
+        }
+
+        // :686
+        let line = world.assemble_line(node, *id, None, false, true, true);
+
+        if let Some(next) = walk_forward(&current, line, None) {
+          stack.push(next);
+        }
+      }
+
+      continue;
+    }
+
+    // :708 to :716
+    let via = hits.iter().copied().find(|id| {
+      world.item(*id).is_some_and(|item| {
+        item.of_kind(Kind::VIA)
+          && item.net() == net
+          && !item.is_virtual()
+          && !current.visited.contains(id)
+      })
+    });
+
+    let Some(via) = via else {
+      // :764 to :770
+      if current.path_length > best.length {
+        best.length = current.path_length;
+        best.items = current.path_items;
+        best.end_pad = None;
+      }
+
+      continue;
+    };
+
+    // :720
+    current.visited.insert(via);
+
+    // :722
+    let continuations =
+      find_lines_from_via(world, node, resolver, via, &current.visited);
+
+    // :755 to :761
+    if continuations.is_empty() {
+      if current.path_length > best.length {
+        best.length = current.path_length;
+        best.items = current.path_items;
+        best.items.push(PathItem::Via(via));
+        best.end_pad = None;
+      }
+
+      continue;
+    }
+
+    // :724 to :753
+    for line in continuations {
+      if let Some(next) = walk_forward(&current, line, Some(via)) {
+        stack.push(next);
+      }
+    }
+  }
+
+  best
+}
+
+/// The longest run of copper the tuner may lengthen, out of one item.
+///
+/// Port of `TOPOLOGY::AssembleTuningPath`,
+/// `pcbnew/router/pns_topology.cpp:787`, the path
+/// `MEANDER_PLACER::Start` measures the tuned length over
+/// (`pcbnew/router/pns_meander_placer.cpp:85`).
+///
+/// It differs from [`assemble_trivial_path`] in exactly the two ways
+/// length tuning needs: [`walk_tuning_path`] walks **through** a pad
+/// rather than stopping at one, and each end takes the longest branch a
+/// junction offers rather than refusing to guess.
+///
+/// A via start is resolved the same way twice over: through the via's
+/// joint when it is a non fanout via (`:800`), and through
+/// `find_lines_from_via` otherwise (`:819`). Anything that is neither a
+/// via nor a segment answers an empty path, which is KiCad's `seg`
+/// staying null at `:842`.
+///
+/// # The two in place fixups are not ported
+///
+/// KiCad finishes by rewriting the path's own chains: `OptimiseTraceInPad`
+/// on every line touching a terminal or an intermediate pad (`:928`,
+/// `:974`) and `OptimiseTraceInVia` on the lines either side of every via
+/// (`:1010`). Both are `LENGTH_DELAY_CALCULATION` members that live in
+/// KiCad's board code, outside the router, and both need a `PAD` or a
+/// `PCB_VIA` and a board layer. Note 08 section 11.2 item 1 offers the
+/// choice of leaving the chains alone or exposing the fixup as a host
+/// hook; the chains are left alone, so a track that overshoots into a pad
+/// measures as it is drawn. See [`path_length`], where the same decision
+/// is recorded from the length side.
+pub fn assemble_tuning_path(
+  world: &World,
+  node: NodeId,
+  resolver: &dyn RuleResolver,
+  start: ItemId,
+) -> TuningPath {
+  let Some(item) = world.item(start) else {
+    return TuningPath::default();
+  };
+
+  // :795 to :840
+  let seed = if item.kind() == Kind::VIA {
+    let ItemBody::Via(via) = item.body() else {
+      return TuningPath::default();
+    };
+
+    // :800 to :814
+    let from_joint = find_joint_of_item(world, node, via.pos(), item)
+      .and_then(|reference| world.joint(reference))
+      .filter(|joint| joint.is_non_fanout_via(world.items()))
+      .and_then(|joint| {
+        joint.links().iter().copied().find(|id| {
+          world
+            .item(*id)
+            .is_some_and(|link| link.of_kind(Kind::SEGMENT | Kind::ARC))
+        })
+      });
+
+    // :816 to :835
+    match from_joint {
+      Some(seed) => Some(seed),
+      None => {
+        find_lines_from_via(world, node, resolver, start, &BTreeSet::new())
+          .first()
+          .and_then(|line| {
+            line.links().iter().copied().find(|id| {
+              world
+                .item(*id)
+                .is_some_and(|link| link.of_kind(Kind::SEGMENT | Kind::ARC))
+            })
+          })
+      }
+    }
+  } else if item.of_kind(Kind::SEGMENT | Kind::ARC) {
+    // :838
+    Some(start)
+  } else {
+    None
+  };
+
+  // :842
+  let Some(seed) = seed else {
+    return TuningPath::default();
+  };
+
+  // :848
+  let line = world.assemble_line(node, seed, None, false, true, true);
+
+  // :853 to :856
+  let visited: BTreeSet<ItemId> = line.links().iter().copied().collect();
+
+  // :860, :865
+  let left = walk_tuning_path(world, node, resolver, &line, false, &visited);
+  let right = walk_tuning_path(world, node, resolver, &line, true, &visited);
+
+  // :867 to :876. `ITEM_SET::Prepend` in a loop, so the left branch ends
+  // up reversed ahead of the seed line, exactly as in
+  // [`follow_trivial_path`].
+  let mut items: Vec<PathItem> = Vec::new();
+
+  for item in left.items {
+    items.insert(0, item);
+  }
+
+  items.push(PathItem::Line(Box::new(line)));
+  items.extend(right.items);
+
+  // :881 to :908. KiCad also checks that the solid's parent really is a
+  // `PCB_PAD_T` before naming it a terminal, because a `SOLID` can stand
+  // for any board object with copper; every solid here is one the host
+  // named, so there is nothing to check.
+  TuningPath {
+    items,
+    start_pad: left.end_pad,
+    end_pad: right.end_pad,
+  }
+}
+
+// ---------------------------------------------------------------------
 // ConnectedItems
 // ---------------------------------------------------------------------
 
@@ -925,7 +1462,7 @@ mod tests {
   use super::*;
   use crate::geometry::seg::Seg;
   use crate::geometry::shape::Shape;
-  use crate::item::{NetId, Segment, Solid};
+  use crate::item::{NetId, Segment, Solid, Via, ViaType};
   use crate::rules::FixedClearance;
 
   /// The net every fixture item sits on.
@@ -1155,5 +1692,188 @@ mod tests {
     empty.link(pad);
 
     assert!(!simplify_line(&mut world, root, &empty));
+  }
+
+  /// A track on one layer, of the fixture net.
+  fn add_track_on(
+    world: &mut World,
+    node: NodeId,
+    layer: i32,
+    from: Vec2,
+    to: Vec2,
+  ) -> ItemId {
+    let body = ItemBody::Segment(Segment::new(Seg::new(from, to), WIDTH));
+    let mut item = world.make_item(body);
+
+    item.set_layers_and_flash_all(LayerRange::single(layer));
+    item.set_net(NET);
+
+    world
+      .add_segment(node, item, false)
+      .expect("the fixture track is neither degenerate nor redundant")
+  }
+
+  /// A through via of the fixture net, spanning layers zero and one.
+  fn add_via(world: &mut World, node: NodeId, at: Vec2) -> ItemId {
+    let body = ItemBody::Via(Via::new(at, 6000, 3000, ViaType::Through));
+    let mut item = world.make_item(body);
+
+    item.set_layers_and_flash_all(LayerRange::new(0, 1));
+    item.set_net(NET);
+
+    world.add_via(node, item)
+  }
+
+  /// Every line of a path, in order, as its chain.
+  fn path_lines(path: &TuningPath) -> Vec<LineChain> {
+    path
+      .items
+      .iter()
+      .filter_map(|item| match item {
+        PathItem::Line(line) => Some(line.shape().clone()),
+        PathItem::Via(_) => None,
+      })
+      .collect()
+  }
+
+  /// `walkTuningPath` walks **through** a pad where `followBranch` stops
+  /// at one (`pcbnew/router/pns_topology.cpp:676`), so the path spans a
+  /// net that runs through a series component.
+  #[test]
+  fn a_tuning_path_runs_through_an_intermediate_pad_to_both_terminals() {
+    let mut world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let root = world.root();
+    let rules = FixedClearance::uniform(100);
+
+    let west = add_pad(&mut world, root, Vec2::new(0, 0));
+    let seed =
+      add_track(&mut world, root, Vec2::new(0, 0), Vec2::new(3_000_000, 0));
+
+    add_pad(&mut world, root, Vec2::new(3_000_000, 0));
+    add_track(
+      &mut world,
+      root,
+      Vec2::new(3_000_000, 0),
+      Vec2::new(8_000_000, 0),
+    );
+
+    let east = add_pad(&mut world, root, Vec2::new(8_000_000, 0));
+    let path = assemble_tuning_path(&world, root, &rules, seed);
+
+    assert_eq!(path.start_pad, Some(west));
+    assert_eq!(path.end_pad, Some(east));
+    assert_eq!(path_lines(&path).len(), 2);
+    assert_eq!(path_length(&path.items), 8_000_000);
+  }
+
+  /// The depth first search keeps the **longest** branch (`:667`), which
+  /// is what makes this a tuning walk and not a shortest connection walk.
+  #[test]
+  fn a_tuning_path_takes_the_longer_branch_out_of_a_pad() {
+    let mut world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let root = world.root();
+    let rules = FixedClearance::uniform(100);
+
+    let seed =
+      add_track(&mut world, root, Vec2::new(0, 0), Vec2::new(3_000_000, 0));
+
+    add_pad(&mut world, root, Vec2::new(3_000_000, 0));
+
+    // The short branch, and the long one, in that insertion order so
+    // that the answer cannot come from the order the hits arrive in.
+    add_track(
+      &mut world,
+      root,
+      Vec2::new(3_000_000, 0),
+      Vec2::new(4_000_000, 0),
+    );
+    add_track(
+      &mut world,
+      root,
+      Vec2::new(3_000_000, 0),
+      Vec2::new(3_000_000, 5_000_000),
+    );
+
+    let path = assemble_tuning_path(&world, root, &rules, seed);
+
+    assert_eq!(path_length(&path.items), 3_000_000 + 5_000_000);
+  }
+
+  /// A via is walked through by way of `findLinesFromVia` (`:722`), and
+  /// both the via and the run on the far side end up in the path.
+  #[test]
+  fn a_tuning_path_crosses_a_via_and_keeps_it() {
+    let mut world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let root = world.root();
+    let rules = FixedClearance::uniform(100);
+    let corner = Vec2::new(3_000_000, 0);
+
+    let seed = add_track_on(&mut world, root, 0, Vec2::new(0, 0), corner);
+    let via = add_via(&mut world, root, corner);
+
+    add_track_on(&mut world, root, 1, corner, Vec2::new(7_000_000, 0));
+
+    let path = assemble_tuning_path(&world, root, &rules, seed);
+    let vias: Vec<ItemId> = path
+      .items
+      .iter()
+      .filter_map(|item| match item {
+        PathItem::Via(id) => Some(*id),
+        PathItem::Line(_) => None,
+      })
+      .collect();
+
+    assert_eq!(vias, vec![via]);
+    assert_eq!(path_lines(&path).len(), 2);
+    assert_eq!(path_length(&path.items), 3_000_000 + 4_000_000);
+  }
+
+  /// The via itself adds nothing to the length: it is a point here, where
+  /// KiCad's host adds the stackup distance. See [`path_length`].
+  #[test]
+  fn a_via_contributes_no_length() {
+    let mut world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let root = world.root();
+    let via = add_via(&mut world, root, Vec2::new(0, 0));
+
+    assert_eq!(path_length(&[PathItem::Via(via)]), 0);
+    assert_eq!(path_length(&[]), 0);
+  }
+
+  /// `AssembleTuningPath`'s `seg` stays null for anything that is neither
+  /// a via nor a segment (`:842`), and the answer is an empty set.
+  #[test]
+  fn a_tuning_path_from_a_pad_is_empty() {
+    let mut world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let root = world.root();
+    let rules = FixedClearance::uniform(100);
+    let pad = add_pad(&mut world, root, Vec2::new(0, 0));
+
+    add_track(&mut world, root, Vec2::new(0, 0), Vec2::new(3_000_000, 0));
+
+    let path = assemble_tuning_path(&world, root, &rules, pad);
+
+    assert!(path.items.is_empty());
+    assert!(path.start_pad.is_none());
+    assert!(path.end_pad.is_none());
+  }
+
+  /// One walk of a dead end answers KiCad's initial `WALK_RESULT`, whose
+  /// length is minus one (`pcbnew/router/pns_topology.h:125`) until the
+  /// zero length dead end replaces it.
+  #[test]
+  fn a_walk_out_of_a_dead_end_finds_nothing_but_reports_zero() {
+    let mut world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let root = world.root();
+    let rules = FixedClearance::uniform(100);
+    let seed =
+      add_track(&mut world, root, Vec2::new(0, 0), Vec2::new(3_000_000, 0));
+    let line = world.assemble_line(root, seed, None, false, true, true);
+    let visited: BTreeSet<ItemId> = line.links().iter().copied().collect();
+    let walk = walk_tuning_path(&world, root, &rules, &line, true, &visited);
+
+    assert_eq!(walk.length, 0);
+    assert!(walk.items.is_empty());
+    assert!(walk.end_pad.is_none());
   }
 }

@@ -721,10 +721,12 @@ impl MeanderSettings {
   ///
   /// In this port the generator does not reach back into anything: the
   /// flip comes out of [`MeanderedLine::meander_segment`] as a flag and
-  /// the caller applies it here. Note 08 section 11.4 asks for that, and
-  /// it is sound because nothing inside the fitting loop reads
-  /// [`MeanderSettings::initial_side`]: the flip only changes where the
-  /// **next** move starts.
+  /// the caller applies it. Note 08 section 11.4 asks for that. It is
+  /// sound because nothing inside the fitting loop reads
+  /// [`MeanderSettings::initial_side`]; what does read it is the placer,
+  /// once per base segment, so the caller has to apply the flip between
+  /// base segments and not merely at the end of a move. See
+  /// [`MeanderSegmentResult::initial_side_flipped`].
   pub const fn flip_initial_side(&mut self) {
     self.initial_side = self.initial_side.flipped();
   }
@@ -1921,11 +1923,19 @@ pub struct MeanderSegmentResult {
   /// Whether the caller should call
   /// [`MeanderSettings::flip_initial_side`].
   ///
-  /// KiCad's lambda can fire more than once in one loop and each firing
+  /// KiCad's lambda can fire more than once in one call and each firing
   /// negates the side, so what matters is the parity; this is that
-  /// parity. Nothing inside the loop reads
-  /// [`MeanderSettings::initial_side`], so applying the flip after the
-  /// loop instead of during it changes nothing.
+  /// parity.
+  ///
+  /// Nothing inside [`MeanderedLine::meander_segment`] reads
+  /// [`MeanderSettings::initial_side`], so reporting the flip rather than
+  /// performing it changes nothing **within one base segment**. It does
+  /// not follow that a caller may defer it: the placer re-reads the side
+  /// at the top of every base segment
+  /// (`pcbnew/router/pns_meander_placer.cpp:265`), so a flip on one
+  /// decides which side the next one starts on. Note 08 section 11.6, and
+  /// [`crate::placer::meander_placer::MeanderPlacer::move_to`] is what
+  /// applies it at the right point.
   pub initial_side_flipped: bool,
 }
 
