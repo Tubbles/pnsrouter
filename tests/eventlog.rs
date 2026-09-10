@@ -773,6 +773,7 @@ fn every_geometry_and_shape_variant_survives_the_trip_through_text() {
           source: Some(HostId(21)),
         },
       )],
+      moved_solids: vec![(HostId(23), Vec2::new(-7, 9))],
     }],
     ..SessionRecording::new(snapshot, settings(), sizes())
   };

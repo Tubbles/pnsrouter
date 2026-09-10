@@ -6,7 +6,7 @@ pnsrouter is a standalone Rust crate on crates.io implementing an interactive pu
 
 ## Non-goals for now
 
-Arc tracks (on hold), HDI micro via stacks, a custom DRC rule language, and the LibrePCB side of differential pairs (on hold). Component drag (KiCad's `DRAG_COMPONENT`) is the tail of milestone 9; multi drag landed on 2026-09-10. The data model must not prevent any of them.
+Arc tracks (on hold), HDI micro via stacks, a custom DRC rule language, and the LibrePCB side of differential pairs (on hold). Multi drag and component drag (KiCad's `DRAG_COMPONENT`) both landed on 2026-09-10 as the tail of milestone 9. The data model must not prevent any of them.
 
 ## Milestones
 
@@ -20,7 +20,7 @@ Arc tracks (on hold), HDI micro via stacks, a custom DRC rule language, and the 
 - M7 Hardening and release: fixtures from real boards, fuzzing of geometry, performance profiling on large boards, 0.1.0 release on crates.io.
 
 - M8 Parallel obstacle query (implemented 2026-09-10, off by default): KiCad's thread pool in `NODE::NearestObstacle` (`pns_node.cpp:437`) ported with `std::thread::scope`, sequential below a candidate count threshold, reduction by (distance, uid) so every answer is identical on any thread count. The determinism half of the exit criterion holds and is tested; the performance half does not. Per query thread creation costs more than the geometry it moves on both measured boards, so `World::set_parallelism` defaults to 1. The numbers and the reason are in `doc/performance.md` and `doc/work/008-parallel-obstacle-query.md`.
-- M9 Dragging: segment, corner and via drag with the shove engine, multi drag, and the helpers deferred for them (rotation, angles, `PointAlong`, line versus line decomposition at the dragger's call sites). Exit criterion: the seven drag cases of the KiCad corpus replay to their goldens, and LibrePCB drags a trace with the select tool.
+- M9 Dragging (implemented 2026-09-10, two exceptions): segment, corner and via drag with the shove engine, multi drag, component drag, and the helpers deferred for them (`PointAlong`, line versus line decomposition at the dragger's call sites; rotation and angle types turned out to be arc only, note 06 section 9.6). Exit criterion: the seven drag cases of the KiCad corpus replay to their goldens, and LibrePCB drags a trace with the select tool. Six of the seven do; the seventh, `issue23449-shove-lone-via-drag-crash`, has an empty golden that only a failing via drag reproduces and the divergence is in the shove's lone stitching via head, not in the dragger (`doc/work/009-dragging.md`). LibrePCB drags a single trace; the multi drag and component drag gestures are not wired up there yet.
 - M10 Differential pairs: the pair placer, coupling and gap rules, the pair dragger, and the host hooks (`dp_net_pair` and friends) filled in for LibrePCB through a naming convention. Exit criterion: a pair routes in all three modes on a synthetic two layer board in the crate's tests. The LibrePCB side is on hold until LibrePCB has a pair concept (user decision, 2026-09-10).
 - M11 Meanders: single trace length tuning, differential pair length tuning and skew tuning, chamfered corners only until arcs exist. Exit criterion: a tuned trace reaches the target length within the tolerance and replays.
 

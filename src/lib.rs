@@ -170,6 +170,8 @@
 //!   trace, in any of the three modes.
 //! - [`multi_dragger`]: moving several traces at once, keeping their
 //!   spacing.
+//! - [`component_dragger`]: moving a footprint by its pads, dragging the
+//!   traces that hang off them along.
 //!
 //! # Measuring and reproducing
 //!
@@ -191,6 +193,7 @@
 pub mod algo_base;
 pub mod arena;
 pub mod collide;
+pub mod component_dragger;
 pub mod debug;
 pub mod dragger;
 pub mod eventlog;

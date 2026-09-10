@@ -160,7 +160,11 @@ src/
   optimizer.rs   merge passes, pad breakouts, fanout cleanup
   mouse_trail.rs posture solver
   shove.rs       effect list shove, springback stack
+  via.rs         via pushout force, shared by the placer and the dragger
   placer/        line_placer, fixed_tail
+  dragger.rs     segment, corner and via drag in all three modes
+  multi_dragger.rs   several traces dragged as a bundle
+  component_dragger.rs  footprints dragged by their pads
   snapshot.rs    WorldSnapshot and the world builder
   router.rs      session facade, PreviewFrame, CommitDiff
   eventlog.rs    session recording, replay, text format

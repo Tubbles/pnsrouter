@@ -18,13 +18,13 @@
 //!   (`pcbnew/router/pns_router.cpp:58`) and `ROUTER::GetInstance()` have
 //!   no counterpart; the ambient state travels as
 //!   [`crate::algo_base::AlgoContext`] (`DESIGN.md` section 8).
-//! - **The component dragger, differential pairs and the three tuning
-//!   modes.** The placer set is closed by the mode (note 03 section 9.2),
-//!   so the missing modes are missing variants and not missing trait
-//!   implementations. Dragging is here, through
-//!   [`Router::start_dragging`] and [`RouterState::DragSegment`], with
-//!   both [`crate::dragger`] and [`crate::multi_dragger`]; the component
-//!   dragger is not, so a set of nothing but pads is refused.
+//! - **Differential pairs and the three tuning modes.** The placer set is
+//!   closed by the mode (note 03 section 9.2), so the missing modes are
+//!   missing variants and not missing trait implementations. All three of
+//!   KiCad's drag algorithms are here, through
+//!   [`Router::start_dragging`], [`RouterState::DragSegment`] and
+//!   [`RouterState::DragComponent`]: [`crate::dragger`],
+//!   [`crate::multi_dragger`] and [`crate::component_dragger`].
 //! - **`SetIterLimit` and `GetIterLimit`**
 //!   (`pcbnew/router/pns_router.h:224`), dead API read by nobody in
 //!   KiCad's tree; the real budgets live in
@@ -53,6 +53,7 @@
 
 use crate::algo_base::AlgoContext;
 use crate::collide::CollisionSearchOptions;
+use crate::component_dragger::{ComponentDragger, MovedSolid};
 use crate::debug::{DebugDecorator, NoDebug};
 use crate::dragger::Dragger;
 use crate::eventlog::{Recorder, SessionEvent, SessionRecording};
@@ -88,8 +89,8 @@ const PROBE_UID: u64 = u64::MAX;
 
 /// Which algorithm the facade is running.
 ///
-/// Port of `ROUTER::RouterState`, `pcbnew/router/pns_router.h:157`, minus
-/// `DRAG_COMPONENT`. `RoutingInProgress()` is `m_state != IDLE`
+/// Port of `ROUTER::RouterState`, `pcbnew/router/pns_router.h:157`.
+/// `RoutingInProgress()` is `m_state != IDLE`
 /// (`pcbnew/router/pns_router.cpp:120`); there is no separate committing
 /// state, the transition back to [`RouterState::Idle`] happens inside
 /// [`Router::stop_routing`].
@@ -103,12 +104,25 @@ pub enum RouterState {
   /// An existing track, corner or via is being dragged. `DRAG_SEGMENT`.
   ///
   /// Entered by [`Router::start_dragging`]
-  /// (`pcbnew/router/pns_router.cpp:185`, `:190`). KiCad's
-  /// `DRAG_COMPONENT` has no variant: a component drag needs
-  /// `COMPONENT_DRAGGER`, which `PLAN.md` lists as a non goal, and
-  /// `ROUTER::GetUpdatedItems` does not even report it (note 06 erratum
-  /// E15).
+  /// (`pcbnew/router/pns_router.cpp:185`, `:190`) for a set that reaches
+  /// [`crate::dragger::Dragger`] or
+  /// [`crate::multi_dragger::MultiDragger`].
   DragSegment,
+
+  /// One or more footprints are being dragged by their pads.
+  /// `DRAG_COMPONENT`.
+  ///
+  /// Entered by [`Router::start_dragging`]
+  /// (`pcbnew/router/pns_router.cpp:179`) for a set of nothing but
+  /// solids, which reaches [`crate::component_dragger::ComponentDragger`].
+  ///
+  /// KiCad's `ROUTER::GetUpdatedItems` has no branch for this state
+  /// (`:839` handles `ROUTE_TRACK`, `:844` handles `DRAG_SEGMENT`,
+  /// nothing handles `DRAG_COMPONENT`), so a component drag reports an
+  /// empty delta to anything that asks. That is note 06 erratum E15 and
+  /// it is the one thing [`Router::pending_update`] adds rather than
+  /// transcribes.
+  DragComponent,
 }
 
 /// Why a routing session refused to start.
@@ -159,18 +173,6 @@ pub enum StartError {
   /// (`pcbnew/router/pns_router.cpp:171`), the first thing
   /// `StartDragging` tests.
   NothingToDrag,
-
-  /// A drag was asked for over a set of nothing but pads.
-  ///
-  /// `if( aStartItems.Count( SOLID_T ) == aStartItems.Size() )`
-  /// (`pcbnew/router/pns_router.cpp:176`), which is how KiCad picks
-  /// `COMPONENT_DRAGGER`. That algorithm moves footprints and their
-  /// fanout rather than traces, and `PLAN.md` has it as the tail of
-  /// milestone 9, so the set is refused here rather than quietly dragged
-  /// as something else. The test is on the **shape of the set** and not
-  /// on a drag mode, and it wins over the multi drag test below it, so a
-  /// selection of pads is always a component drag.
-  ComponentDragUnsupported,
 
   /// The object under the drag is not something a drag can move.
   ///
@@ -365,7 +367,30 @@ pub struct PreviewFrame {
   /// of. Items the engine itself created and then dropped are not listed,
   /// because the host only ever drew them from an earlier frame and every
   /// frame is complete.
+  ///
+  /// A component drag's pads are in here too, and are also in
+  /// [`PreviewFrame::moved_solids`] with the offset to draw them at.
   pub hidden: Vec<HostId>,
+
+  /// Board objects the host must draw at an offset instead of where they
+  /// are.
+  ///
+  /// The preview counterpart of [`CommitDiff::moved_solids`], and empty
+  /// for everything except a component drag.
+  ///
+  /// KiCad splits this between the router and the tool: `updateView`
+  /// hides the old solid and draws the cloned one
+  /// (`pcbnew/router/pns_router.cpp:766`, `:772`), while
+  /// `ROUTER_TOOL::InlineDrag` clones the footprint's graphics, its non
+  /// copper pads, its reference and its value, translates each by the
+  /// cursor offset and hides the originals
+  /// (`pcbnew/router/router_tool.cpp:3076` to `:3113`), under the comment
+  /// "Pads with copper or holes are handled by the router" (`:3100`).
+  /// There is no geometry here to draw a pad's copper with and no reason
+  /// to invent one, since the host already owns the object; the offset is
+  /// what it needs and it is the same offset the tool uses for everything
+  /// else the component carries.
+  pub moved_solids: Vec<(HostId, Vec2)>,
 }
 
 // ---------------------------------------------------------------------
@@ -423,9 +448,10 @@ pub struct NewItem {
 ///
 /// Port of `ROUTER::CommitRouting( NODE* )`
 /// (`pcbnew/router/pns_router.cpp:862`), whose three `ROUTER_IFACE` calls
-/// become three lists a host applies inside one undo transaction. Note 05
-/// section 7.2 asks for exactly this shape, minus `moved_pads`, which
-/// only the component dragger produces.
+/// become three lists a host applies inside one undo transaction, plus
+/// the fourth thing `PNS_KICAD_IFACE` reconstructs out of those calls for
+/// a component drag. Note 05 section 7.2 asks for exactly this shape and
+/// names the fourth list `moved_pads`.
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct CommitDiff {
   /// Objects the host must delete.
@@ -438,6 +464,32 @@ pub struct CommitDiff {
   /// The result of the remove plus add fold; see [`CommitDiff::removed`]
   /// and the port note on [`Router::stop_routing`].
   pub updated: Vec<(HostId, NewItem)>,
+  /// Pads a component drag moved, and how far each one moved.
+  ///
+  /// Empty for everything except
+  /// [`crate::component_dragger::ComponentDragger`], so every other
+  /// session and every stored fixture is unaffected.
+  ///
+  /// A component drag reports the pad it moved as an ordinary removal
+  /// plus addition, and `PNS_KICAD_IFACE` intercepts both:
+  /// `RemoveItem` records the old position and returns without touching
+  /// the commit (`pcbnew/router/pns_kicad_iface.cpp:2629` to `:2636`),
+  /// `createBoardItem` records the new position and returns `nullptr`
+  /// with the comment "Don't add to commit; we'll add the parent
+  /// footprints when processing the m_fpOffsets" (`:2849` to `:2856`),
+  /// and `Commit()` then moves each pad's **footprint** by the
+  /// difference, once per footprint (`:2918` to `:2933`). So the board
+  /// never sees a pad deleted and re-created; it sees one component
+  /// moved.
+  ///
+  /// This is that pair as a value: the pad's own host id and the offset
+  /// it moved by. A host resolves the id to whatever owns the pad, a
+  /// footprint in KiCad and a device instance in LibrePCB, and moves that
+  /// object by the offset, de-duplicating owners as `processedFootprints`
+  /// does. One entry per host object, in the drag's own uid order; a pad
+  /// that became several solids, one per padstack layer, still appears
+  /// once, because all of them move by the same vector.
+  pub moved_solids: Vec<(HostId, Vec2)>,
 }
 
 /// What a running session has changed so far, before any commit.
@@ -1131,8 +1183,9 @@ impl Router {
   /// KiCad dispatches on the **shape of the set** and not on the mode
   /// (`:176` to `:190`), and the three tests are in this order:
   ///
-  /// 1. every item is a solid, which is a component drag and is
-  ///    [`StartError::ComponentDragUnsupported`] here;
+  /// 1. every item is a solid, which is a component drag and reaches
+  ///    [`ComponentDragger`], leaving the router in
+  ///    [`RouterState::DragComponent`];
   /// 2. more than one item is a segment or an arc, which is a multi drag
   ///    and reaches [`MultiDragger`];
   /// 3. anything else reaches [`Dragger`], which then reads
@@ -1141,12 +1194,16 @@ impl Router {
   ///    a single drag of the segment, and the via is ignored.
   ///
   /// The kind test at `:182` is over a **mask**, so two segments, two
-  /// arcs or one of each all reach the multi dragger.
+  /// arcs or one of each all reach the multi dragger. Every shape of a
+  /// non empty set therefore has an algorithm, which is why there is no
+  /// "unsupported set" error.
   ///
   /// `free_angle` reaches the single dragger only.
   /// `MULTI_DRAGGER::SetMode` has an empty body
-  /// (`pcbnew/router/pns_multi_dragger.cpp:284`), so a multi drag
-  /// discards it, which is note 06 errata E2 and E21.
+  /// (`pcbnew/router/pns_multi_dragger.cpp:284`) and
+  /// `COMPONENT_DRAGGER` does not override `SetMode` at all, so it takes
+  /// `DRAG_ALGO`'s empty default (`pcbnew/router/pns_drag_algo.h:119`);
+  /// that is note 06 errata E2 and E21.
   ///
   /// `GetRuleResolver()->ClearCaches()` (`:174`) has no counterpart: a
   /// [`RuleResolver`] here owns whatever caching it does and the facade
@@ -1160,7 +1217,6 @@ impl Router {
   /// # Errors
   ///
   /// [`StartError::AlreadyRouting`], [`StartError::NothingToDrag`],
-  /// [`StartError::ComponentDragUnsupported`],
   /// [`StartError::UnknownStartItem`] for an object the snapshot does not
   /// describe, and [`StartError::NotDraggable`] for one the dragger
   /// refuses.
@@ -1210,25 +1266,30 @@ impl Router {
         .count()
     };
 
-    // :176. All solids wins over the segment count below it.
-    if count_of(Kind::SOLID) == resolved.len() {
-      return Err(StartError::ComponentDragUnsupported);
-    }
-
+    let solids = count_of(Kind::SOLID);
     let tracks = count_of(Kind::SEGMENT | Kind::ARC);
     let context = AlgoContext {
       resolver: self.resolver.as_ref(),
       settings: &self.settings,
       debug: self.debug.as_ref(),
     };
-    // :187, :194. Both draggers branch from the **root**, not from a
+    // :187, :194. Every dragger branches from the **root**, not from a
     // branch of it, unlike the placer.
-    let started = if tracks > 1 {
+    let started = if solids == resolved.len() {
+      // :176. All solids wins over the segment count below it.
+      let mut dragger = ComponentDragger::new(&self.world, root);
+      let started = dragger.start(&self.world, &context, at, &resolved);
+
+      self.dragger = Some(ActiveDragger::Component(Box::new(dragger)));
+      self.state = RouterState::DragComponent;
+      started
+    } else if tracks > 1 {
       // :182
       let mut dragger = MultiDragger::new(&self.world, root);
       let started = dragger.start(&mut self.world, &context, at, &resolved);
 
       self.dragger = Some(ActiveDragger::Multi(Box::new(dragger)));
+      self.state = RouterState::DragSegment;
       started
     } else {
       // :187
@@ -1241,17 +1302,17 @@ impl Router {
       let started = dragger.start(&mut self.world, &context, at, resolved[0]);
 
       self.dragger = Some(ActiveDragger::Single(Box::new(dragger)));
+      self.state = RouterState::DragSegment;
       started
     };
 
     if !started {
       // :213. KiCad drops the dragger and goes back to `IDLE`.
       self.dragger = None;
+      self.state = RouterState::Idle;
 
       return Err(StartError::NotDraggable(resolved[0]));
     }
-
-    self.state = RouterState::DragSegment;
 
     Ok(self.frame())
   }
@@ -1337,8 +1398,9 @@ impl Router {
           placer.move_to(&mut self.world, &context, at, end_item);
         }
       }
-      // :504, :658
-      RouterState::DragSegment => {
+      // :504, :506, :658. `ROUTER::Move` routes both drag states to
+      // `moveDragging`.
+      RouterState::DragSegment | RouterState::DragComponent => {
         if let Some(dragger) = self.dragger.as_mut() {
           dragger.drag(&mut self.world, &context, at);
         }
@@ -1410,8 +1472,10 @@ impl Router {
       RouterState::Idle => FixOutcome::Continue(PreviewFrame::default()),
       // :922
       RouterState::RouteTrack => self.fix_placement(at, end, force_finish),
-      // :928
-      RouterState::DragSegment => self.fix_drag(force_finish),
+      // :928, :929. Both drag states reach the dragger's `FixRoute`.
+      RouterState::DragSegment | RouterState::DragComponent => {
+        self.fix_drag(force_finish)
+      }
     }
   }
 
@@ -1760,6 +1824,17 @@ impl Router {
   /// case against, because none of the seven drag logs holds an
   /// `EVT_FIX`; see note 06 section 10.1.
   ///
+  /// # The one addition
+  ///
+  /// [`RouterState::DragComponent`] takes the same branch, which KiCad
+  /// does **not** have: its `switch` handles `ROUTE_TRACK` (`:839`) and
+  /// `DRAG_SEGMENT` (`:844`) and falls through for `DRAG_COMPONENT`, so
+  /// a component drag reports an empty delta to everything that asks,
+  /// the QA log player included. That is note 06 erratum E15, and it is
+  /// repaired rather than reproduced: an empty answer here is not a
+  /// behaviour a host could want, and the branch it belongs in is
+  /// already written.
+  ///
   /// See [`PendingUpdate`] for why this is not a [`CommitDiff`].
   pub fn pending_update(&self) -> PendingUpdate {
     let node = match self.state {
@@ -1768,8 +1843,8 @@ impl Router {
       RouterState::RouteTrack => {
         self.placer.as_ref().map(|placer| placer.current_node(true))
       }
-      // :844
-      RouterState::DragSegment => {
+      // :844, plus the `DRAG_COMPONENT` branch KiCad lacks.
+      RouterState::DragSegment | RouterState::DragComponent => {
         self.dragger.as_ref().map(ActiveDragger::current_node)
       }
     };
@@ -1891,6 +1966,13 @@ impl Router {
       }
 
       self.index.insert(*host, *id);
+    }
+
+    // A moved pad keeps its host object: the old solid is gone from the
+    // board and the clone stands for the same pad at its new position.
+    for (host, moved) in plan.moved {
+      self.index.remove_item(moved.before);
+      self.index.insert(host, moved.after);
     }
 
     self.committed = plan.added;
@@ -2122,6 +2204,27 @@ impl Router {
   /// it directly, because the dragger's node is not the placer's.
   fn commit_plan_for(&self, node: NodeId) -> CommitPlan {
     let mut plan = CommitPlan::default();
+
+    // A component drag's pads are not committable items and never reach
+    // the three lists below; see [`CommitDiff::moved_solids`].
+    for moved in self
+      .dragger
+      .as_ref()
+      .map_or(&[][..], ActiveDragger::moved_solids)
+    {
+      let Some(host) = self.index.host_of(moved.before) else {
+        continue;
+      };
+
+      plan.moved.push((host, *moved));
+
+      // `Commit()` de-duplicates by footprint (`:2925`); this
+      // de-duplicates by host object, which is one step closer in.
+      if !plan.diff.moved_solids.iter().any(|(seen, _)| *seen == host) {
+        plan.diff.moved_solids.push((host, moved.offset));
+      }
+    }
+
     let (added, removed) = self.world.get_updated_items(node);
     let mut pool: Vec<ItemId> = added
       .into_iter()
@@ -2213,18 +2316,20 @@ impl Router {
 /// `std::unique_ptr<DRAG_ALGO>` over three implementations.
 /// `DESIGN.md` section 11 and note 06 section 9.3 both ask for enum
 /// dispatch here rather than a trait: `DRAG_ALGO` is a C++ virtual base
-/// whose third implementation, `COMPONENT_DRAGGER`, is out of scope, so a
-/// trait would exist to be implemented twice and both implementations are
-/// in this crate. There is deliberately no `src/drag_algo.rs`.
+/// and all three of its implementations are in this crate, so a trait
+/// would be a vtable nothing outside needs. There is deliberately no
+/// `src/drag_algo.rs`.
 ///
-/// The two are boxed because both carry a [`crate::shove::Shove`], so an
-/// unboxed enum would be as large as the bigger of them wherever a
-/// [`Router`] is moved.
+/// All three are boxed because two of them carry a
+/// [`crate::shove::Shove`], so an unboxed enum would be as large as the
+/// biggest of them wherever a [`Router`] is moved.
 enum ActiveDragger {
   /// One segment, one corner or one via of one trace. `DRAGGER`.
   Single(Box<Dragger>),
   /// Several traces at once. `MULTI_DRAGGER`.
   Multi(Box<MultiDragger>),
+  /// One or more footprints, by their pads. `COMPONENT_DRAGGER`.
+  Component(Box<ComponentDragger>),
 }
 
 impl ActiveDragger {
@@ -2240,6 +2345,9 @@ impl ActiveDragger {
     match self {
       ActiveDragger::Single(dragger) => dragger.drag(world, context, at),
       ActiveDragger::Multi(dragger) => dragger.drag(world, context, at),
+      // A component drag reads no settings and runs no collision query,
+      // so it needs no context (note 06 erratum E30).
+      ActiveDragger::Component(dragger) => dragger.drag(world, at),
     }
   }
 
@@ -2248,17 +2356,20 @@ impl ActiveDragger {
     match self {
       ActiveDragger::Single(dragger) => dragger.current_node(),
       ActiveDragger::Multi(dragger) => dragger.current_node(),
+      ActiveDragger::Component(dragger) => dragger.current_node(),
     }
   }
 
   /// `DRAG_ALGO::CurrentLayer` (`pcbnew/router/pns_drag_algo.h:110`).
-  /// Both implementations are unreachable in KiCad and both are wrong in
-  /// their own way; see [`Dragger::current_layer`] and
-  /// [`MultiDragger::current_layer`].
+  /// All three implementations are unreachable in KiCad and each is
+  /// unhelpful in its own way; see [`Dragger::current_layer`],
+  /// [`MultiDragger::current_layer`] and
+  /// [`ComponentDragger::current_layer`].
   fn current_layer(&self) -> i32 {
     match self {
       ActiveDragger::Single(dragger) => dragger.current_layer(),
       ActiveDragger::Multi(dragger) => dragger.current_layer(),
+      ActiveDragger::Component(dragger) => dragger.current_layer(),
     }
   }
 
@@ -2271,6 +2382,11 @@ impl ActiveDragger {
     match self {
       ActiveDragger::Single(dragger) => dragger.current_nets(),
       ActiveDragger::Multi(dragger) => dragger.current_nets().first().copied(),
+      // Always nothing: `COMPONENT_DRAGGER::CurrentNets` answers an
+      // empty vector (`pcbnew/router/pns_component_dragger.h:85`).
+      ActiveDragger::Component(dragger) => {
+        dragger.current_nets().first().copied()
+      }
     }
   }
 
@@ -2280,6 +2396,7 @@ impl ActiveDragger {
     match self {
       ActiveDragger::Single(dragger) => dragger.traces(),
       ActiveDragger::Multi(dragger) => dragger.traces(),
+      ActiveDragger::Component(dragger) => dragger.traces(),
     }
   }
 
@@ -2288,8 +2405,21 @@ impl ActiveDragger {
   /// empty vector and which only `MULTI_DRAGGER` overrides.
   fn last_committed_leader_segments(&self) -> &[ItemId] {
     match self {
-      ActiveDragger::Single(_) => &[],
+      ActiveDragger::Single(_) | ActiveDragger::Component(_) => &[],
       ActiveDragger::Multi(dragger) => dragger.last_committed_leader_segments(),
+    }
+  }
+
+  /// The pads a drag has moved, which only a component drag ever has.
+  ///
+  /// There is no `DRAG_ALGO` method behind this: KiCad's interface
+  /// reconstructs the same information from the removal and addition of
+  /// each solid (`pcbnew/router/pns_kicad_iface.cpp:2634`, `:2854`). See
+  /// [`CommitDiff::moved_solids`].
+  fn moved_solids(&self) -> &[MovedSolid] {
+    match self {
+      ActiveDragger::Single(_) | ActiveDragger::Multi(_) => &[],
+      ActiveDragger::Component(dragger) => dragger.moved_solids(),
     }
   }
 
@@ -2297,8 +2427,9 @@ impl ActiveDragger {
   ///
   /// The decision half of `DRAG_ALGO::FixRoute`
   /// (`pcbnew/router/pns_drag_algo.h:89`). `force_commit` reaches the
-  /// single dragger and is ignored by the multi one, which is note 06
-  /// erratum E24.
+  /// single dragger in forced mark obstacles mode only (note 06 erratum
+  /// E7) and the component dragger always; the multi dragger ignores it,
+  /// which is note 06 erratum E24.
   fn fix_route_node(
     &mut self,
     world: &mut World,
@@ -2311,6 +2442,9 @@ impl ActiveDragger {
       }
       ActiveDragger::Multi(dragger) => {
         dragger.fix_route_node(context, force_commit)
+      }
+      ActiveDragger::Component(dragger) => {
+        dragger.fix_route_node(world, context, force_commit)
       }
     }
   }
@@ -2332,6 +2466,14 @@ struct CommitPlan {
   updated: Vec<ItemId>,
   /// The items behind [`CommitDiff::removed`].
   removed: Vec<ItemId>,
+  /// The solids a component drag moved, with the host object each one
+  /// belongs to.
+  ///
+  /// Deliberately **not** positional against
+  /// [`CommitDiff::moved_solids`]: that has one entry per host object
+  /// and this has one per solid, because a pad on several padstack
+  /// layers is several solids that all move together.
+  moved: Vec<(HostId, MovedSolid)>,
 }
 
 /// Build the frame a host draws after one event.
@@ -2425,6 +2567,19 @@ fn drag_preview_frame(
   }
 
   append_node_delta(&mut frame, world, index, node, resolver);
+
+  // The pads a component drag is moving. `append_node_delta` has just
+  // put each of them in `hidden`, because the drag node took the
+  // original out of the board; see [`PreviewFrame::moved_solids`].
+  for moved in dragger.moved_solids() {
+    let Some(host) = index.host_of(moved.before) else {
+      continue;
+    };
+
+    if !frame.moved_solids.iter().any(|(seen, _)| *seen == host) {
+      frame.moved_solids.push((host, moved.offset));
+    }
+  }
 
   frame
 }

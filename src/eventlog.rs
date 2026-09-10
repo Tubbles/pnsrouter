@@ -1113,7 +1113,12 @@ impl SessionRecording {
   /// removed <host>
   /// added <new-item>
   /// updated <host> <new-item>
+  /// moved-solid <host> <offset>
   /// ```
+  ///
+  /// A `moved-solid` record is written only by a component drag, so a
+  /// recording of anything else is byte for byte what it was before the
+  /// record existed.
   ///
   /// `<flash>` is `flash-default` for [`WorldItem::flashed_layers`] of
   /// [`None`] and `flash <count> <layer>...` otherwise. `<drill>` is
@@ -1270,6 +1275,13 @@ impl SessionRecording {
         line(
           &mut out,
           &format!("updated {} {}", host.0, new_item_text(item)),
+        );
+      }
+
+      for (host, offset) in &diff.moved_solids {
+        line(
+          &mut out,
+          &format!("moved-solid {} {}", host.0, vec2_text(*offset)),
         );
       }
     }
@@ -2107,6 +2119,14 @@ fn parse_recording(text: &str) -> Result<SessionRecording, ParseError> {
           .updated
           .push((HostId(host), item));
       }
+      "moved-solid" => {
+        let host: u64 = tokens.number("a host id")?;
+        let offset = tokens.vec2("a moved pad offset")?;
+
+        commit_at(&mut results, &tokens)?
+          .moved_solids
+          .push((HostId(host), offset));
+      }
       other => {
         return Err(tokens.error(format!("`{other}` is not a record keyword")));
       }
@@ -2281,6 +2301,7 @@ mod tests {
         removed: Vec::new(),
         added: vec![committed(Some(NetId(7))), committed(None)],
         updated: vec![(HostId(1), committed(Some(NetId(2))))],
+        moved_solids: Vec::new(),
       },
       CommitDiff {
         added: vec![committed(Some(NetId(7)))],

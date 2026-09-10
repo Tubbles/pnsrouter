@@ -2,7 +2,7 @@
 
 Reference architecture note for milestone 9 of this crate. Source tree: sparse checkout of KiCad master at commit `302b2ba1014b2f116ab38d69ffa8c6d1c633ed85`, read 2026-09-10. All `path:line` citations are relative to `/home/Tubbles/dev/ref/kicad/`.
 
-Files read in full: `pcbnew/router/pns_drag_algo.h`, `pcbnew/router/pns_dragger.h`, `pcbnew/router/pns_dragger.cpp`, `pcbnew/router/pns_multi_dragger.h`, `pcbnew/router/pns_multi_dragger.cpp`. Read in the parts that touch dragging: `pcbnew/router/pns_router.h/.cpp`, `pcbnew/router/router_tool.cpp`, `pcbnew/router/pns_tool_base.cpp`, `pcbnew/router/pns_line.cpp` (the drag primitives), `pcbnew/router/pns_optimizer.cpp` (the drag only passes), `pcbnew/router/pns_shove.h/.cpp` (the call surface), `pcbnew/router/pns_via.cpp` (`PushoutForce`), `pcbnew/router/pns_node.cpp` (`FixupVirtualVias`, `FindJoint`), `libs/kimath/src/geometry/shape_line_chain.cpp` (`PointAlong`), `qa/tools/pns/pns_log_player.cpp` (how the corpus drives a drag).
+Files read in full: `pcbnew/router/pns_drag_algo.h`, `pcbnew/router/pns_dragger.h`, `pcbnew/router/pns_dragger.cpp`, `pcbnew/router/pns_multi_dragger.h`, `pcbnew/router/pns_multi_dragger.cpp`, and, added on 2026-09-10 with section 11, `pcbnew/router/pns_component_dragger.h` and `pcbnew/router/pns_component_dragger.cpp`. Read in the parts that touch dragging: `pcbnew/router/pns_router.h/.cpp`, `pcbnew/router/router_tool.cpp`, `pcbnew/router/pns_tool_base.cpp`, `pcbnew/router/pns_line.cpp` (the drag primitives), `pcbnew/router/pns_optimizer.cpp` (the drag only passes), `pcbnew/router/pns_shove.h/.cpp` (the call surface), `pcbnew/router/pns_via.cpp` (`PushoutForce`), `pcbnew/router/pns_node.cpp` (`FixupVirtualVias`, `FindJoint`), `libs/kimath/src/geometry/shape_line_chain.cpp` (`PointAlong`), `qa/tools/pns/pns_log_player.cpp` (how the corpus drives a drag).
 
 What is deliberately not here, because an earlier note has it:
 
@@ -1978,5 +1978,267 @@ Before starting it, resolve the contradiction between `PLAN.md`, which lists mul
 ### 10.3 What is deliberately not in the order
 
 - **Arc drag.** `startDragArc` (`pns_dragger.cpp:155`) and `LINE::DragArc` (`pns_line.cpp:911`) need `SHAPE_ARC`, `CIRCLE::ConstructFromTanTanPt`, `CalcArcMid` and the chain's arc index vector. That is the arc milestone, which `PLAN.md` has on hold.
-- **Component drag.** `COMPONENT_DRAGGER` is a third `DRAG_ALGO` implementation, reached only when every start item is a `SOLID` (`pcbnew/router/pns_router.cpp:176`). `PLAN.md` lists it as a non goal and `ROUTER::GetUpdatedItems` does not even report it (E15).
+- **Component drag.** `COMPONENT_DRAGGER` is a third `DRAG_ALGO` implementation, reached only when every start item is a `SOLID` (`pcbnew/router/pns_router.cpp:176`), and `ROUTER::GetUpdatedItems` does not even report it (E15). It was out of the order above when this note was written; section 11 was added on 2026-09-10 when it came back into scope as the tail of the milestone, and it is a step of its own, after step 11 and dependent on nothing in it.
 - **`checkVirtualVia`.** Blocked on the `FixupVirtualVias` decision (section 9.5), and it only affects which mode a click near a width change produces.
+
+---
+
+## 11. `COMPONENT_DRAGGER`
+
+Read 2026-09-10 at the same commit. `pcbnew/router/pns_component_dragger.cpp` is 275 lines including the licence header and `pcbnew/router/pns_component_dragger.h` is 141, which makes it the smallest of the three `DRAG_ALGO` implementations by a wide margin: no shove, no walkaround, no optimizer, no mode, no failure path.
+
+The mechanism in one sentence: **clone every selected pad at the cursor offset, move rigidly anything that runs between two selected pads, and drag one corner of every other attached trace to where its pad end went.**
+
+`ROUTER::StartDragging` reaches it when every item of the set is a `SOLID_T` (`pcbnew/router/pns_router.cpp:176`), which section 1.3 already records, and puts the router in `DRAG_COMPONENT`. That state is where erratum E15 bites: `ROUTER::GetUpdatedItems` has no branch for it.
+
+### 11.1 State
+
+`pcbnew/router/pns_component_dragger.h:119` to `:136`.
+
+| Member | Line | Role |
+| --- | --- | --- |
+| `struct DRAGGED_CONNECTION` | `:120` | one attached trace: `origLine`, `attachedPad`, `p_orig`, `p_next`, `offset`. |
+| `std::set<SOLID*> m_solids` | `:128` | the pads being dragged. **Pointer ordered**, see E31. |
+| `std::set<ITEM*> m_fixedItems` | `:129` | segments and arcs that move rigidly with the pads. Pointer ordered too. |
+| `std::vector<DRAGGED_CONNECTION> m_conns` | `:130` | the traces that get one corner dragged. Insertion ordered. |
+| `bool m_dragStatus` | `:132` | written once, in the constructor (`.cpp:38`). See E29. |
+| `ITEM_SET m_draggedItems` | `:133` | what `Traces()` answers: the cloned solids, the cloned fixed items and the re-dragged lines, all three in one set. |
+| `ITEM_SET m_initialDraggedItems` | `:134` | the primitives as they arrived, removed from the fresh branch at the top of every `Drag`. |
+| `NODE* m_currentNode` | `:135` | the one branch, rebuilt on every `Drag`. |
+| `VECTOR2I m_p0` | `:136` | where the gesture started. |
+
+`DRAGGED_CONNECTION::p_orig` and `p_next` are **not** filled in by `Start`; only `Drag` writes them (`.cpp:184`, `:185`). `offset` is written by `Start` and is zero for everything except the unconnected trace end case of section 11.2.
+
+The node tree is one level, where the single dragger has two:
+
+```
+world (root, handed in by SetWorld)
+ +-- m_currentNode = m_world->Branch()      rebuilt on every Drag, .cpp:161
+```
+
+There is no pre drag node, because there is no shove to stand one on.
+
+### 11.2 `Start`
+
+`.cpp:48` to `:153`. It classifies, and it never fails: the only `return` is `true` at `:152`.
+
+```
+Start(aP, aPrimitives):
+    m_currentNode = nullptr                                        :52
+    m_initialDraggedItems = aPrimitives                            :53
+    m_p0 = aP                                                      :54
+    seenItems = {}                     # unordered_set<LINKED_ITEM*>  :56
+
+    for item in aPrimitives.Items():                               :115
+        if item->Kind() != SOLID_T: continue                       :117
+        solid = (SOLID*) item
+        m_solids.insert(solid)                                     :122
+        if not item->IsRoutable(): continue                        :124
+
+        jt = m_world->FindJoint(solid->Pos(), solid)                :127
+        for link in jt->LinkList():                                :129
+            if link->OfKind(SEGMENT_T | ARC_T):                    :131
+                addLinked(solid, jt, link)                         :132
+
+        # a trace end that lies inside the pad but is not jointed to it
+        m_world->QueryJoints(solid->Hull().BBox(), extraJoints,
+                             solid->Layers(), SEGMENT_T | ARC_T)   :137
+        for extraJoint in extraJoints:                             :140
+            if extraJoint->Net() == jt->Net()
+               and extraJoint->LinkCount() == 1:                   :142
+                li = extraJoint->LinkList().front()                :144
+                if li->Collide(solid, m_world, solid->Layer()):    :146
+                    addLinked(solid, extraJoint, li,
+                              extraJoint->Pos() - solid->Pos())    :147
+    return true                                                    :152
+```
+
+Four things to carry over.
+
+1. **A pad that is not routable still moves.** `:124` only skips the connection search, so an NPTH pad or a mask-only pad is cloned at the new position and drags nothing.
+2. **`FindJoint( solid->Pos(), solid )`** is the two argument overload, `FindJoint( aPos, aItem->Layers().Start(), aItem->Net() )` (`pcbnew/router/pns_node.h:478`). It is dereferenced unchecked at `:129`; the guard that makes that safe is `:124`, because `NODE::addSolid` links a joint only for a routable solid (`pcbnew/router/pns_node.cpp:609`).
+3. **The `extraJoints` block is the whole of the "pad is not connected" handling.** A trace that ends inside the pad's hull, on the pad's net, on the pad's layers, with exactly one link at that joint, and that actually collides with the pad, is dragged along as if it were connected. `LinkCount()` takes the default mask `-1`, so an end that also carries a via is not picked up. The offset it is recorded with is the distance from the pad centre to that dangling end, which is what keeps the trace end in the same place relative to the pad as the pad moves.
+4. **`solid->Hull()`** is called with all three defaults, `aClearance = 0`, `aWalkaroundThickness = 0`, `aLayer = -1` (`pcbnew/router/pns_solid.h:110`), so the query box is the bare copper box.
+
+`addLinked` (`:58` to `:113`) is where the two "runs between two dragged pads" cases live:
+
+```
+addLinked(aSolid, aJoint, aItem, aOffset = {}):
+    if aItem in seenItems: return                                  :61
+    seenItems.insert(aItem)                                        :64
+
+    # case 1: this one segment goes straight from pad to pad
+    otherEnd = (aJoint->Pos() == aItem->Anchor(0)) ? aItem->Anchor(1)
+                                                  : aItem->Anchor(0)   :67
+    otherJoint = m_world->FindJoint(otherEnd, aItem->Layer(), aItem->Net())  :69
+    if otherJoint and otherJoint->LinkCount(SOLID_T):                  :71
+        for otherItem in otherJoint->LinkList():                       :73
+            if aPrimitives.Contains(otherItem):                        :75
+                m_fixedItems.insert(aItem); return                     :77, :78
+
+    cn.origLine    = m_world->AssembleLine(aItem, &segIndex)           :86
+    cn.attachedPad = aSolid                                            :87
+    cn.offset      = aOffset                                           :88
+
+    # case 2: the whole assembled line goes from pad to pad
+    jA = m_world->FindJoint(line.CPoint(0),     aItem->Layer(), aItem->Net())   :92
+    jB = m_world->FindJoint(line.CLastPoint(),  aItem->Layer(), aItem->Net())   :93
+    wxASSERT(jA == aJoint or jB == aJoint)                             :95
+    jSearch = (jA == aJoint) ? jB : jA                                 :96
+    if jSearch and jSearch->LinkCount(SOLID_T):                        :98
+        for otherItem in jSearch->LinkList():                          :100
+            if aPrimitives.Contains(otherItem):                        :102
+                for item in cn.origLine.Links():                       :104
+                    m_fixedItems.insert(item)                          :105
+                return                                                 :107
+
+    m_conns.push_back(cn)                                              :112
+```
+
+`segIndex` is written by `AssembleLine` and never read; it exists only because the out parameter has no default.
+
+Both cases are the same idea at two granularities. Case 1 catches one segment whose far anchor carries a dragged pad, case 2 catches a run of segments whose far *joint* does, and case 2 puts **every** link of the run into `m_fixedItems`, not just the seed. A trace between two dragged pads therefore translates rigidly instead of being re-shaped, which is the only way to keep it straight when both of its ends move by the same vector.
+
+`seenItems` is an `unordered_set` but is only ever asked `count` (`:61`), so its order is not observable. It de-duplicates the *seed segment*, not the assembled line, which is why the same line can be reached a second time from the pad at its other end; the second visit lands in case 2 and inserts into a `std::set` that already holds those links, so it is idempotent.
+
+### 11.3 `Drag`
+
+`.cpp:156` to `:244`. Always answers `true` (`:243`), and it re-derives everything from `Start`'s records rather than from the previous drag, so a component drag never accumulates.
+
+```
+Drag(aP):
+    m_world->KillChildren()                                        :160
+    m_currentNode = m_world->Branch()                              :161
+    for item in m_initialDraggedItems: m_currentNode->Remove(item) :163, :164
+    m_draggedItems.Clear()                                         :166
+
+    for s in m_solids:                                             :168
+        p_next = aP - m_p0 + s->Pos()                              :170
+        snew = (SOLID*) s->Clone(); snew->SetPos(p_next)           :171, :172
+        m_draggedItems.Add(snew.get())                             :174
+        m_currentNode->Add(std::move(snew))                        :175
+        if not s->IsRoutable(): continue                           :177
+        for l in m_conns where l.attachedPad == s:                 :180, :182
+            l.p_orig = s->Pos() + l.offset                         :184
+            l.p_next = p_next    + l.offset                        :185
+
+    for item in m_fixedItems:                                      :190
+        m_currentNode->Remove(item)                                :192
+        SEGMENT_T: s_new = clone; s_new->SetEnds(aP - m_p0 + A,
+                                                 aP - m_p0 + B)    :199, :202
+        ARC_T:     a_new = clone; a_new->Arc().Move(aP - m_p0)     :213, :216
+        default:   wxFAIL_MSG                                      :224
+        m_draggedItems.Add(new); m_currentNode->Add(new)           :204, :205
+
+    for cn in m_conns:                                             :228
+        l_new = LINE(cn.origLine)                                  :230
+        l_new.Unmark()                                             :231
+        l_new.ClearLinks()                                         :232
+        l_new.DragCorner(cn.p_next, cn.origLine.CLine().Find(cn.p_orig))   :233
+        m_draggedItems.Add(l_new)                                  :236
+        l_orig = LINE(cn.origLine)                                 :238
+        m_currentNode->Remove(l_orig)                              :239
+        m_currentNode->Add(l_new)                                  :240
+    return true                                                    :243
+```
+
+Five details a port cannot paraphrase away.
+
+1. **`SOLID::Clone` deep copies the hole.** The copy constructor clones `m_shape` and `m_hole` (`pcbnew/router/pns_solid.h:63`, `:66`), and `SetPos` moves both (`pcbnew/router/pns_solid.cpp:81` to `:90`). A port whose hole is a separate arena item has to build a fresh hole for the clone and translate it by the same delta, or two pads end up sharing one drill.
+2. **`l_new.Unmark()` runs while `l_new` still holds `origLine`'s links** (`:231` before `:232`), and `LINE::Unmark` clears the mask on every link as well as on the line (`pcbnew/router/pns_line.cpp:184`). So the *board's* segments lose their marker bits, not only the copy's. Reproduce the order.
+3. **`m_draggedItems.Add( l_new )` copies the line before the node links it** (`:236` before `:240`; `ITEM_SET::Add( const LINE& )` clones, `pcbnew/router/pns_itemset.cpp:36`). What `Traces()` answers is therefore an unlinked snapshot, which is what makes it safe to hold across the next `Drag`.
+4. **`Find( cn.p_orig )` can answer `-1`**, and `LINE::DragCorner` guards on it with `wxCHECK_RET( aIndex >= 0 )` (`pcbnew/router/pns_line.cpp:886`), so the line is re-added unchanged rather than having its last corner dragged. See E34.
+5. **The removal at `:239` uses `l_orig`, a copy that kept its links**, while `l_new` had them cleared at `:232`. That is the same "the links, not the geometry, are what the removal uses" trick section 8.5 lists for the other two draggers.
+
+There is **no collision test in `Drag` at all**, no walkaround, no shove and no optimizer, so `Settings().Mode()` is ignored outright: a component drag behaves like mark obstacles mode whatever the router is set to, and even the highlighting is left to `ROUTER::markViolations`.
+
+### 11.4 `FixRoute`, `CurrentNode` and `Traces`
+
+```
+FixRoute(aForceCommit):                                            :247
+    node = CurrentNode()
+    if node and (Settings().AllowDRCViolations() or aForceCommit
+                 or not node->CheckColliding(m_draggedItems)):     :253
+        Router()->CommitRouting(node); return true                 :255, :256
+    return false                                                   :260
+
+CurrentNode(): return m_currentNode ? m_currentNode : m_world      :264 to :267
+Traces():      return m_draggedItems                               :270 to :273
+```
+
+`FixRoute` is the **only** place a component drag looks at collisions, and unlike `DRAGGER::FixRoute` (erratum E7) it honours `aForceCommit` in every mode, because there is no `m_forceMarkObstaclesMode` branch to hide it in. `CheckColliding( ITEM_SET )` is the plain loop of `pcbnew/router/pns_node.cpp:478` over a set that holds cloned solids, cloned fixed segments and lines all at once. There is no re-drag branch: a refused fix simply answers false and the host's loop has already ended.
+
+`CurrentNets()` answers an empty vector and `CurrentLayer()` answers `UNDEFINED_LAYER` (`.h:85`, `:96`), both with the comment "Currently unused for component dragging". `Mode()` answers `DM_COMPONENT` (`.h:108`) and has no caller (E1).
+
+### 11.5 The host side
+
+`ROUTER_TOOL::CanInlineDrag` offers a footprint drag when every selected item is a `FOOTPRINT` and `DM_FREE_ANGLE` is not in the mask (`pcbnew/router/router_tool.cpp:2751` to `:2754`), which is the one place the mode mask means anything (section 1.2).
+
+`ROUTER_TOOL::InlineDrag` then builds the item set out of footprints rather than out of the selection (`:2796` to `:2903`):
+
+```
+if selection.Front() is not TRACE / VIA / ARC / FOOTPRINT: return 0     :2788
+footprints = { selection.Front() } if it is a FOOTPRINT                 :2798, :2799
+if selection.Size() > 1: every other item must be a FOOTPRINT too       :2802 to :2814
+                         ("We can drag multiple footprints, but not a grab-bag")
+...
+m_router->SyncWorld()                                                   :2852
+for footprint in footprints:                                            :2865
+    for pad in footprint->Pads():   itemsToDrag.Add(FindItemByParent(pad))   :2867 to :2872
+    for zone in footprint->Zones(): itemsToDrag.Add(FindItemsByParent(zone)) :2881 to :2884
+    for shape in footprint->GraphicalItems():                           :2887
+        if layer is Edge_Cuts, Margin or copper:
+            itemsToDrag.Add(FindItemsByParent(shape))                   :2893, :2894
+```
+
+So the set is not only pads: a footprint's copper zones and its board outline, margin and copper graphics all become solids and all travel with it. That is why `COMPONENT_DRAGGER` skips anything that is not `SOLID_T` at `:117` rather than asserting, and why `:124` has to tolerate an unroutable member.
+
+The rest of the gesture is the track path of section 7.4, plus four footprint only pieces the router does not provide:
+
+- the **courtyard clearance check**, `DRC_INTERACTIVE_COURTYARD_CLEARANCE` initialised at `:2863` and run per motion at `:3124`, with each footprint moved and moved back around it (`:3119`, `:3129`);
+- the **dynamic ratsnest**, `dynamicItems` collected at `:2877`, blocked at `:2903` and recomputed per motion at `:3134`;
+- the **preview of everything that is not copper**: graphics, non copper pads, the reference and the value are cloned, translated by `m_endSnapPoint - p` and added to the view preview while the originals are hidden (`:3076` to `:3113`). The comment at `:3100` says the rest is the router's: "Pads with copper or holes are handled by the router", meaning through `updateView`'s added loop over the cloned solids;
+- for a **single** footprint, the cursor is warped to the footprint anchor first when the user asked for that, so the footprint does not jump at the first motion (`:2971` to `:2989`).
+
+The commit is the interesting half, and it is not `CommitDiff` shaped. `ROUTER::CommitRouting( NODE* )` reports the old solid as a removal and the new one as an addition like any other item, and `PNS_KICAD_IFACE` intercepts both:
+
+- `RemoveItem` on a `SOLID_T` whose parent is a `PAD` records `m_fpOffsets[pad].p_old` and **returns without touching the commit** (`pcbnew/router/pns_kicad_iface.cpp:2629` to `:2636`);
+- `createBoardItem` on a `SOLID_T` records `m_fpOffsets[pad].p_new` and returns `nullptr`, with the comment "Don't add to commit; we'll add the parent footprints when processing the m_fpOffsets" (`:2849` to `:2856`);
+- `Commit()` then walks `m_fpOffsets`, computes `p_new - p_old` per pad, and moves each pad's **footprint** by that offset once, de-duplicated through `processedFootprints` (`:2918` to `:2933`).
+
+So the board never sees a pad removed and re-added; it sees one footprint moved. A port whose commit is a value has to say the same thing, which is what `CommitDiff::moved_solids` is for: one `(host object, offset)` pair per moved pad, leaving the three item lists to the traces the drag re-shaped.
+
+### 11.6 Errata
+
+**E29. `m_dragStatus` is never assigned after the constructor.** `.cpp:38` sets it false and nothing writes it again. `GetForceMarkObstaclesMode` (`.h:113` to `:117`) writes that false into the out parameter and returns false, so the host's "Track violates DRC. (Ctrl+click to commit anyway.)" hint never appears for a component drag even though `FixRoute` will refuse for exactly that reason. Same shape as E23 for the multi dragger.
+
+**E30. `Drag` has no failure path.** It returns `true` unconditionally (`:243`), tests no collisions, and keeps no "last good" solution, so there is nothing to restore and `ROUTER::moveDragging` always reports success. The routing mode is not read at all: no shove, no walkaround, no optimizer. The dead `class OPTIMIZER;` forward declaration at `.h:32` is the trace of an intention that was never carried out.
+
+**E31. `m_solids` and `m_fixedItems` are `std::set` of raw pointers** (`.h:128`, `:129`), so `Drag`'s two loops (`:168`, `:190`) run in address order. Nothing downstream depends on the order today, because the loops only add to a node and to a set that is later scanned for a yes or a no, but `DESIGN.md` section 8 forbids it on principle. Order them by uid in a port. `m_fpOffsets` on the interface side is a `std::map<PAD*, ...>` with the same property (`pcbnew/router/pns_kicad_iface.h:188`), harmless only because every pad of one footprint carries the same offset.
+
+**E32. `Start` clears none of `m_solids`, `m_fixedItems` or `m_conns`,** and the constructor does not either (`:35` to `:40`); only `m_currentNode`, `m_initialDraggedItems` and `m_p0` are reset (`:52` to `:54`). Calling `Start` twice on one instance would accumulate. Latent, because `ROUTER::StartDragging` allocates a fresh `COMPONENT_DRAGGER` per gesture (`pcbnew/router/pns_router.cpp:178`).
+
+**E33. Both "runs between two dragged pads" tests count solids and then iterate every link.** `:71` tests `otherJoint->LinkCount( ITEM::SOLID_T )` and `:73` walks `otherJoint->LinkList()`, which is every link of the joint, so the `Contains` test at `:75` is offered segments and vias as candidates too; `:98` to `:102` is the same shape. It cannot misfire today, because the set only ever holds solids (`pcbnew/router/pns_router.cpp:176`) and a solid is exactly what the `LinkCount` guard promised was there. Filter the link list by `SOLID_T` in a port and the two tests say what they mean.
+
+**E34. `cn.origLine.CLine().Find( cn.p_orig )` can answer `-1`.** `Find` returns `-1` for a point that is not a vertex (`libs/kimath/src/geometry/shape_line_chain.cpp:1253`), and `LINE::DragCorner` catches it with `wxCHECK_RET( aIndex >= 0 )` (`pcbnew/router/pns_line.cpp:886`) and returns, so the line is removed and re-added unchanged. The lookup cannot miss for a well formed board, because `p_orig` is either the pad's own joint position or a dangling end that `QueryJoints` found, and both are endpoints of the assembled line, but it is an unguarded assumption at the call site.
+
+**E35. `wxASSERT( jA == aJoint || jB == aJoint )` at `:95` is what `jSearch` rests on.** In a release build the assertion is a no operation and `jSearch = ( jA == aJoint ) ? jB : jA` silently picks `jA` when neither end is the pad's joint, which would test the wrong end for a second dragged pad. It holds because `AssembleLine` stops at a pad, so one end of the assembled line is always the joint the seed hangs off.
+
+**E36. The unconnected trace end block is almost unreachable, because its two conditions contradict each other.** `:142` demands `extraJoint->Net() == jt->Net()`, that is the same net as the pad, and `:146` then demands `li->Collide( solid, m_world, solid->Layer() )`. `ITEM::Collide` with no search context runs with `differentNetsOnly` true, and a same net pair takes `clearance = -1` at `pcbnew/router/pns_item.cpp:188` and answers false. Two ways out of the contradiction survive:
+
+- **null nets.** The test at `:188` also requires `aHead->Net()` to be non null, so a netless pad with a netless trace end inside it falls through to the resolver and does collide. That is the case a port can exercise, and it is what `tests/component_dragger.rs` uses.
+- **a user defined physical clearance rule.** `runPhysicalOnly` (`pns_item.cpp:125`, over `NODE::HasUserDefinedPhysicalConstraint`, `pcbnew/router/pns_node.h:145`) makes the resolver net blind, so every same net pair falls through as well.
+
+On an ordinary board with nets and no physical rule, a trace end that stops inside a pad without being jointed to it is therefore **not** dragged along. Reproduce the code as it stands; the point of recording this is that a port which "fixes" the net test would change behaviour on every board rather than on the two cases above.
+
+### 11.7 What the port needs
+
+Everything in section 9.1 covers it, with three exceptions.
+
+| What | Where | KiCad source |
+| --- | --- | --- |
+| `CommitDiff::moved_solids` | `src/router.rs` | `pcbnew/router/pns_kicad_iface.cpp:2634`, `:2854`, `:2918`. A pad is not removed and re-added on the board, its footprint is moved. |
+| `RouterState::DragComponent` and the `pending_update` branch for it | `src/router.rs` | `pcbnew/router/pns_router.cpp:179`, and E15, which is the branch KiCad does **not** have. |
+| A deep copy of a solid's hole | `src/component_dragger.rs` | `pcbnew/router/pns_solid.h:66`, `pns_solid.cpp:87`. The crate keeps the hole as a separate arena item, so the clone needs a fresh one. |
+
+Nothing new is needed from the shove (it is never built), from the optimizer (it is never called), from the walkaround, from `MouseTrailTracer` or from `Line` beyond `drag_corner`, which milestone 9 already widened.

@@ -933,30 +933,44 @@ fn a_drag_of_nothing_is_refused_and_a_track_plus_a_via_is_a_single_drag() {
 }
 
 #[test]
-fn a_drag_of_nothing_but_pads_is_a_component_drag_and_is_refused() {
+fn a_drag_of_nothing_but_pads_is_a_component_drag() {
   // `pcbnew/router/pns_router.cpp:176`, which wins over the segment count
-  // below it, so a selection of pads is always a component drag.
+  // below it, so a selection of pads is always a component drag and the
+  // router lands in `DRAG_COMPONENT` (`:179`).
   let mut router = router_in(RouterMode::MarkObstacles);
 
-  assert_eq!(
-    router.start_dragging(START, &[START_PAD, TARGET_PAD], false),
-    Err(StartError::ComponentDragUnsupported)
-  );
+  router
+    .start_dragging(START, &[START_PAD, TARGET_PAD], false)
+    .expect("a set of nothing but pads is a component drag");
+
+  assert_eq!(router.state(), RouterState::DragComponent);
+  assert!(router.routing_in_progress());
+  // `COMPONENT_DRAGGER::CurrentNets` answers an empty vector and
+  // `CurrentLayer` answers `UNDEFINED_LAYER`
+  // (`pcbnew/router/pns_component_dragger.h:85`, `:96`).
+  assert_eq!(router.current_net(), None);
+  assert_eq!(router.current_layer(), Some(-1));
+
+  router.abort_routing();
   assert_eq!(router.state(), RouterState::Idle);
 }
 
 #[test]
-fn a_drag_of_a_lone_pad_or_of_an_unknown_object_is_refused() {
+fn a_lone_pad_is_a_component_drag_and_an_unknown_object_is_refused() {
   let mut router = router_in(RouterMode::MarkObstacles);
 
   // A lone pad never reaches `DRAGGER` at all: the all solids test at
   // `pcbnew/router/pns_router.cpp:176` catches a one element set of one
   // solid first. `DRAGGER::Start`'s own `default:` refusal (`:355`) is
   // covered by `tests/dragger.rs`.
-  assert_eq!(
-    router.start_dragging(START, &[START_PAD], false),
-    Err(StartError::ComponentDragUnsupported)
-  );
+  router
+    .start_dragging(START, &[START_PAD], false)
+    .expect("one pad is a component drag of one pad");
+
+  assert_eq!(router.state(), RouterState::DragComponent);
+
+  router.abort_routing();
+
   assert_eq!(
     router.start_dragging(START, &[HostId(99)], false),
     Err(StartError::UnknownStartItem(HostId(99)))
