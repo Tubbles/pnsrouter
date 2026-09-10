@@ -201,6 +201,40 @@ pub enum SessionEvent {
     settings: MeanderSettings,
   },
 
+  /// [`Router::start_tuning_diff_pair`].
+  ///
+  /// One variant per tuning mode rather than a mode field on
+  /// [`SessionEvent::StartTuning`], for the reason
+  /// [`Router::start_tuning_diff_pair`] gives: the facade has three entry
+  /// points because their refusals differ, and a reader of a recording
+  /// should never have to work out which placer ran.
+  ///
+  /// The payload is [`SessionEvent::StartTuning`]'s, `meander` block and
+  /// all, and the three share one block table numbered in event order.
+  StartTuningDiffPair {
+    /// The point the tuned stretch starts at, before snapping.
+    at: Vec2,
+    /// The track to tune. Either lane will do; the pair is recovered
+    /// from it.
+    item: HostId,
+    /// The dimensions the meanders are drawn to.
+    settings: MeanderSettings,
+  },
+
+  /// [`Router::start_tuning_skew`].
+  ///
+  /// The lane named here is the one that gets meandered: the skew placer
+  /// does not pick the shorter one (note 08 section 7.1), so the object
+  /// is part of the result and not just a way in.
+  StartTuningSkew {
+    /// The point the tuned stretch starts at, before snapping.
+    at: Vec2,
+    /// The lane to meander.
+    item: HostId,
+    /// The dimensions the meanders are drawn to.
+    settings: MeanderSettings,
+  },
+
   /// [`Router::amplitude_step`]. Not logged by KiCad, whose host binds it
   /// to a key and re-runs the whole generator update
   /// (`pcbnew/generators/pcb_tuning_pattern.cpp:2785`).
@@ -565,6 +599,16 @@ fn apply(
     }
     SessionEvent::StartTuning { at, item, settings } => {
       if router.start_tuning(*at, *item, *settings).is_ok() {
+        *frames_count += 1;
+      }
+    }
+    SessionEvent::StartTuningDiffPair { at, item, settings } => {
+      if router.start_tuning_diff_pair(*at, *item, *settings).is_ok() {
+        *frames_count += 1;
+      }
+    }
+    SessionEvent::StartTuningSkew { at, item, settings } => {
+      if router.start_tuning_skew(*at, *item, *settings).is_ok() {
         *frames_count += 1;
       }
     }
@@ -1104,8 +1148,8 @@ fn length_target_text(target: Option<LengthTarget>) -> String {
 /// The eleven fields of [`MeanderSettings`]. There is no block zero for
 /// the router's own value the way [`settings_lines`] and [`sizes_lines`]
 /// have one, because a [`Router`] has no meander settings of its own:
-/// every block is the payload of one [`SessionEvent::StartTuning`], and
-/// they are numbered from zero in the order those events appear.
+/// every block is the payload of one of the three `start-tuning` events,
+/// and they are numbered from zero in the order those events appear.
 fn meander_lines(out: &mut String, block: usize, settings: &MeanderSettings) {
   let corner_style = match settings.corner_style() {
     CornerStyle::Chamfer => "chamfer",
@@ -1181,6 +1225,16 @@ fn event_text(
     ),
     SessionEvent::StartTuning { at, item, .. } => format!(
       "event start-tuning {} {} {meander_block}",
+      vec2_text(*at),
+      item.0
+    ),
+    SessionEvent::StartTuningDiffPair { at, item, .. } => format!(
+      "event start-tuning-diff-pair {} {} {meander_block}",
+      vec2_text(*at),
+      item.0
+    ),
+    SessionEvent::StartTuningSkew { at, item, .. } => format!(
+      "event start-tuning-skew {} {} {meander_block}",
       vec2_text(*at),
       item.0
     ),
@@ -1310,6 +1364,8 @@ impl SessionRecording {
   /// start-routing <x> <y> <start-host> <layer>
   /// start-routing-diff-pair <x> <y> <start-host> <layer>
   /// start-tuning <x> <y> <item-host> <meander-block>
+  /// start-tuning-diff-pair <x> <y> <item-host> <meander-block>
+  /// start-tuning-skew <x> <y> <item-host> <meander-block>
   /// amplitude-step <sign>
   /// spacing-step <sign>
   /// start-dragging <x> <y> <free-angle> <count> <host>...
@@ -1338,9 +1394,9 @@ impl SessionRecording {
   /// everything.
   ///
   /// `meander` has **no block zero of its own**: a router carries no
-  /// meander settings, so every block is one `start-tuning` event's
-  /// payload and they are numbered from zero in the order those events
-  /// appear. A `meander` block is checked by
+  /// meander settings, so every block is the payload of one of the three
+  /// `start-tuning` events and they are numbered from zero in the order
+  /// those events appear, whichever of the three each one is. A `meander` block is checked by
   /// [`MeanderSettings::new`] as it is read, so a file with a
   /// non positive step or a round corner style is a parse error rather
   /// than a settings value nothing downstream can honour. Its
@@ -1364,7 +1420,9 @@ impl SessionRecording {
         SessionEvent::SetSettings { settings } => {
           settings_blocks.push(settings);
         }
-        SessionEvent::StartTuning { settings, .. } => {
+        SessionEvent::StartTuning { settings, .. }
+        | SessionEvent::StartTuningDiffPair { settings, .. }
+        | SessionEvent::StartTuningSkew { settings, .. } => {
           meander_blocks.push(settings);
         }
         _ => {}
@@ -1449,7 +1507,12 @@ impl SessionRecording {
 
         // The meander blocks are numbered from zero, so the counter
         // advances **after** the event that named the block.
-        if matches!(event, SessionEvent::StartTuning { .. }) {
+        if matches!(
+          event,
+          SessionEvent::StartTuning { .. }
+            | SessionEvent::StartTuningDiffPair { .. }
+            | SessionEvent::StartTuningSkew { .. }
+        ) {
           meander_block += 1;
         }
       }
@@ -1935,7 +1998,8 @@ enum BlockKind {
   Sizes,
   /// A [`RoutingSettings`] block, named by `event set-settings`.
   Settings,
-  /// A [`MeanderSettings`] block, named by `event start-tuning`.
+  /// A [`MeanderSettings`] block, named by any of the three
+  /// `event start-tuning...` records.
   Meander,
 }
 
@@ -2189,17 +2253,24 @@ fn parse_event(tokens: &mut Tokens<'_>) -> Result<ParsedEvent, ParseError> {
         layer: tokens.number("a layer index")?,
       }
     }
-    "start-tuning" => {
+    name
+    @ ("start-tuning" | "start-tuning-diff-pair" | "start-tuning-skew") => {
       let at = tokens.vec2("a point")?;
-      let item: u64 = tokens.number("a host id")?;
+      let item = HostId(tokens.number("a host id")?);
       let block = tokens.block("a meander block")?;
+      let settings = MeanderSettings::default();
+      let event = match name {
+        "start-tuning-diff-pair" => {
+          SessionEvent::StartTuningDiffPair { at, item, settings }
+        }
+        "start-tuning-skew" => {
+          SessionEvent::StartTuningSkew { at, item, settings }
+        }
+        _ => SessionEvent::StartTuning { at, item, settings },
+      };
 
       return Ok(ParsedEvent::WithBlock(
-        Box::new(SessionEvent::StartTuning {
-          at,
-          item: HostId(item),
-          settings: MeanderSettings::default(),
-        }),
+        Box::new(event),
         BlockKind::Meander,
         block,
       ));
@@ -2573,8 +2644,11 @@ fn resolve_block(
         )
       })?;
 
-      if let Some(SessionEvent::StartTuning { settings, .. }) =
-        events.get_mut(entry.event)
+      if let Some(
+        SessionEvent::StartTuning { settings, .. }
+        | SessionEvent::StartTuningDiffPair { settings, .. }
+        | SessionEvent::StartTuningSkew { settings, .. },
+      ) = events.get_mut(entry.event)
       {
         *settings = checked;
       }
@@ -2893,6 +2967,266 @@ mod tests {
 
     assert_eq!(read, recording, "{text}");
     assert_eq!(replay(&read, rules()).diffs, vec![recorded]);
+  }
+
+  /// The pair fixture of note 08 section 14.3, and its unequal lane
+  /// variant of section 14.4 when `detour` is set.
+  ///
+  /// Two lanes a pitch apart between two pad pairs. With the detour, the
+  /// N lane takes a rectangular excursion near the start that adds
+  /// exactly two millimetres outside the tuned range, which is what gives
+  /// the skew tuner something to close.
+  ///
+  /// `tests/dp_meander_placer.rs` and `tests/meander_skew_placer.rs`
+  /// carry the same boards with their obstacles and their constraint
+  /// answering resolvers; these only have to make a session that commits
+  /// something.
+  fn pair_tuning_board(detour: bool) -> WorldSnapshot {
+    let mut snapshot = WorldSnapshot::new(1, World::DEFAULT_MAX_CLEARANCE);
+    let pad = |id: u64, at: Vec2, net: NetId| {
+      WorldItem::new(
+        HostId(id),
+        Some(net),
+        LayerRange::single(0),
+        WorldGeometry::Solid {
+          shape: Shape::circle(at, 150_000),
+          pos: at,
+          offset: Vec2::new(0, 0),
+          orientation_degrees: 0.0,
+          anchors: Vec::new(),
+        },
+      )
+    };
+    let track = |id: u64, net: NetId, from: Vec2, to: Vec2| {
+      WorldItem::new(
+        HostId(id),
+        Some(net),
+        LayerRange::single(0),
+        WorldGeometry::Segment {
+          seg: Seg::new(from, to),
+          width: 200_000,
+        },
+      )
+    };
+
+    snapshot
+      .items
+      .push(pad(1, Vec2::new(0, -200_000), NetId(1)));
+    snapshot.items.push(pad(2, Vec2::new(0, 200_000), NetId(2)));
+    snapshot
+      .items
+      .push(pad(3, Vec2::new(8_000_000, -200_000), NetId(1)));
+    snapshot
+      .items
+      .push(pad(4, Vec2::new(8_000_000, 200_000), NetId(2)));
+    snapshot.items.push(track(
+      5,
+      NetId(1),
+      Vec2::new(0, -200_000),
+      Vec2::new(8_000_000, -200_000),
+    ));
+
+    if detour {
+      snapshot.items.push(track(
+        6,
+        NetId(2),
+        Vec2::new(0, 200_000),
+        Vec2::new(0, 1_200_000),
+      ));
+      snapshot.items.push(track(
+        7,
+        NetId(2),
+        Vec2::new(0, 1_200_000),
+        Vec2::new(2_000_000, 1_200_000),
+      ));
+      snapshot.items.push(track(
+        8,
+        NetId(2),
+        Vec2::new(2_000_000, 1_200_000),
+        Vec2::new(2_000_000, 200_000),
+      ));
+      snapshot.items.push(track(
+        9,
+        NetId(2),
+        Vec2::new(2_000_000, 200_000),
+        Vec2::new(8_000_000, 200_000),
+      ));
+    } else {
+      snapshot.items.push(track(
+        6,
+        NetId(2),
+        Vec2::new(0, 200_000),
+        Vec2::new(8_000_000, 200_000),
+      ));
+    }
+
+    snapshot
+  }
+
+  /// The meander settings both pair round trips run with.
+  fn pair_tuning_settings(
+    target_length: Option<LengthTarget>,
+    target_skew: Option<LengthTarget>,
+  ) -> MeanderSettings {
+    MeanderSettings::new(MeanderSettingsRequest {
+      keep_endpoints: true,
+      target_length,
+      target_skew,
+      ..MeanderSettingsRequest::default()
+    })
+    .expect("the default request is chamfered and has a positive step")
+  }
+
+  /// A pair length tuning session records, survives the text format and
+  /// replays to the same commit.
+  ///
+  /// [`SessionEvent::StartTuningDiffPair`] is the one event a pair length
+  /// session has that a single track one does not, so this is what pins
+  /// its writer and its reader against each other. The two live
+  /// adjustments run between the moves, because a replay that cannot
+  /// reproduce them cannot reproduce the geometry.
+  #[test]
+  fn a_pair_tuning_session_replays_to_the_same_commit() {
+    let snapshot = pair_tuning_board(false);
+    let settings = pair_tuning_settings(
+      Some(LengthTarget::explicit(9_400_000, 10_000_000, 10_600_000)),
+      Some(LengthTarget::around(0)),
+    );
+    let from = Vec2::new(1_000_000, -200_000);
+    let to = Vec2::new(7_000_000, -200_000);
+    let mut router = Router::new(
+      &snapshot,
+      diff_pair_rules(),
+      RoutingSettings::default(),
+      diff_pair_sizes(),
+    );
+
+    router.start_recording(&snapshot);
+    router
+      .start_tuning_diff_pair(from, HostId(5), settings)
+      .expect("the fixture lanes are a differential pair");
+    router.move_to(to, None);
+    router.amplitude_step(-1);
+    router.spacing_step(1);
+    router.move_to(to, None);
+
+    let recorded = match router.fix_route(to, None, true) {
+      FixOutcome::Finished(diff) => diff,
+      FixOutcome::Continue(_) => panic!("a tuning fix always finishes"),
+    };
+    let recording = router.take_recording().expect("a recording was running");
+
+    assert!(
+      matches!(
+        recording.events.first(),
+        Some(SessionEvent::StartTuningDiffPair { settings: recorded, .. })
+          if *recorded == settings
+      ),
+      "{:?}",
+      recording.events.first()
+    );
+    assert!(!recorded.added.is_empty(), "{recorded:?}");
+
+    let text = recording.to_text();
+    let read = SessionRecording::from_text(&text).expect(&text);
+
+    assert_eq!(read, recording, "{text}");
+    assert_eq!(replay(&read, diff_pair_rules()).diffs, vec![recorded]);
+  }
+
+  /// A skew tuning session records, survives the text format and replays
+  /// to the same commit.
+  ///
+  /// The clicked lane is the **shorter** one, because the placer does not
+  /// pick a lane (note 08 section 7.1) and clicking the longer one
+  /// meanders nothing to record.
+  #[test]
+  fn a_skew_tuning_session_replays_to_the_same_commit() {
+    let snapshot = pair_tuning_board(true);
+    let settings = pair_tuning_settings(None, Some(LengthTarget::around(0)));
+    let from = Vec2::new(3_000_000, -200_000);
+    let to = Vec2::new(7_000_000, -200_000);
+    let mut router = Router::new(
+      &snapshot,
+      diff_pair_rules(),
+      RoutingSettings::default(),
+      diff_pair_sizes(),
+    );
+
+    router.start_recording(&snapshot);
+    router
+      .start_tuning_skew(from, HostId(5), settings)
+      .expect("the P lane is half of a differential pair");
+    router.move_to(to, None);
+    router.amplitude_step(-1);
+    router.spacing_step(1);
+    router.move_to(to, None);
+
+    let recorded = match router.fix_route(to, None, true) {
+      FixOutcome::Finished(diff) => diff,
+      FixOutcome::Continue(_) => panic!("a tuning fix always finishes"),
+    };
+    let recording = router.take_recording().expect("a recording was running");
+
+    assert!(
+      matches!(
+        recording.events.first(),
+        Some(SessionEvent::StartTuningSkew { settings: recorded, .. })
+          if *recorded == settings
+      ),
+      "{:?}",
+      recording.events.first()
+    );
+    assert!(!recorded.added.is_empty(), "{recorded:?}");
+
+    let text = recording.to_text();
+    let read = SessionRecording::from_text(&text).expect(&text);
+
+    assert_eq!(read, recording, "{text}");
+    assert_eq!(replay(&read, diff_pair_rules()).diffs, vec![recorded]);
+  }
+
+  /// The three tuning starts share one `meander` block table, numbered in
+  /// event order whichever of the three each event is.
+  #[test]
+  fn the_three_tuning_starts_share_one_block_table() {
+    let block = |spacing: i32| {
+      MeanderSettings::new(MeanderSettingsRequest {
+        spacing,
+        ..MeanderSettingsRequest::default()
+      })
+      .expect("a positive step")
+    };
+    let mut recording = empty();
+
+    recording.events.push(SessionEvent::StartTuning {
+      at: Vec2::new(0, 0),
+      item: HostId(1),
+      settings: block(600_000),
+    });
+    recording.events.push(SessionEvent::StopRouting);
+    recording.events.push(SessionEvent::StartTuningDiffPair {
+      at: Vec2::new(1, 1),
+      item: HostId(2),
+      settings: block(700_000),
+    });
+    recording.events.push(SessionEvent::StopRouting);
+    recording.events.push(SessionEvent::StartTuningSkew {
+      at: Vec2::new(2, 2),
+      item: HostId(3),
+      settings: block(800_000),
+    });
+
+    let text = recording.to_text();
+
+    assert!(text.contains("event start-tuning 0 0 1 0"), "{text}");
+    assert!(
+      text.contains("event start-tuning-diff-pair 1 1 2 1"),
+      "{text}"
+    );
+    assert!(text.contains("event start-tuning-skew 2 2 3 2"), "{text}");
+    assert!(text.contains("meander 2 spacing 800000"), "{text}");
+    assert_eq!(SessionRecording::from_text(&text), Ok(recording), "{text}");
   }
 
   /// A `meander` block the settings constructor refuses is a parse error

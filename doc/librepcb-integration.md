@@ -408,7 +408,7 @@ One gesture would be missing and would stay missing: there is no differential pa
 
 ### 3.8 Length tuning, and where the host side differs from KiCad's
 
-The engine can tune the length of a single trace as of milestone 11 (`router::Router::start_tuning`), and nothing in LibrePCB drives it yet. The interesting part is that copying KiCad's host design would be the wrong move here, and the reason is worth writing down before anyone starts.
+The engine can tune the length of a single trace, the length of both lanes of a differential pair together and the skew between the two lanes of a pair as of milestone 11 (`router::Router::start_tuning`, `start_tuning_diff_pair` and `start_tuning_skew`), and nothing in LibrePCB drives any of them yet. The interesting part is that copying KiCad's host design would be the wrong move here, and the reason is worth writing down before anyone starts.
 
 **KiCad's tuning is not a router tool mode.** The three hotkeys `7`, `8` and `9` activate `DRAWING_TOOL::PlaceTuningPattern` (`pcbnew/generators/pcb_tuning_pattern.cpp:2497`), not the router tool, and what they create is a `PCB_GENERATOR` board item: a group of tracks plus the settings that produced them, saved in the board file, re-editable later. The router is something that generator drives from inside its own edit loop. `EditStart` syncs the world and refreshes the target from the design rules, `Update` runs `StopRouting`, resets the copper to the pattern's stored baseline, `StartRouting`, `UpdateSettings`, one `Move`, and reads the status and the length back, all on **every mouse move**, and `EditFinish` runs one `FixRoute` and sorts the router's commit into what belongs in the group and what is the reconstructed remainder of the original track. That whole arrangement exists to make a tuning pattern a persistent, re-editable board object.
 
@@ -425,6 +425,18 @@ Four things the tool mode would need, none of them in the crate.
 **The readout.** `PreviewFrame::tuning` carries the status, the length, the delta from the length the session started at and the settings back. KiCad draws it as a floating label beside the pattern with the current length, the minimum and the maximum and the words "too long", "too short" or "tuned"; the status bar is the cheap place for it in LibrePCB. Reading the settings back matters for one field only, `initial_side`: the shape generator flips it when a meander only fits on the other side of the base line, and a host that does not carry the flip forward gets a different shape on the next session.
 
 The commit applier needs no change: a tuning session commits segments on one net, and the original track arrives as an update of the same host object rather than a removal plus an addition, which the applier already handles.
+
+**The two pair modes are further out than the single trace one**, and not because of anything in the crate. Both start with `topology::assemble_diff_pair`, which asks the resolver `dp_coupled_net` and `dp_net_polarity`; LibrePCB answers neither, for the reason section 3.7 gives, so both refuse with `StartError::NotADiffPairForTuning` or `NotADiffPairForSkew` until LibrePCB grows a pair concept. Everything section 3.7 lists as needed for pair **routing** is needed here too, minus the three sizes: a pair tuner reads exactly one field of `settings::Sizes`, `diff_pair_gap`, and only as the fallback when the pair's own gap could not be measured off the board. So the order to build them in is: the tool mode for a single trace first, the pair concept second, and the two pair modes fall out of it.
+
+Four things a host driving the two pair modes has to know, none of which applies to the single trace one.
+
+**The skew tuner does not pick a lane.** It meanders whichever lane the user clicked and only measures the other one. Click the longer lane and ask for zero skew and it reports "too long" and changes nothing; the remedy is to click the other lane. A host could pick for the user by comparing the two lanes first, but nothing in the engine does it, because nothing in KiCad's does.
+
+**The readout means different things per mode.** `PreviewFrame::tuning` carries `TuningInfo::mode`, and `TuningInfo::result` is a length in the two length modes and a **skew** in `TuningMode::PairSkew`. The skew is also in `TuningInfo::skew` under its own name, with `TuningInfo::skew_target` and `TuningInfo::coupled_length` beside it, so a host can show "skew 12 um against 10 mm" without knowing about the override. A host that labels `result` "length" in every mode is wrong in one of the three.
+
+**The target is a skew, not a length.** `MeanderSettings::target_skew` is what a skew session reads and `target_length` is ignored entirely, which is the opposite of the other two modes. The toolbar needs both fields, or one field whose meaning follows the mode.
+
+**A pair session is systematically long.** KiCad draws the first meander of every coupled span half a pitch off the two lanes, so the tuned length overshoots the target by one or two jogs of `( gap + width ) / 2`, which on a 200 um wide pair at a 200 um gap is 400 um. That is four times KiCad's own 100 um tolerance, so a pair length session reports "too long" for any target a user types unless the design rule window is wider than the overshoot. It is note 08 erratum E24, it is reproduced deliberately, and a host that shows the status without the number will look broken. Show the length beside it.
 
 ## 4. The commit applier
 

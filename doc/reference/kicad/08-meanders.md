@@ -1795,6 +1795,18 @@ Four appends in `makeMiterShape` cast a `double` coordinate with `( int )`: `pcb
 
 `qa/tests/pcbnew/test_meander_corner_radius.cpp` includes `router/pns_meander.h` and asserts four `MEANDER_SETTINGS` defaults (`:43` to `:52`). Its other two cases re-implement `cornerRadius`'s clamp arithmetic inline (`:122` to `:126`) and assert that the re-implementation agrees with a table; no `MEANDER_SHAPE` is constructed and `Fit` is never called anywhere in KiCad's test suite. There is therefore **no upstream test the port can mirror** for the shape generator, which is why section 13 step 1 asks for hand computed expectations and section 2.6 supplies them.
 
+### E24. The first meander of a coupled span is drawn half a pitch off the two lanes
+
+`pcbnew/router/pns_dp_meander_placer.cpp:463` runs `addCornersUntilIndex` before `MeanderSegment` for every coupled span, and `MEANDERED_LINE::AddCorner( p, n )` sets `m_last = p` (`pns_meander.cpp:871`), the **P lane's** vertex. `MeanderSegment` then fits from `m_last` (`:277`), `MEANDER_SHAPE::Fit` hands that point to `genMeanderShape` as the shape's origin (`:795`), and `genMeanderShape` offsets chain 0 by `+m_baselineOffset` and chain 1 by `-m_baselineOffset` **from it** (`:598`, `:620`). Since `m_baselineOffset` is half the pitch and the origin is already half a pitch off the centreline, both chains land half a pitch off the two lanes.
+
+Only the first meander of each span is affected. Every later one starts from `AddMeander`'s `aShape->BaseSegment().B` (`:929`), which `updateBaseSegment` projects onto the base segment (`:975`), so its origin is on the centreline and the two chains land where they should.
+
+The visible consequences are a step of `( gap + width ) / 2` on each lane where the tuned stretch begins and, because `tuneLineLength` measures the meanders against their own baselines and never sees the steps, a tuned length that overshoots the target by one or two of them. On the section 14.3 board that is 400018 nm against `DEFAULT_LENGTH_TOLERANCE`'s 100000, so a dual run there can never report `TUNED` inside KiCad's own window. Found while porting, not by reading; `tests/dp_meander_placer.rs::the_first_meander_of_a_span_is_drawn_off_the_two_lanes` pins it.
+
+### E25. `AssembleDiffPair`'s `pItems` is built and never read
+
+`pcbnew/router/pns_topology.cpp:1048` declares it and `:1053` fills it with the clicked line's same layer segments and arcs. Nothing in the function reads it: `findNItem` is called with `startItem` (`:1130`) and, when that finds nothing, with the items joined to it (`:1153`), never with the rest of the clicked line. So a click in the middle of a bent lane pairs only the segment under the cursor and its immediate neighbours, which is what the fallback exists for. Same class of defect as E1's dead locals. Do not port it.
+
 ---
 
 ## 13. Proposed order of implementation
@@ -1977,8 +1989,8 @@ The port should also decide, and pin, what happens when the constraint is missin
 | `a_target_that_cannot_be_reached_reports_too_short` | 14.2, no obstacle | Target 30 mm: status `TooShort`, result is the maximum the 6 mm stretch can give, and every meander is at `max_amplitude`. |
 | `a_target_below_the_current_length_reports_too_long` | 14.2, no obstacle | Target 5 mm: `doMove`'s early test fires (`pns_meander_placer.cpp:282`), status `TooLong`, geometry untouched. |
 | `an_obstacle_forces_a_smaller_amplitude` | 14.2, with `O` | `CheckFit` rejects the full amplitude on that side; the committed geometry clears `O` by at least `CLEARANCE`. |
-| `an_obstacle_flips_the_initial_side` | 14.2, with `O` | `flipInitialSide` fires and the returned settings carry the flip (section 11.5's `TuningReadout::settings`). |
-| `a_pair_reaches_a_longer_target` | 14.3 | Status `Tuned`; both lanes `PITCH` apart on every straight run; `DiffPair::coupled_length` over the commit is at least 80 percent of the shorter lane. |
+| `an_obstacle_flips_the_initial_side` | 14.2, with `O` | `flipInitialSide` fires and the returned settings carry the flip (section 11.5's `TuningReadout::settings`). **Not reachable on this board**: the amplitude scan finds a shorter meander on the same side before it ever needs the other one, so the flip never fires. The fitting loop's own tests in `src/meander.rs` cover it without a world. |
+| `a_pair_reaches_a_longer_target` | 14.3 | Status `Tuned`; both lanes `PITCH` apart on every straight run; `DiffPair::coupled_length` over the commit is at least 75 percent of the shorter lane. **The window has to be wider than `DEFAULT_LENGTH_TOLERANCE`**: erratum E24 makes a dual run overshoot by 400018 nm on this board, so the case is written with 600000 nm and `the_first_meander_of_a_span_is_drawn_off_the_two_lanes` pins the overshoot with KiCad's own 100000. The eighty percent this row first asked for is not reachable either, because the two lanes' corners are drawn at `cr - offset` and `cr + offset` (`pns_meander.cpp:612`, `:613`) and those chamfers do not pair up under `CoupledSegmentPairs`'s parallelism test. |
 | `a_pair_start_on_an_uncoupled_net_is_refused` | 14.2 | `Err( NotADiffPairForTuning )` (`pns_dp_meander_placer.cpp:107`). |
 | `a_start_on_something_that_is_not_a_track_is_refused` | any | `Err( NotATrack )` (`pns_meander_placer.cpp:73`). |
 | `the_skew_placer_lengthens_the_shorter_lane` | 14.4 | Click P, target skew 0: status `Tuned`, `tuning_length_result` (the skew) within `+/- 100_000` of zero. |

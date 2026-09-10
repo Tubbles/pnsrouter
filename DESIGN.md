@@ -163,7 +163,8 @@ src/
   shove.rs       effect list shove, springback stack
   via.rs         via pushout force, shared by the placer and the dragger
   diff_pair.rs   differential pair geometry, gateways, fitting
-  placer/        line_placer, diff_pair_placer, fixed_tail, the Placer enum
+  placer/        line_placer, diff_pair_placer, the three meander placers,
+                 fixed_tail, the Placer enum
   dragger.rs     segment, corner and via drag in all three modes
   multi_dragger.rs   several traces dragged as a bundle
   component_dragger.rs  footprints dragged by their pads

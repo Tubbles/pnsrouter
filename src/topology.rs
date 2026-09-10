@@ -26,8 +26,6 @@
 //!
 //! # What is not here
 //!
-//! - `AssembleDiffPair` and the `DP_PARALLELITY_THRESHOLD` machinery
-//!   (`:1036`): differential pairs only.
 //! - `ShortestConnectionLength`, declared at
 //!   `pcbnew/router/pns_topology.h:70` and never defined.
 //! - `AssembleCluster` (`:1187`), which is [`World::assemble_cluster`]:
@@ -38,6 +36,7 @@
 use std::collections::{BTreeSet, VecDeque};
 
 use crate::collide::CollisionSearchOptions;
+use crate::diff_pair::{DiffPair, common_parallel_projection};
 use crate::geometry::collision;
 use crate::geometry::line_chain::LineChain;
 use crate::geometry::shape::Shape;
@@ -1437,6 +1436,352 @@ pub fn assemble_tuning_path(
 }
 
 // ---------------------------------------------------------------------
+// AssembleDiffPair
+// ---------------------------------------------------------------------
+
+/// How far two segments may tilt against each other and still be paired.
+///
+/// `DP_PARALLELITY_THRESHOLD` (`pcbnew/router/pns_topology.h:106`), read
+/// at `pcbnew/router/pns_topology.cpp:1088`. KiCad asks the same question
+/// with three different thresholds; the other two are named on
+/// `COUPLED_SEGMENTS_PARALLELISM_THRESHOLD` in [`crate::diff_pair`].
+const DP_PARALLELITY_THRESHOLD: i32 = 5;
+
+/// A differential pair recovered from copper already on the board.
+///
+/// KiCad writes the pair through a `DIFF_PAIR&` out parameter and answers
+/// a `bool` (`pcbnew/router/pns_topology.h:101`); the pair travels as the
+/// return value here.
+///
+/// The two lines come with it because they are the only way back to the
+/// items the pair was assembled from. KiCad's `DIFF_PAIR` keeps them as
+/// `m_line_p` and `m_line_n` (`pcbnew/router/pns_diff_pair.h:560`), which
+/// the `DIFF_PAIR( const LINE&, const LINE& )` constructor fills and
+/// `PLine()` hands back unchanged while they are linked (`:488`). This
+/// crate's [`DiffPair`] holds chains only and rebuilds its two line views
+/// on demand, so the linked originals would be lost. Both tuning placers
+/// need them twice over: `AssembleTuningPath` starts from `PLine()`'s
+/// first link (`pcbnew/router/pns_dp_meander_placer.cpp:120`) and `Start`
+/// removes both lines from its branch by link (`:156`).
+#[derive(Clone, Debug)]
+pub struct AssembledDiffPair {
+  /// The pair, with its measured gap, its width and its layers.
+  pub pair: DiffPair,
+  /// The P lane as assembled, still linked to the items it came from.
+  pub line_p: Line,
+  /// The N lane as assembled.
+  pub line_n: Line,
+}
+
+/// What [`find_coupled_item`] has settled on so far.
+///
+/// The four locals of `AssembleDiffPair`'s `findNItem` lambda
+/// (`pcbnew/router/pns_topology.cpp:1063` to `:1069`), which is called
+/// twice and has to carry its best answer across both calls.
+struct CoupledSearch {
+  /// `minDist_sq` (`:1065`), the smallest segment to segment distance
+  /// any accepted candidate had.
+  min_dist_sq: i64,
+  /// `minDistTarget_sq` (`:1066`), the smallest distance from a candidate
+  /// to the centre of the clicked item.
+  min_dist_target_sq: i64,
+  /// `refItem` (`:1063`), the item on the clicked net that was paired.
+  ref_item: Option<ItemId>,
+  /// `coupledItem` (`:1064`), its partner on the coupled net.
+  coupled_item: Option<ItemId>,
+}
+
+/// One pass of `findNItem` over the coupled net's candidates.
+///
+/// `pcbnew/router/pns_topology.cpp:1071` to `:1128`. A candidate has to be
+/// the same kind of object, the same width, parallel within
+/// [`DP_PARALLELITY_THRESHOLD`] and overlapping in the common parallel
+/// projection; among those, the one nearest `p_id` wins, tie broken by
+/// distance to `target_point`.
+///
+/// # Two things the transcription cannot keep
+///
+/// The arc arm (`:1098` to `:1112`) pairs two arcs by their centres and
+/// scores them by the difference of their radii. [`LineChain`] cannot hold
+/// an arc, so there is nothing to pair; the kind test above it already
+/// refuses everything that is not a segment.
+///
+/// The tie break reads `n_item->Shape( -1 )->SquaredDistance( target )`
+/// (`:1117`), which for a `SHAPE_SEGMENT` falls through to
+/// `SHAPE::SquaredDistance` (`libs/kimath/src/geometry/shape.cpp:111`):
+/// it polygonises the segment's copper and measures to that outline. The
+/// centre line's squared distance is used instead. Every candidate that
+/// reaches the test has the same width, so subtracting the same half
+/// width from each cannot reorder them and squaring is monotone; the two
+/// therefore choose the same candidate except when the target point lies
+/// inside the copper of two of them at once, where KiCad's outline
+/// distance is zero for both and this one still separates them.
+fn find_coupled_item(
+  world: &World,
+  search: &mut CoupledSearch,
+  n_items: &[ItemId],
+  p_id: ItemId,
+  target_point: Vec2,
+) {
+  let Some(p_item) = world.item(p_id) else {
+    return;
+  };
+
+  for &n_id in n_items {
+    let Some(n_item) = world.item(n_id) else {
+      continue;
+    };
+
+    // :1077
+    if n_item.kind() != p_item.kind() {
+      continue;
+    }
+
+    // :1080
+    let (ItemBody::Segment(p_segment), ItemBody::Segment(n_segment)) =
+      (p_item.body(), n_item.body())
+    else {
+      continue;
+    };
+
+    // :1085
+    if n_segment.width() != p_segment.width() {
+      continue;
+    }
+
+    // :1088
+    if !p_segment
+      .seg()
+      .approx_parallel(&n_segment.seg(), DP_PARALLELITY_THRESHOLD)
+    {
+      continue;
+    }
+
+    // :1093
+    if common_parallel_projection(p_segment.seg(), n_segment.seg()).is_none() {
+      continue;
+    }
+
+    // :1096
+    let dist_sq = n_segment
+      .seg()
+      .squared_distance_to_segment(&p_segment.seg());
+
+    // :1115. `<=` here and `<` on the tie break, so a later candidate at
+    // the same distance only wins by being nearer the click.
+    if dist_sq <= search.min_dist_sq {
+      let dist_target_sq =
+        n_segment.seg().squared_distance_to_point(target_point);
+
+      if dist_target_sq < search.min_dist_target_sq {
+        search.min_dist_target_sq = dist_target_sq;
+        search.min_dist_sq = dist_sq;
+        search.ref_item = Some(p_id);
+        search.coupled_item = Some(n_id);
+      }
+    }
+  }
+}
+
+/// Recover the differential pair a clicked track belongs to.
+///
+/// Port of `TOPOLOGY::AssembleDiffPair`,
+/// `pcbnew/router/pns_topology.cpp:1036`. Note 07 section 12.2 deferred
+/// it because milestone 10's placer never needed it; both pair length
+/// tuners start with it and cannot start without it.
+///
+/// The host says which two nets are coupled, through
+/// [`RuleResolver::dp_coupled_net`], and which of the two is the positive
+/// half, through [`RuleResolver::dp_net_polarity`]: a negative polarity on
+/// the clicked net swaps the two assembled lines so that
+/// [`AssembledDiffPair::line_p`] really is P (`:1160`). A resolver that
+/// answers neither, which is the default, makes this answer [`None`] and
+/// a pair tuning session refuse to start.
+///
+/// # The gap is measured, not configured
+///
+/// `:1163` to `:1177` recovers the gap from the geometry: the
+/// perpendicular distance between the two paired items, minus one lane's
+/// width, so the answer is the **copper edge to edge** gap of the pair as
+/// built rather than the one any rule asked for. It is negative when
+/// nothing could be measured, which is what makes both placers fall back
+/// to [`crate::settings::Sizes::diff_pair_gap`]
+/// (`pcbnew/router/pns_dp_meander_placer.cpp:114`).
+///
+/// # The layer test is equality, not overlap
+///
+/// `:1052` and `:1061` compare `item->Layers() == startItem->Layers()`,
+/// exact equality of the range. A coupled track on a layer range that
+/// merely overlaps the clicked one is not a candidate.
+///
+/// # Determinism
+///
+/// KiCad collects the coupled net's items into a `std::set<ITEM*>`
+/// (`:1057`) and the fallback links into another (`:1134`), so both are
+/// iterated in **address** order. The candidate loop is order sensitive,
+/// because a candidate that fails the tie break does not update
+/// `minDist_sq` and therefore does not narrow the search for the ones
+/// after it. Here [`World::all_items_in_net`] answers in uid order and the
+/// fallback set is a [`BTreeSet`], so the answer is reproducible; note 07
+/// line 1822 flags this as the same class of problem `dist_sq <= minDist_sq`
+/// already has.
+///
+/// # Erratum: `pItems` is built and never read
+///
+/// `:1048` declares it, `:1053` fills it with the clicked line's same
+/// layer segments, and nothing anywhere in the function reads it: the
+/// search runs over `startItem` (`:1130`) and then over the items joined
+/// to it (`:1153`), never over the rest of the clicked line. So a click in
+/// the middle of a bent lane pairs only the segment under the cursor and
+/// its immediate neighbours, which is what the fallback exists for. The
+/// dead vector is not ported; note 08's errata list does not carry it.
+#[must_use]
+pub fn assemble_diff_pair(
+  world: &World,
+  node: NodeId,
+  resolver: &dyn RuleResolver,
+  start: ItemId,
+) -> Option<AssembledDiffPair> {
+  let item = world.item(start)?;
+
+  // :1038, :1039
+  let ref_net = item.net()?;
+  let coupled_net = resolver.dp_coupled_net(ref_net)?;
+
+  // :1040, the `dynamic_cast<LINKED_ITEM*>`: a segment, an arc or a via.
+  if !item.of_kind(Kind::SEGMENT | Kind::ARC | Kind::VIA) {
+    return None;
+  }
+
+  // :1045. Every argument is spelled out because the last one differs
+  // from the crate's default: a segment of a different width does not
+  // continue the line here.
+  let line_p = world.assemble_line(node, start, None, false, false, false);
+
+  // :1059 to :1066
+  let layers = item.layers();
+  let n_items: Vec<ItemId> = world
+    .all_items_in_net(node, Some(coupled_net), Kind::SEGMENT | Kind::ARC)
+    .into_iter()
+    .filter(|id| {
+      world
+        .item(*id)
+        .is_some_and(|candidate| candidate.layers() == layers)
+    })
+    .collect();
+
+  // :1069. KiCad reads the centre of an uninitialised `BOX2I` when the
+  // shape has none; every kind that reaches here has one.
+  let target_point = item.shape(-1)?.center()?;
+  let mut search = CoupledSearch {
+    min_dist_sq: i64::MAX,
+    min_dist_target_sq: i64::MAX,
+    ref_item: None,
+    coupled_item: None,
+  };
+
+  // :1130
+  find_coupled_item(world, &mut search, &n_items, start, target_point);
+
+  // :1132 to :1153. Nothing under the cursor could be paired, so try
+  // whatever is joined to it at either end.
+  if search.coupled_item.is_none() {
+    let mut links_to_test: BTreeSet<ItemId> = BTreeSet::new();
+
+    for index in 0..item.anchor_count() {
+      let Some(reference) =
+        find_joint_of_item(world, node, item.anchor(index), item)
+      else {
+        continue;
+      };
+      let Some(joint) = world.joint(reference) else {
+        continue;
+      };
+
+      for &link in joint.links() {
+        if link != start {
+          links_to_test.insert(link);
+        }
+      }
+    }
+
+    for link in links_to_test {
+      find_coupled_item(world, &mut search, &n_items, link, target_point);
+    }
+  }
+
+  // :1155
+  let ref_id = search.ref_item?;
+  let coupled_id = search.coupled_item?;
+
+  // :1158
+  let line_n = world.assemble_line(node, coupled_id, None, false, false, false);
+
+  // :1160
+  let (line_p, line_n) = if resolver.dp_net_polarity(ref_net) < 0 {
+    (line_n, line_p)
+  } else {
+    (line_p, line_n)
+  };
+
+  // :1163 to :1177. The arc arm needs two `SHAPE_ARC` radii and has
+  // nothing to read here.
+  let gap = gap_between(world, ref_id, coupled_id, line_p.width());
+
+  // :1179 to :1182
+  let mut pair = DiffPair::from_lines(&line_p, &line_n, 0);
+
+  pair.set_width(line_p.width());
+  pair.set_layers(line_p.layers());
+  pair.set_gap(gap);
+
+  Some(AssembledDiffPair {
+    pair,
+    line_p,
+    line_n,
+  })
+}
+
+/// The copper gap between the two items a pair was recognised by.
+///
+/// `pcbnew/router/pns_topology.cpp:1165` to `:1170`: the cross product of
+/// the reference segment's direction with the displacement between the
+/// two far anchors, divided by the reference length, which is the
+/// perpendicular distance between the two centre lines, minus one lane's
+/// width. `-1` when the reference is not a segment (`:1163`), which is
+/// KiCad's "no gap could be measured".
+fn gap_between(
+  world: &World,
+  ref_id: ItemId,
+  coupled_id: ItemId,
+  width: i32,
+) -> i32 {
+  let (Some(reference), Some(coupled)) =
+    (world.item(ref_id), world.item(coupled_id))
+  else {
+    return -1;
+  };
+
+  if reference.kind() != Kind::SEGMENT {
+    return -1;
+  }
+
+  // :1167
+  let direction = reference.anchor(1) - reference.anchor(0);
+  let displacement = reference.anchor(1) - coupled.anchor(1);
+  let length = i64::from(direction.euclidean_norm());
+
+  if length == 0 {
+    return -1;
+  }
+
+  // :1170. KiCad narrows the quotient to an `int` before the subtraction.
+  let distance = (direction.cross(displacement) / length).abs();
+
+  i32::try_from(distance).unwrap_or(i32::MAX) - width
+}
+
+// ---------------------------------------------------------------------
 // ConnectedItems
 // ---------------------------------------------------------------------
 
@@ -1463,7 +1808,7 @@ mod tests {
   use crate::geometry::seg::Seg;
   use crate::geometry::shape::Shape;
   use crate::item::{NetId, Segment, Solid, Via, ViaType};
-  use crate::rules::FixedClearance;
+  use crate::rules::{CoupledNets, FixedClearance};
 
   /// The net every fixture item sits on.
   const NET: Option<NetId> = Some(NetId(1));
@@ -1875,5 +2220,178 @@ mod tests {
     assert_eq!(walk.length, 0);
     assert!(walk.items.is_empty());
     assert!(walk.end_pad.is_none());
+  }
+
+  // -----------------------------------------------------------------
+  // AssembleDiffPair
+  // -----------------------------------------------------------------
+
+  /// The positive half of the pair fixture.
+  const PAIR_NET_P: Option<NetId> = Some(NetId(1));
+
+  /// The negative half.
+  const PAIR_NET_N: Option<NetId> = Some(NetId(2));
+
+  /// The width of one lane of the pair fixture.
+  const LANE_WIDTH: i32 = 200_000;
+
+  /// The centre to centre spacing of the two lanes.
+  const LANE_PITCH: i32 = 400_000;
+
+  /// A track of a chosen net and the lane width.
+  fn add_lane(
+    world: &mut World,
+    node: NodeId,
+    net: Option<NetId>,
+    from: Vec2,
+    to: Vec2,
+  ) -> ItemId {
+    let body = ItemBody::Segment(Segment::new(Seg::new(from, to), LANE_WIDTH));
+    let mut item = world.make_item(body);
+
+    item.set_layers_and_flash_all(LayerRange::single(0));
+    item.set_net(net);
+
+    world
+      .add_segment(node, item, false)
+      .expect("a fixture lane is neither degenerate nor redundant")
+  }
+
+  /// Note 08 section 14.3's pair board: two straight lanes a pitch apart,
+  /// eight millimetres long, and the handles of the P and N tracks.
+  fn pair_board() -> (World, ItemId, ItemId) {
+    let mut world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let root = world.root();
+    let track_p = add_lane(
+      &mut world,
+      root,
+      PAIR_NET_P,
+      Vec2::new(0, -LANE_PITCH / 2),
+      Vec2::new(8_000_000, -LANE_PITCH / 2),
+    );
+    let track_n = add_lane(
+      &mut world,
+      root,
+      PAIR_NET_N,
+      Vec2::new(0, LANE_PITCH / 2),
+      Vec2::new(8_000_000, LANE_PITCH / 2),
+    );
+
+    (world, track_p, track_n)
+  }
+
+  /// The resolver that says which two nets are coupled.
+  fn pair_rules() -> CoupledNets {
+    CoupledNets::new(FixedClearance::uniform(100_000), NetId(1), NetId(2))
+  }
+
+  /// A click on either lane recovers both lines, P first whichever was
+  /// clicked, with the measured gap and the clicked lane's layers.
+  #[test]
+  fn a_click_on_either_lane_of_a_pair_recovers_both() {
+    let (world, track_p, track_n) = pair_board();
+    let root = world.root();
+    let rules = pair_rules();
+
+    for start in [track_p, track_n] {
+      let found = assemble_diff_pair(&world, root, &rules, start)
+        .expect("the two lanes are a pair");
+
+      assert_eq!(found.pair.nets(), (PAIR_NET_P, PAIR_NET_N));
+      assert_eq!(found.line_p.net(), PAIR_NET_P);
+      assert_eq!(found.line_n.net(), PAIR_NET_N);
+      assert_eq!(found.pair.width(), LANE_WIDTH);
+      assert_eq!(found.pair.layers(), LayerRange::single(0));
+      // The gap is measured, not configured: the pitch minus one width.
+      assert_eq!(found.pair.gap(), LANE_PITCH - LANE_WIDTH);
+      assert_eq!(found.pair.chain_p().point(0).y, -LANE_PITCH / 2);
+      assert_eq!(found.pair.chain_n().point(0).y, LANE_PITCH / 2);
+      // Both lines carry the links the placers remove and walk from.
+      assert_eq!(found.line_p.links(), &[track_p]);
+      assert_eq!(found.line_n.links(), &[track_n]);
+    }
+  }
+
+  /// A resolver with no pair concept, which is the default, answers
+  /// nothing and no pair is recovered.
+  #[test]
+  fn a_net_with_no_coupled_partner_is_not_a_pair() {
+    let (world, track_p, _) = pair_board();
+    let root = world.root();
+    let rules = FixedClearance::uniform(100_000);
+
+    assert!(assemble_diff_pair(&world, root, &rules, track_p).is_none());
+  }
+
+  /// A pad is not a `LINKED_ITEM`, so it cannot start the search
+  /// (`pcbnew/router/pns_topology.cpp:1040`).
+  #[test]
+  fn a_pad_cannot_start_a_pair() {
+    let (mut world, _, _) = pair_board();
+    let root = world.root();
+    let rules = pair_rules();
+    let pad = add_pad(&mut world, root, Vec2::new(0, -LANE_PITCH / 2));
+
+    assert!(assemble_diff_pair(&world, root, &rules, pad).is_none());
+  }
+
+  /// A click on a stub that is not parallel to anything on the coupled
+  /// net falls through to the joined items (`:1132`), which is the only
+  /// path that reaches a segment other than the clicked one: `pItems` is
+  /// built and never read.
+  #[test]
+  fn a_click_on_an_unpairable_stub_falls_back_to_the_joined_items() {
+    let (mut world, track_p, track_n) = pair_board();
+    let root = world.root();
+    let rules = pair_rules();
+    let stub = add_lane(
+      &mut world,
+      root,
+      PAIR_NET_P,
+      Vec2::new(0, -LANE_PITCH / 2),
+      Vec2::new(0, -1_200_000),
+    );
+
+    let found = assemble_diff_pair(&world, root, &rules, stub)
+      .expect("the stub's neighbour is half of a pair");
+
+    assert_eq!(found.pair.gap(), LANE_PITCH - LANE_WIDTH);
+    assert_eq!(found.line_n.links(), &[track_n]);
+    // The clicked line is the whole run the stub belongs to, stub first,
+    // because `AssembleLine` follows through the joint of degree two.
+    assert!(found.line_p.contains_link(track_p));
+    assert!(found.line_p.contains_link(stub));
+  }
+
+  /// A coupled track on a different layer is not a candidate: the test
+  /// is exact equality of the layer range (`:1052`, `:1061`).
+  #[test]
+  fn a_coupled_track_on_another_layer_is_not_a_candidate() {
+    let mut world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let root = world.root();
+    let rules = pair_rules();
+    let track_p = add_lane(
+      &mut world,
+      root,
+      PAIR_NET_P,
+      Vec2::new(0, -LANE_PITCH / 2),
+      Vec2::new(8_000_000, -LANE_PITCH / 2),
+    );
+    let body = ItemBody::Segment(Segment::new(
+      Seg::new(
+        Vec2::new(0, LANE_PITCH / 2),
+        Vec2::new(8_000_000, LANE_PITCH / 2),
+      ),
+      LANE_WIDTH,
+    ));
+    let mut item = world.make_item(body);
+
+    item.set_layers_and_flash_all(LayerRange::single(1));
+    item.set_net(PAIR_NET_N);
+    world
+      .add_segment(root, item, false)
+      .expect("the second layer lane is not redundant");
+
+    assert!(assemble_diff_pair(&world, root, &rules, track_p).is_none());
   }
 }

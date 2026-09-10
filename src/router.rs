@@ -77,10 +77,12 @@ use crate::line::Line;
 use crate::meander::{LengthTarget, MeanderSettings, TuningStatus};
 use crate::multi_dragger::MultiDragger;
 use crate::node::{NodeId, World};
-use crate::placer::Placer;
 use crate::placer::diff_pair_placer::{DiffPairPlacer, PairError};
+use crate::placer::dp_meander_placer::DpMeanderPlacer;
 use crate::placer::line_placer::LinePlacer;
 use crate::placer::meander_placer::{MeanderPlacer, TuningError};
+use crate::placer::meander_skew_placer::MeanderSkewPlacer;
+use crate::placer::{Placer, TuningMode};
 use crate::rules::{ItemRef, RuleResolver};
 use crate::settings::{RoutingSettings, Sizes};
 use crate::snapshot::{HostIndex, WorldSnapshot};
@@ -138,6 +140,20 @@ pub enum RouterState {
   /// [`Router::abort_routing`] all take the placer branch, exactly as
   /// they do for [`RouterState::RouteTrack`].
   TuneSingle,
+
+  /// Both lanes of a differential pair are being length tuned.
+  ///
+  /// Everything [`RouterState::TuneSingle`] says applies, with
+  /// `PNS_MODE_TUNE_DIFF_PAIR` in place of `PNS_MODE_TUNE_SINGLE`.
+  TuneDiffPair,
+
+  /// One lane of a differential pair is being skew tuned.
+  ///
+  /// Everything [`RouterState::TuneSingle`] says applies, with
+  /// `PNS_MODE_TUNE_DIFF_PAIR_SKEW` in place of `PNS_MODE_TUNE_SINGLE`.
+  /// The readout is a **skew** and not a length; see
+  /// [`TuningInfo::mode`].
+  TuneSkew,
   /// An existing track, corner or via is being dragged. `DRAG_SEGMENT`.
   ///
   /// Entered by [`Router::start_dragging`]
@@ -160,6 +176,22 @@ pub enum RouterState {
   /// it is the one thing [`Router::pending_update`] adds rather than
   /// transcribes.
   DragComponent,
+}
+
+impl RouterState {
+  /// Whether one of the three length tuning modes is running.
+  ///
+  /// KiCad asks the same question with `ROUTER::Mode()`
+  /// (`pcbnew/router/pns_router.h:171`), because all three modes leave it
+  /// in `ROUTE_TRACK`; the state carries the answer here.
+  pub const fn is_tuning(self) -> bool {
+    matches!(
+      self,
+      RouterState::TuneSingle
+        | RouterState::TuneDiffPair
+        | RouterState::TuneSkew
+    )
+  }
 }
 
 /// Why a routing session refused to start.
@@ -285,6 +317,35 @@ pub enum StartError {
   /// it is one here.
   NoTuningPath,
 
+  /// The track a pair length tuning session was asked to tune is not
+  /// half of a differential pair.
+  ///
+  /// Port of "Unable to find complementary differential pair net for
+  /// length tuning. Make sure the names of the nets belonging to a
+  /// differential pair end with either _N/_P or +/-."
+  /// (`pcbnew/router/pns_dp_meander_placer.cpp:107`). This crate has no
+  /// net names and invents no convention: the host answers
+  /// [`crate::rules::RuleResolver::dp_coupled_net`], and a host with no
+  /// pair concept answers [`None`] and reaches this.
+  NotADiffPairForTuning,
+
+  /// The same, from a skew tuning session.
+  ///
+  /// Port of "...for skew tuning..."
+  /// (`pcbnew/router/pns_meander_skew_placer.cpp:79`), a separate variant
+  /// because KiCad words the two differently and a host shows the message
+  /// the mode calls for.
+  NotADiffPairForSkew,
+
+  /// One lane of the recovered pair holds no segment.
+  ///
+  /// The unreported `return false` of
+  /// `pcbnew/router/pns_dp_meander_placer.cpp:117` and
+  /// `pns_meander_skew_placer.cpp:88`, which leaves KiCad's status bar
+  /// empty. It cannot arise from a successful pair assembly; see
+  /// [`crate::placer::meander_placer::TuningError::PairLaneHasNoSegments`].
+  PairLaneHasNoSegments,
+
   /// The object under the drag is not something a drag can move.
   ///
   /// Port of the `default:` of `DRAGGER::Start`
@@ -295,13 +356,16 @@ pub enum StartError {
   NotDraggable(ItemId),
 }
 
-/// The three ways a tuning session refuses to start, as a host sees them.
+/// The six ways a tuning session refuses to start, as a host sees them.
 impl From<TuningError> for StartError {
   fn from(error: TuningError) -> Self {
     match error {
       TuningError::NeedsStartItem => StartError::TuningNeedsStartItem,
       TuningError::NotATrack(item) => StartError::NotATrack(item),
       TuningError::NoTuningPath => StartError::NoTuningPath,
+      TuningError::NotADiffPairForTuning => StartError::NotADiffPairForTuning,
+      TuningError::NotADiffPairForSkew => StartError::NotADiffPairForSkew,
+      TuningError::PairLaneHasNoSegments => StartError::PairLaneHasNoSegments,
     }
   }
 }
@@ -570,10 +634,21 @@ pub struct TuningInfo {
   /// into "too long", "too short" or "tuned" (`pcb_tuning_pattern.cpp:1328`).
   pub status: TuningStatus,
 
+  /// Which of the three tuning modes produced this readout.
+  ///
+  /// KiCad's host knows it because it set `ROUTER::SetMode` itself
+  /// (`pcbnew/generators/pcb_tuning_pattern.cpp:1285`) and branches on it
+  /// to label the number (`:2147`). It travels with the readout here so
+  /// that a host that only holds the frame can label it too.
+  pub mode: TuningMode,
+
   /// The length the last move produced, in nanometres.
+  ///
   /// `TuningLengthResult()` (`pns_meander_placer_base.h:61`). It is a
-  /// skew rather than a length for the skew placer, which arrives with
-  /// the next slice.
+  /// **skew** rather than a length in [`TuningMode::PairSkew`], where the
+  /// skew placer overrides the accessor
+  /// (`pcbnew/router/pns_meander_skew_placer.cpp:240`); the same number
+  /// is in [`TuningInfo::skew`] under its own name for that mode.
   pub result: i64,
 
   /// How far that has moved from the length the session started at.
@@ -598,6 +673,37 @@ pub struct TuningInfo {
   /// `flipInitialSide` writes into it from inside the shape generator
   /// (`pcbnew/router/pns_meander.cpp:287`).
   pub settings: MeanderSettings,
+
+  /// The difference in length between the two lanes, when the session
+  /// measures one.
+  ///
+  /// `MEANDER_SKEW_PLACER::CurrentSkew`
+  /// (`pcbnew/router/pns_meander_skew_placer.cpp:195`), which is the same
+  /// number [`TuningInfo::result`] carries in [`TuningMode::PairSkew`].
+  /// It is here under its own name so that a host can show it without
+  /// knowing about the override.
+  ///
+  /// [`None`] in the other two modes. The pair **length** tuner has no
+  /// skew concept: it tunes the longer lane's length
+  /// (`pns_dp_meander_placer.cpp:180`) and never compares the two, so
+  /// there is no number of KiCad's to report.
+  pub skew: Option<i64>,
+
+  /// The skew window the session was aimed at.
+  ///
+  /// [`MeanderSettings::target_skew`], resolved the way the skew placer
+  /// resolves it, and [`None`] outside [`TuningMode::PairSkew`] where
+  /// nothing reads the field. [`TuningInfo::target`] is the **length**
+  /// window the status was actually decided against, which in skew mode
+  /// is this window plus the coupled lane's length.
+  pub skew_target: Option<LengthTarget>,
+
+  /// The coupled lane's total length, in [`TuningMode::PairSkew`].
+  ///
+  /// `m_coupledLength` (`pcbnew/router/pns_meander_skew_placer.h:73`),
+  /// which is what the skew is measured against and what makes the two
+  /// numbers a host shows add up. [`None`] in the other two modes.
+  pub coupled_length: Option<i64>,
 }
 
 // ---------------------------------------------------------------------
@@ -1147,7 +1253,7 @@ impl Router {
   /// [`Router::current_net`] gives.
   pub fn current_nets(&self) -> RoutedNets {
     if let Some(placer) = self.placer.as_ref() {
-      return if placer.is_diff_pair() {
+      return if placer.routes_two_nets() {
         RoutedNets::Pair(placer.current_net(), placer.current_net_n())
       } else {
         RoutedNets::Single(placer.current_net())
@@ -1696,6 +1802,141 @@ impl Router {
     Ok(self.frame())
   }
 
+  /// Begin length tuning the differential pair a track belongs to.
+  ///
+  /// Port of `ROUTER::StartRouting` (`pcbnew/router/pns_router.cpp:434`)
+  /// for `PNS_MODE_TUNE_DIFF_PAIR`, which news a `DP_MEANDER_PLACER`
+  /// (`:457`). Everything [`Router::start_tuning`] says about the
+  /// signature holds: no layer, no sizes, no start gate, the settings in
+  /// the call.
+  ///
+  /// Which two nets are coupled is entirely the host's answer, through
+  /// [`crate::rules::RuleResolver::dp_coupled_net`] and
+  /// [`crate::rules::RuleResolver::dp_net_polarity`], exactly as it is
+  /// for [`Router::start_routing_diff_pair`]. A host that answers neither
+  /// sees [`StartError::NotADiffPairForTuning`].
+  ///
+  /// # Why a third entry point and not a mode argument
+  ///
+  /// Note 08 section 11.5 recommends one entry point with a mode, on the
+  /// grounds that all three tuning modes take the same arguments. Three
+  /// separate entries are taken instead, for the reason note 07 section
+  /// 12.4 gave for pairs and [`Router::start_routing_diff_pair`] repeats:
+  /// the refusals differ (only the two pair modes can answer
+  /// [`StartError::NotADiffPairForTuning`] or
+  /// [`StartError::NotADiffPairForSkew`]), the recording then carries one
+  /// event per mode so a reader is never in doubt about which placer ran,
+  /// and [`Router::start_tuning`] keeps the shape it shipped with.
+  ///
+  /// # Errors
+  ///
+  /// [`StartError::AlreadyRouting`], [`StartError::UnknownStartItem`],
+  /// and everything
+  /// [`crate::placer::meander_placer::TuningError`] carries.
+  pub fn start_tuning_diff_pair(
+    &mut self,
+    at: Vec2,
+    item: HostId,
+    settings: MeanderSettings,
+  ) -> Result<PreviewFrame, StartError> {
+    self.record(SessionEvent::StartTuningDiffPair { at, item, settings });
+
+    if self.routing_in_progress() {
+      return Err(StartError::AlreadyRouting);
+    }
+
+    let root = self.world.root();
+    let start_item = self
+      .resolve_host_item(root, at, item, None)
+      .ok_or(StartError::UnknownStartItem(item))?;
+
+    // :457
+    let mut placer = DpMeanderPlacer::new(
+      &self.world,
+      root,
+      settings,
+      self.sizes.diff_pair_gap,
+    );
+    let context = AlgoContext {
+      resolver: self.resolver.as_ref(),
+      settings: &self.settings,
+      debug: self.debug.as_ref(),
+    };
+
+    // :473
+    placer.start(&mut self.world, &context, at, Some(start_item))?;
+
+    self.placer = Some(Placer::DpMeander(Box::new(placer)));
+    self.state = RouterState::TuneDiffPair;
+
+    Ok(self.frame())
+  }
+
+  /// Begin skew tuning the lane of a differential pair under a point.
+  ///
+  /// Port of `ROUTER::StartRouting` (`pcbnew/router/pns_router.cpp:434`)
+  /// for `PNS_MODE_TUNE_DIFF_PAIR_SKEW`, which news a
+  /// `MEANDER_SKEW_PLACER` (`:461`).
+  ///
+  /// # It meanders the lane that was clicked
+  ///
+  /// There is no automatic choice of the shorter lane anywhere in
+  /// KiCad's placer, and none here: the clicked lane is the one that gets
+  /// meandered and the other one is only measured. Clicking the **longer**
+  /// lane and asking for zero skew therefore reports
+  /// [`crate::meander::TuningStatus::TooLong`] and changes nothing; the
+  /// user's remedy is to click the other lane. Note 08 section 7.1.
+  ///
+  /// The readout is a skew: [`TuningInfo::result`] and
+  /// [`TuningInfo::skew`] are the same number, and
+  /// [`TuningInfo::mode`] is what tells a host to label it as one.
+  ///
+  /// # Errors
+  ///
+  /// [`StartError::AlreadyRouting`], [`StartError::UnknownStartItem`],
+  /// and everything
+  /// [`crate::placer::meander_placer::TuningError`] carries, with
+  /// [`StartError::NotADiffPairForSkew`] in place of
+  /// [`StartError::NotADiffPairForTuning`].
+  pub fn start_tuning_skew(
+    &mut self,
+    at: Vec2,
+    item: HostId,
+    settings: MeanderSettings,
+  ) -> Result<PreviewFrame, StartError> {
+    self.record(SessionEvent::StartTuningSkew { at, item, settings });
+
+    if self.routing_in_progress() {
+      return Err(StartError::AlreadyRouting);
+    }
+
+    let root = self.world.root();
+    let start_item = self
+      .resolve_host_item(root, at, item, None)
+      .ok_or(StartError::UnknownStartItem(item))?;
+
+    // :461
+    let mut placer = MeanderSkewPlacer::new(
+      &self.world,
+      root,
+      settings,
+      self.sizes.diff_pair_gap,
+    );
+    let context = AlgoContext {
+      resolver: self.resolver.as_ref(),
+      settings: &self.settings,
+      debug: self.debug.as_ref(),
+    };
+
+    // :473
+    placer.start(&mut self.world, &context, at, Some(start_item))?;
+
+    self.placer = Some(Placer::MeanderSkew(Box::new(placer)));
+    self.state = RouterState::TuneSkew;
+
+    Ok(self.frame())
+  }
+
   /// Nudge the meander amplitude by one step and re-run the last move.
   ///
   /// Port of `PCB_ACTIONS::amplIncrease` and `amplDecrease`
@@ -1715,7 +1956,7 @@ impl Router {
   pub fn amplitude_step(&mut self, sign: i32) -> bool {
     self.record(SessionEvent::AmplitudeStep { sign });
 
-    if self.state != RouterState::TuneSingle {
+    if !self.state.is_tuning() {
       return false;
     }
 
@@ -1743,7 +1984,7 @@ impl Router {
   pub fn spacing_step(&mut self, sign: i32) -> bool {
     self.record(SessionEvent::SpacingStep { sign });
 
-    if self.state != RouterState::TuneSingle {
+    if !self.state.is_tuning() {
       return false;
     }
 
@@ -1990,7 +2231,10 @@ impl Router {
       RouterState::Idle => return PreviewFrame::default(),
       // :501. A tuning session takes the same branch, exactly as
       // `ROUTER::Move` does (`:502`).
-      RouterState::RouteTrack | RouterState::TuneSingle => {
+      RouterState::RouteTrack
+      | RouterState::TuneSingle
+      | RouterState::TuneDiffPair
+      | RouterState::TuneSkew => {
         let end_item = self.resolve_end_item(at, end);
 
         if let Some(placer) = self.placer.as_mut() {
@@ -2069,10 +2313,12 @@ impl Router {
     match self.state {
       // :933
       RouterState::Idle => FixOutcome::Continue(PreviewFrame::default()),
-      // :922
-      RouterState::RouteTrack | RouterState::TuneSingle => {
-        self.fix_placement(at, end, force_finish)
-      }
+      // :922. All three tuning modes take it too, because KiCad leaves
+      // every one of them in `ROUTE_TRACK`.
+      RouterState::RouteTrack
+      | RouterState::TuneSingle
+      | RouterState::TuneDiffPair
+      | RouterState::TuneSkew => self.fix_placement(at, end, force_finish),
       // :928, :929. Both drag states reach the dragger's `FixRoute`.
       RouterState::DragSegment | RouterState::DragComponent => {
         self.fix_drag(force_finish)
@@ -2453,7 +2699,10 @@ impl Router {
     let node = match self.state {
       RouterState::Idle => None,
       // :839
-      RouterState::RouteTrack | RouterState::TuneSingle => {
+      RouterState::RouteTrack
+      | RouterState::TuneSingle
+      | RouterState::TuneDiffPair
+      | RouterState::TuneSkew => {
         self.placer.as_ref().map(|placer| placer.current_node(true))
       }
       // :844, plus the `DRAG_COMPONENT` branch KiCad lacks.
@@ -3146,16 +3395,26 @@ fn preview_frame(
 /// placers, which answer [`None`] to every one of them.
 fn tuning_info(placer: &Placer) -> Option<Box<TuningInfo>> {
   let settings = *placer.meander_settings()?;
+  let mode = placer.tuning_mode()?;
+  let skew = placer.tuning_skew();
 
   Some(Box::new(TuningInfo {
+    mode,
     status: placer.tuning_status()?,
     result: placer.tuning_length_result()?,
     delta: placer.tuning_length_delta(),
     // The window the status was decided against; see [`TuningInfo::target`].
-    target: settings
-      .target_length()
+    target: placer
+      .tuning_target()
       .unwrap_or_else(LengthTarget::unconstrained),
     settings,
+    skew,
+    // Only the skew mode reads either, so only it reports them.
+    skew_target: match mode {
+      TuningMode::PairSkew => settings.target_skew(),
+      TuningMode::SingleLength | TuningMode::PairLength => None,
+    },
+    coupled_length: placer.tuning_coupled_length(),
   }))
 }
 

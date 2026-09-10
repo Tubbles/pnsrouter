@@ -113,6 +113,34 @@ pub enum TuningError {
   /// refusal rather than a silent zero so that a host that reaches it
   /// learns why instead of seeing a tuner that will not tune.
   NoTuningPath,
+
+  /// The track is not half of a differential pair.
+  ///
+  /// "Unable to find complementary differential pair net for length
+  /// tuning..." (`pcbnew/router/pns_dp_meander_placer.cpp:107`), which is
+  /// [`crate::topology::assemble_diff_pair`] answering [`None`]: the
+  /// resolver named no coupled net, or nothing on that net runs alongside
+  /// the clicked track.
+  NotADiffPairForTuning,
+
+  /// The same refusal from the skew tuner.
+  ///
+  /// "...for skew tuning..."
+  /// (`pcbnew/router/pns_meander_skew_placer.cpp:79`). A separate variant
+  /// because KiCad words the two differently and a host shows the message
+  /// the mode calls for.
+  NotADiffPairForSkew,
+
+  /// One lane of the recovered pair holds no segment.
+  ///
+  /// The unreported `return false` of
+  /// `pcbnew/router/pns_dp_meander_placer.cpp:117` and
+  /// `pns_meander_skew_placer.cpp:88`, which KiCad leaves with no failure
+  /// reason at all, so its host shows an empty status bar. It cannot
+  /// arise from a successful pair assembly, since both lines were
+  /// assembled from real segments; it is a refusal rather than a silent
+  /// false so that a host that reaches it learns why.
+  PairLaneHasNoSegments,
 }
 
 // ---------------------------------------------------------------------
@@ -285,6 +313,16 @@ impl MeanderPlacer {
   /// The lifecycle state.
   pub const fn state(&self) -> &MeanderPlacerState {
     &self.state
+  }
+
+  /// The node every session branches from.
+  ///
+  /// `Router()->GetWorld()` (`pcbnew/router/pns_meander_placer.cpp:81`).
+  /// [`crate::placer::meander_skew_placer::MeanderSkewPlacer`] reads it
+  /// so that it can recover the pair before this placer takes the clicked
+  /// lane out of its own branch; see that type's `start`.
+  pub const fn root_node(&self) -> NodeId {
+    self.root_node
   }
 
   /// The dimensions the meanders are drawn to.
@@ -524,6 +562,30 @@ impl MeanderPlacer {
     Some(self.tuning_length_result()? - tuning.baseline_length)
   }
 
+  /// The length the last move measured, before the fallback
+  /// [`MeanderPlacer::tuning_length_result`] applies.
+  ///
+  /// `m_lastLength` (`pcbnew/router/pns_meander_placer.h:135`), raw. The
+  /// skew placer reads it that way, because its own `TuningLengthResult`
+  /// is a skew (`pcbnew/router/pns_meander_skew_placer.cpp:242`) and
+  /// never goes through the "zero means no move yet" fallback.
+  pub fn last_length(&self) -> Option<i64> {
+    self.state.tuning().map(|tuning| tuning.last_length)
+  }
+
+  /// Seed the length the readout starts from.
+  ///
+  /// `MEANDER_SKEW_PLACER::Start` writes `m_lastLength` itself
+  /// (`pcbnew/router/pns_meander_skew_placer.cpp:152`, `:160`), where
+  /// `MEANDER_PLACER::Start` leaves the constructor's zero (`:46`). That
+  /// is one assignment across an inheritance boundary in KiCad and one
+  /// call across a module boundary here.
+  pub fn set_last_length(&mut self, length: i64) {
+    if let Some(tuning) = self.state.tuning_mut() {
+      tuning.last_length = length;
+    }
+  }
+
   // -----------------------------------------------------------------
   // Start
   // -----------------------------------------------------------------
@@ -686,7 +748,17 @@ impl MeanderPlacer {
   /// Cut the line into three, meander the middle, glue it back together.
   ///
   /// Port of `doMove`, `pcbnew/router/pns_meander_placer.cpp:228`, the
-  /// one routine the milestone is about. There is no incremental state:
+  /// one routine the milestone is about.
+  ///
+  /// It is public because
+  /// [`crate::placer::meander_skew_placer::MeanderSkewPlacer`] reuses it
+  /// whole and changes only the three targets it is given
+  /// (`pcbnew/router/pns_meander_skew_placer.cpp:234`); KiCad spells that
+  /// reuse as inheritance, and this is what `protected` amounts to across
+  /// two modules. Nothing else should call it: the target a single track
+  /// session tunes to is [`MeanderPlacer::move_to`]'s job to look up.
+  ///
+  /// There is no incremental state:
   /// the tuned stretch is re-meandered from scratch on every move
   /// (`:243`).
   ///
@@ -697,9 +769,10 @@ impl MeanderPlacer {
   /// `m_lastLength` is built by subtraction and then addition (`:288`,
   /// `:323`): the whole path length minus the straight stretch about to
   /// be replaced, then plus the meandered stretch. That works because the
-  /// path being measured still holds the pre meander geometry; see
-  /// [`MeanderTuning::tuned_path`].
-  fn do_move(
+  /// path being measured still holds the pre meander geometry: nothing
+  /// ever writes the meanders back into `m_tunedPath`, which is what
+  /// makes `origPathLength()` a constant after `Start`.
+  pub fn do_move(
     &mut self,
     world: &mut World,
     context: &AlgoContext<'_>,
@@ -1088,7 +1161,7 @@ impl MeanderPlacer {
 /// `pcbnew/router/pns_helpers.cpp:187`: the nearest point of a segment,
 /// and for an arc the nearer of its two anchors. The arc branch arrives
 /// with the arcs; a segment is the only kind that reaches here today.
-fn snapped_start_point(item: &Item, at: Vec2) -> Vec2 {
+pub(crate) fn snapped_start_point(item: &Item, at: Vec2) -> Vec2 {
   // :190
   if let ItemBody::Segment(segment) = item.body() {
     return segment.seg().nearest_point_to_point(at);
