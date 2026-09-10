@@ -1,5 +1,7 @@
 # pnsrouter
 
+> **Notice.** This project is "vibe" ported and maintained: an LLM (Claude Code) did the porting from KiCad's router sources and does the ongoing work, under human direction, and so far no human has reviewed the code line by line. Read and use it with that in mind.
+
 Interactive push and shove PCB router library, written in Rust. The design follows KiCad's PNS router (`pcbnew/router` in the KiCad source tree), reimplemented as a standalone library without GUI or board file format dependencies, so that other EDA tools can embed it. The first consumer is [LibrePCB](https://librepcb.org).
 
 ## Status

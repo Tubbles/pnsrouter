@@ -104,3 +104,7 @@ Deferred during the M7 close (2026-09-09):
 
 - cargo-fuzz targets for `SessionRecording::from_text` and for random shape pairs through `collide` (no panic, symmetric answer) need a nightly toolchain; run them as a CI job on nightly rather than in the container, which pins 1.92.0 and has a read only rustup directory.
 - 0.1.0 is the user's to publish; the runbook is in `doc/work/007-hardening-and-release.md`.
+
+Requested by the user (2026-09-10):
+
+- As soon as 0.1.0 is on crates.io, switch LibrePCB from the `libs/pnsrouter` submodule to `pnsrouter = "0.1"` in `libs/librepcb/rust-core/Cargo.toml` and remove the submodule.
