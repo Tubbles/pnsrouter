@@ -61,7 +61,7 @@
 //!
 //! Seven of the eleven cases open with `EVT_START_DRAG` or
 //! `EVT_START_MULTIDRAG`. The crate has no dragger yet (`PLAN.md`
-//! milestone 8), so those tests are `#[ignore]`d with that reason and
+//! milestone 9), so those tests are `#[ignore]`d with that reason and
 //! their bodies check only that the case loads and that its board mapping
 //! resolves.
 //!
@@ -363,21 +363,21 @@ fn simple_shove_1_matches_the_golden() {
 
 /// The longest log in the corpus, 858 events of one drag.
 #[test]
-#[ignore = "dragging is milestone 8"]
+#[ignore = "dragging is milestone 9"]
 fn drag_acute_fallback() {
   assert_loads_and_maps("drag-acute-fallback");
 }
 
 /// Post drag walkaround optimiser behaviour.
 #[test]
-#[ignore = "dragging is milestone 8"]
+#[ignore = "dragging is milestone 9"]
 fn drag_walk_optimize_a() {
   assert_loads_and_maps("drag-walk-optimize-a");
 }
 
 /// The corner fixing variant of the case above.
 #[test]
-#[ignore = "dragging is milestone 8"]
+#[ignore = "dragging is milestone 9"]
 fn drag_walk_optimize_fix_corners() {
   assert_loads_and_maps("drag-walk-optimize-fix-corners");
 }
@@ -385,7 +385,7 @@ fn drag_walk_optimize_fix_corners() {
 /// GitLab issue 23449, a crash dragging an isolated via. Its golden is
 /// empty, so it is a free win at tier 1 once the dragger exists.
 #[test]
-#[ignore = "dragging is milestone 8"]
+#[ignore = "dragging is milestone 9"]
 fn issue23449_shove_lone_via_drag_crash() {
   assert_loads_and_maps("issue23449-shove-lone-via-drag-crash");
 }
@@ -393,7 +393,7 @@ fn issue23449_shove_lone_via_drag_crash() {
 /// A heavy single layer shove cascade across ten nets, by far the largest
 /// golden in the corpus.
 #[test]
-#[ignore = "dragging is milestone 8"]
+#[ignore = "dragging is milestone 9"]
 fn simple_drag_shove_singlelayer() {
   assert_loads_and_maps("simple-drag-shove-singlelayer");
 }
@@ -401,14 +401,14 @@ fn simple_drag_shove_singlelayer() {
 /// Walking around teardrop pads with hugging disabled. The only self
 /// contained case, shipping its own board.
 #[test]
-#[ignore = "dragging is milestone 8"]
+#[ignore = "dragging is milestone 9"]
 fn walk_with_teardrops() {
   assert_loads_and_maps("walk-with-teardrops");
 }
 
 /// Dragging a segment into the board outline.
 #[test]
-#[ignore = "dragging is milestone 8"]
+#[ignore = "dragging is milestone 9"]
 fn walk_drag_seg_against_board_edge() {
   assert_loads_and_maps("walk_drag_seg_against_board_edge");
 }

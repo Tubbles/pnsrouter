@@ -6,7 +6,7 @@ pnsrouter is a standalone Rust crate on crates.io implementing an interactive pu
 
 ## Non-goals for now
 
-Differential pairs, length tuning (meanders), multi drag, component drag, arc tracks, HDI micro via stacks, a custom DRC rule language. The data model must not prevent them, but no code is written for them.
+Arc tracks (on hold), HDI micro via stacks, a custom DRC rule language, and the LibrePCB side of differential pairs (on hold). Component drag (KiCad's `DRAG_COMPONENT`) is the tail of milestone 9 and multi drag its last step. The data model must not prevent any of them.
 
 ## Milestones
 
