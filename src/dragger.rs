@@ -11,8 +11,8 @@
 //!
 //! # What is implemented
 //!
-//! Steps 1 to 3 of that order, which is the mark obstacles path end to
-//! end:
+//! Steps 1 to 5 of that order, which is the mark obstacles path end to
+//! end plus the post drag optimizer the other two paths finish with:
 //!
 //! - [`Dragger::start`] with the mode decision of `startDragSegment`
 //!   (`:118`) and the state half of `startDragVia` (`:257`);
@@ -22,8 +22,12 @@
 //!   which is [`Dragger::drag`] in [`RouterMode::MarkObstacles`], in free
 //!   angle mode, and after any first drag failure;
 //! - [`Dragger::traces`], [`Dragger::current_node`],
-//!   [`Dragger::current_nets`], [`Dragger::force_mark_obstacles_mode`]
-//!   and [`Dragger::fix_route`] as far as mark obstacles needs it.
+//!   [`Dragger::current_nets`], [`Dragger::force_mark_obstacles_mode`],
+//!   [`Dragger::fix_route_node`] and [`Dragger::fix_route`] as far as
+//!   mark obstacles needs them;
+//! - `optimizeAndUpdateDraggedLine` (`:569`), `bestAnchorForPoint`
+//!   (`:639`) and `pointHasBadCorner` (`:622`), which **no path in this
+//!   revision of the module reaches yet**; see below.
 //!
 //! # What is not implemented yet
 //!
@@ -34,18 +38,29 @@
 //!   kind of stub. The [`Shove`] itself is already constructed by
 //!   [`Dragger::start`], because that is where KiCad builds it (`:325`)
 //!   and the node tree depends on it.
-//! - `optimizeAndUpdateDraggedLine` (`:569`), `bestAnchorForPoint`
-//!   (`:639`) and `pointHasBadCorner` (`:622`), step 5. Nothing in the
-//!   mark obstacles path reaches them: `dragMarkObstacles` is the one
-//!   drag routine that never optimizes.
 //! - Everything about the via drag except the handles `startDragVia`
 //!   stores: `findViaFanoutByHandle` (`:267`), `dragViaMarkObstacles`
 //!   (`:452`), `dragViaWalkaround` (`:492`) and `propagateViaForces`
 //!   (`:62`), step 9.
-//! - The session facade (`ROUTER::StartDragging`,
-//!   `pcbnew/router/pns_router.cpp:166`), the event log and the KiCad
-//!   corpus replay, step 4. Nothing in `src/router.rs` reaches a
-//!   [`Dragger`] yet.
+//!
+//! # Why the post drag optimizer has no caller here
+//!
+//! Note 06 section 2.14 opens with "`optimizeAndUpdateDraggedLine` is
+//! where every successful drag ends, in all three modes". That is wrong
+//! against the source: its five call sites are `:553` (`dragViaWalkaround`),
+//! `:757` and `:786` (`dragWalkaround`) and `:857` and `:900`
+//! (`dragShove`). `dragMarkObstacles` (`:381` to `:449`) never optimizes,
+//! which the note itself says two sections later and which is what makes
+//! a mark obstacles drag follow the cursor exactly.
+//!
+//! So the three routines below are built now, because every later step's
+//! geometry ends in them, and they stay unreachable until step 6 wires
+//! `dragWalkaround` up. The `#[expect(dead_code)]` on
+//! `Dragger::optimize_and_update_dragged_line` says exactly that, and the
+//! expectation itself becomes a warning the day the first caller lands,
+//! so it cannot be forgotten. Only the two anchor helpers have unit
+//! tests; the routine itself lands untested, because a test would make it
+//! live in the test build alone and turn that expectation into noise.
 //!
 //! # What is not ported at all
 //!
@@ -86,12 +101,16 @@
 
 use crate::algo_base::AlgoContext;
 use crate::collide::CollisionSearchOptions;
-use crate::geometry::direction45::Direction45;
+use crate::geometry::box2::Box2;
+use crate::geometry::direction45::{AngleType, Direction45};
+use crate::geometry::line_chain::LineChain;
+use crate::geometry::seg::Seg;
 use crate::geometry::vec2::Vec2;
 use crate::item::{ItemBody, ItemId, Kind, MarkerFlags, NetId};
 use crate::line::Line;
 use crate::mouse_trail::MouseTrailTracer;
 use crate::node::{NodeId, World};
+use crate::optimizer::{EffortFlags, Optimizer};
 use crate::settings::RouterMode;
 use crate::shove::{Shove, ViaHandle};
 
@@ -846,6 +865,123 @@ impl Dragger {
     self.drag_mark_obstacles(world, context, at)
   }
 
+  /// Optimize the line a drag produced and put it in the drag node.
+  ///
+  /// Port of `optimizeAndUpdateDraggedLine` (`:569`), the tail every
+  /// walkaround and shove drag ends with. `original` is the line the drag
+  /// started from and `at` is the cursor point.
+  ///
+  /// Four things it does that are easy to get wrong.
+  ///
+  /// 1. The effort level is [`EffortFlags::MERGE_SEGMENTS`] plus
+  ///    [`EffortFlags::MERGE_COLINEAR`] when
+  ///    [`crate::settings::RoutingSettings::smooth_dragged_segments`] is
+  ///    set (`:580`). `REQUIRE_OBTUSE_ANGLES` (`:583`) has no counterpart
+  ///    in [`Optimizer`] yet; it is step 7 of note 06 section 10.2, and
+  ///    three of the seven corpus drag cases need it.
+  /// 2. [`Optimizer::set_preserve_vertex`] turns
+  ///    [`EffortFlags::PRESERVE_VERTEX`] on by itself, in KiCad as here,
+  ///    which is why the effort level above never names it.
+  /// 3. The preserved vertex is the cursor point when the line already
+  ///    passes through it and [`best_anchor_for_point`] otherwise
+  ///    (`:590`), and the chain is split there (`:594`) so the vertex
+  ///    exists to be preserved.
+  /// 4. With
+  ///    [`crate::settings::RoutingSettings::optimize_entire_dragged_track`]
+  ///    false the optimizer is confined to
+  ///    [`Line::changed_area`], and to a **zero size** box at the cursor
+  ///    when there is no changed area, whose comment says "No valid area
+  ///    yet? set to minimum to disable optimization" (`:603`).
+  ///
+  /// # Erratum E5 is transcribed, not repaired
+  ///
+  /// `:617` clears `m_draggedItems` and `:618` puts the optimized line in
+  /// alone. Note 06 erratum E5 shows what that costs a via drag:
+  /// `dragViaWalkaround` adds the dragged via (`:511`) and every clear
+  /// fanout line (`:557`) first, and the first line that needs a
+  /// walkaround wipes all of it. The note proposes adding rather than
+  /// replacing and clearing at the top of `dragViaWalkaround` instead.
+  /// That repair belongs to step 9, where the via path is written and its
+  /// only observable consequence, [`Dragger::traces`] under-reporting,
+  /// can be tested; until then this is KiCad's line for line.
+  #[expect(
+    dead_code,
+    reason = "the walkaround and shove drags of steps 6 and 8 are its \
+              only callers; see the module documentation"
+  )]
+  fn optimize_and_update_dragged_line(
+    &mut self,
+    world: &mut World,
+    context: &AlgoContext<'_>,
+    dragged: &mut Line,
+    original: &Line,
+    at: Vec2,
+  ) {
+    let Some(last) = self.last_node else {
+      return;
+    };
+
+    // :573, :574. The links are gone before the unmark, so the unmark
+    // only ever clears the line's own bits.
+    dragged.clear_links();
+    dragged.unmark(world, MarkerFlags::ALL);
+
+    // :576
+    let mut optimizer = Optimizer::new(last);
+    // :578
+    let mut effort = EffortFlags::MERGE_SEGMENTS;
+
+    // :580
+    if context.settings.smooth_dragged_segments {
+      effort |= EffortFlags::MERGE_COLINEAR;
+    }
+
+    // :583. TODO(step 7): `Settings().GetRestrictAngles()` adds
+    // `OPTIMIZER::REQUIRE_OBTUSE_ANGLES`, which needs
+    // `Constraint::ObtuseOnly` and `Optimizer::drag_fix_corners`
+    // (`pcbnew/router/pns_optimizer.cpp:305`, `:738`, `:801`); the
+    // placeholder comment is already at `src/optimizer.rs`'s `:709`.
+
+    optimizer.set_effort_level(effort);
+
+    // :588, :590
+    let anchor = if dragged.shape().find(at, 0).is_some() {
+      at
+    } else {
+      best_anchor_for_point(dragged.shape(), at)
+    };
+
+    // :593, :594
+    optimizer.set_preserve_vertex(anchor);
+    dragged.chain_mut().split(anchor);
+
+    // :598
+    if !context.settings.optimize_entire_dragged_track {
+      // :600, :603
+      let area = dragged
+        .changed_area(original)
+        .unwrap_or_else(|| Box2::from_vec2(at));
+
+      // :607. KiCad passes `SetRestrictArea`'s `true` default, which
+      // does nothing either way; see `Optimizer::set_restrict_area`.
+      optimizer.set_restrict_area(area, true);
+    }
+
+    // :612
+    let mut post_opt = Line::new();
+
+    optimizer.optimize(world, context, dragged, &mut post_opt, Some(original));
+
+    // :613. The caller's line takes the optimized shape without the
+    // links the addition below hands out.
+    *dragged = post_opt.clone();
+
+    // :616 to :618
+    world.add_line(last, &mut post_opt, false);
+    self.dragged_items.clear();
+    self.dragged_items.push(post_opt);
+  }
+
   /// How far a dragged corner may snap onto the line's own neighbours.
   ///
   /// The `Settings().SmoothDraggedSegments() ? width / N : 0` the three
@@ -883,34 +1019,55 @@ impl Dragger {
   /// through the walkaround or the shove again, can itself fail, and
   /// appends another point to the mouse trail.
   ///
-  /// This calls [`World::commit`] where KiCad calls
-  /// `ROUTER::CommitRouting`; the host half of that, the removed plus
-  /// added fold that preserves object identity, belongs to the session
-  /// facade and arrives with step 4.
+  /// KiCad's `FixRoute` reaches back into `ROUTER::CommitRouting( node )`
+  /// through the dragger's router pointer. There is no such pointer here
+  /// (`DESIGN.md` section 8), and the facade has to build its host facing
+  /// diff **before** the node is folded away, so the routine is split:
+  /// [`Dragger::fix_route_node`] is everything up to the commit and
+  /// answers which node to commit, and this is the whole of it for a
+  /// caller that only wants the world updated.
   pub fn fix_route(
     &mut self,
     world: &mut World,
     context: &AlgoContext<'_>,
     force_commit: bool,
   ) -> bool {
+    match self.fix_route_node(world, context, force_commit) {
+      Some(node) => {
+        world.commit(node);
+
+        true
+      }
+      None => false,
+    }
+  }
+
+  /// Which node a fix would commit, or [`None`] when it refuses.
+  ///
+  /// The decision half of [`Dragger::fix_route`], which is
+  /// `DRAGGER::FixRoute` (`:957`) with the three
+  /// `Router()->CommitRouting( node )` calls replaced by the node they
+  /// were given. Nothing is committed here, so a caller may still read
+  /// the delta off the answer.
+  ///
+  /// The re-drag of the last branch (`:983`) does happen, because it is
+  /// what makes the answer legal; only the commit is deferred.
+  pub fn fix_route_node(
+    &mut self,
+    world: &mut World,
+    context: &AlgoContext<'_>,
+    force_commit: bool,
+  ) -> Option<NodeId> {
     let node = self.current_node();
 
     // :963
     if self.drag_status {
-      world.commit(node);
-
-      return true;
+      return Some(node);
     }
 
     // :968
     if self.force_mark_obstacles_mode {
-      if force_commit {
-        world.commit(node);
-
-        return true;
-      }
-
-      return false;
+      return force_commit.then_some(node);
     }
 
     // :983. Everything already committed is legal even when the current
@@ -920,14 +1077,101 @@ impl Dragger {
 
     self.drag(world, context, at);
 
-    if self.drag_status {
-      world.commit(self.current_node());
+    self.drag_status.then(|| self.current_node())
+  }
+}
 
-      return true;
+// ---------------------------------------------------------------------
+// The post drag anchor
+// ---------------------------------------------------------------------
+
+/// Whether the two segments meeting at a vertex make a corner the post
+/// drag optimizer must not be asked to preserve.
+///
+/// Port of `pointHasBadCorner` (`:622`). A corner is bad when the angle
+/// between the two directions is acute, right or a full reversal; an
+/// endpoint is never bad (`:624`).
+///
+/// `DIRECTION_45( seg )` is built with the default `a90 = false` (`:629`,
+/// `:630`), so a 90 degree corner classifies as
+/// [`AngleType::RIGHT`] and not as straight.
+fn point_has_bad_corner(chain: &LineChain, vertex_index: usize) -> bool {
+  // :624
+  if vertex_index == 0 || vertex_index + 1 >= chain.point_count() {
+    return false;
+  }
+
+  // :626, :627
+  let before =
+    Seg::new(chain.point(vertex_index - 1), chain.point(vertex_index));
+  let after =
+    Seg::new(chain.point(vertex_index), chain.point(vertex_index + 1));
+
+  // :633
+  Direction45::from_seg(&before, false)
+    .angle(Direction45::from_seg(&after, false))
+    .intersects(AngleType::ACUTE | AngleType::RIGHT | AngleType::HALF_FULL)
+}
+
+/// The vertex the post drag optimizer should preserve for a cursor point
+/// that is not on the line.
+///
+/// Port of `bestAnchorForPoint` (`:639`): the nearest point of the chain,
+/// unless that lands on a vertex with a bad corner, in which case the
+/// walk steps outwards one vertex at a time and takes the first good one,
+/// preferring the nearer of the left and the right candidate.
+///
+/// Two details decide the answer. The comparison at `:664` is on
+/// **squared** distances, so no rounding is involved, and a tie goes to
+/// the right candidate, because the left one only wins on a strict `<`.
+/// When the walk finds nothing, the bad nearest point is used after all
+/// (`:681`).
+fn best_anchor_for_point(chain: &LineChain, at: Vec2) -> Vec2 {
+  // :641, :642
+  let Some(nearest) = chain.nearest_point(at) else {
+    return at;
+  };
+  let Some(vertex_index) = chain.find(nearest, 0) else {
+    return nearest;
+  };
+
+  // :644
+  if !point_has_bad_corner(chain, vertex_index) {
+    return nearest;
+  }
+
+  let point_count = chain.point_count();
+
+  // :650
+  for offset in 1..point_count {
+    // :652, :655
+    let right = (vertex_index + offset < point_count
+      && !point_has_bad_corner(chain, vertex_index + offset))
+    .then(|| chain.point(vertex_index + offset));
+
+    // :658
+    if let Some(left_index) = vertex_index.checked_sub(offset)
+      && !point_has_bad_corner(chain, left_index)
+    {
+      let left = chain.point(left_index);
+
+      // :664
+      if right.is_none_or(|right| {
+        (left - at).squared_euclidean_norm()
+          < (right - at).squared_euclidean_norm()
+      }) {
+        return left;
+      }
     }
 
-    false
+    // :672
+    if let Some(right) = right {
+      return right;
+    }
   }
+
+  // :681
+  nearest
 }
 
 #[cfg(test)]
@@ -982,6 +1226,120 @@ mod tests {
     assert_eq!(
       dragger.snap_threshold(&context, MARK_OBSTACLES_SNAP_DIVISOR),
       0
+    );
+  }
+
+  /// A chain out of its points.
+  fn chain_of(points: &[Vec2]) -> LineChain {
+    let mut chain = LineChain::new();
+
+    for point in points {
+      chain.append(*point);
+    }
+
+    chain
+  }
+
+  /// A right angled elbow with an obtuse corner past it: `A` and `D` are
+  /// endpoints, `B` is the bad corner and `C` is a good one.
+  fn elbow() -> LineChain {
+    chain_of(&[
+      Vec2::new(0, 0),
+      Vec2::new(200_000, 0),
+      Vec2::new(200_000, 1_000_000),
+      Vec2::new(1_200_000, 2_000_000),
+    ])
+  }
+
+  #[test]
+  fn an_endpoint_is_never_a_bad_corner() {
+    // `:624`, which is what stops the walk of `bestAnchorForPoint` from
+    // running off either end.
+    let chain = elbow();
+
+    assert!(!point_has_bad_corner(&chain, 0));
+    assert!(!point_has_bad_corner(&chain, chain.point_count() - 1));
+    assert!(!point_has_bad_corner(&chain, chain.point_count()));
+  }
+
+  #[test]
+  fn a_right_angle_is_a_bad_corner_and_an_obtuse_one_is_not() {
+    // `DIRECTION_45( seg )` takes the default `a90 = false` (`:629`), so
+    // 90 degrees classifies as `ANG_RIGHT` and lands in the mask at
+    // `:633`; one octant apart is `ANG_OBTUSE` and does not.
+    let chain = elbow();
+
+    assert!(point_has_bad_corner(&chain, 1));
+    assert!(!point_has_bad_corner(&chain, 2));
+  }
+
+  #[test]
+  fn a_straight_run_is_not_a_bad_corner_and_a_reversal_is() {
+    // `ANG_STRAIGHT` is outside the mask, `ANG_HALF_FULL` inside it.
+    let straight = chain_of(&[
+      Vec2::new(0, 0),
+      Vec2::new(1_000_000, 0),
+      Vec2::new(2_000_000, 0),
+    ]);
+    let reversal = chain_of(&[
+      Vec2::new(0, 0),
+      Vec2::new(1_000_000, 0),
+      Vec2::new(500_000, 0),
+    ]);
+
+    assert!(!point_has_bad_corner(&straight, 1));
+    assert!(point_has_bad_corner(&reversal, 1));
+  }
+
+  #[test]
+  fn an_anchor_on_a_good_line_is_just_the_nearest_point() {
+    // The early return at `:644`, taken both when the nearest point is
+    // not a vertex at all and when it is a good one.
+    let chain = chain_of(&[
+      Vec2::new(0, 0),
+      Vec2::new(1_000_000, 0),
+      Vec2::new(2_000_000, 1_000_000),
+    ]);
+
+    assert_eq!(
+      best_anchor_for_point(&chain, Vec2::new(500_000, 400_000)),
+      Vec2::new(500_000, 0)
+    );
+    assert_eq!(
+      best_anchor_for_point(&chain, Vec2::new(1_100_000, -100_000)),
+      Vec2::new(1_000_000, 0)
+    );
+  }
+
+  #[test]
+  fn an_anchor_on_a_bad_corner_walks_out_to_the_nearer_good_vertex() {
+    // `:658` to `:670`: the left candidate wins on a strict `<` of the
+    // squared distances, so a nearer left vertex is taken.
+    let chain = elbow();
+    let at = Vec2::new(300_000, -100_000);
+
+    // The nearest point is the bad corner itself.
+    assert_eq!(chain.nearest_point(at), Some(Vec2::new(200_000, 0)));
+    assert_eq!(best_anchor_for_point(&chain, at), Vec2::new(0, 0));
+  }
+
+  #[test]
+  fn an_anchor_walk_that_ties_goes_to_the_right_candidate() {
+    // `:664` compares **squared** distances with `<`, so an exact tie
+    // falls through to the right candidate at `:672`.
+    let chain = chain_of(&[
+      Vec2::new(0, 0),
+      Vec2::new(1_000_000, 0),
+      Vec2::new(1_000_000, 1_000_000),
+      Vec2::new(2_000_000, 2_000_000),
+    ]);
+    let at = Vec2::new(1_100_000, -100_000);
+
+    assert_eq!(chain.nearest_point(at), Some(Vec2::new(1_000_000, 0)));
+    assert!(point_has_bad_corner(&chain, 1));
+    assert_eq!(
+      best_anchor_for_point(&chain, at),
+      Vec2::new(1_000_000, 1_000_000)
     );
   }
 

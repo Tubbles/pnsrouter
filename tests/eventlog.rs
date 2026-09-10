@@ -126,6 +126,51 @@ fn board() -> WorldSnapshot {
   snapshot
 }
 
+/// The three host objects the drag session's trace is made of.
+const TRACE_SEGMENTS: [HostId; 3] = [HostId(10), HostId(11), HostId(12)];
+
+/// The corners of that trace, in order.
+///
+/// Three segments due east on layer 0, with a middle one long enough to
+/// survive a sideways drag without collapsing into a corner.
+const DRAGGED_TRACE: [Vec2; 4] = [
+  Vec2::new(0, 3_000_000),
+  Vec2::new(1_000_000, 3_000_000),
+  Vec2::new(3_000_000, 3_000_000),
+  Vec2::new(4_000_000, 3_000_000),
+];
+
+/// Where the drag grabs the trace: the middle of its middle segment, more
+/// than half a track width from either end, so `startDragSegment`
+/// (`pcbnew/router/pns_dragger.cpp:128`) resolves it to a segment drag.
+const DRAG_GRAB: Vec2 = Vec2::new(2_000_000, 3_000_000);
+
+/// Where the drag lets go, clear of everything on the board.
+const DRAG_RELEASE: Vec2 = Vec2::new(2_000_000, 2_000_000);
+
+/// A board with one three segment trace and nothing else.
+///
+/// Separate from [`board`] on purpose: the golden fixture
+/// `two_layer_via.txt` carries [`board`] inside it, so adding an item
+/// there would rewrite a stored golden.
+fn drag_board() -> WorldSnapshot {
+  let mut snapshot = WorldSnapshot::new(2, World::DEFAULT_MAX_CLEARANCE);
+
+  for (host, pair) in TRACE_SEGMENTS.iter().zip(DRAGGED_TRACE.windows(2)) {
+    snapshot.items.push(WorldItem::new(
+      *host,
+      TRACE_NET,
+      LayerRange::single(0),
+      WorldGeometry::Segment {
+        seg: Seg::new(pair[0], pair[1]),
+        width: TRACK_WIDTH,
+      },
+    ));
+  }
+
+  snapshot
+}
+
 /// The sizes every scenario places with.
 fn sizes() -> Sizes {
   let mut sizes = Sizes {
@@ -233,6 +278,74 @@ fn a_recorded_session_replays_to_the_commit_it_made() {
   let recording = record_two_layer_via();
 
   assert_eq!(recording.results.len(), 1);
+  assert_replay_matches(&recording, rules);
+}
+
+/// A drag replays to the commit it made, and survives the text form.
+///
+/// The drag half of `DESIGN.md` section 8: `start_dragging`, two moves
+/// and a fix are inputs like any other, so a recorded drag is a pure
+/// function of (snapshot, settings, events) too. It runs in
+/// [`RouterMode::MarkObstacles`], which is the only drag path
+/// `src/dragger.rs` has: the walkaround and the shove drags fall back to
+/// it, so asking for one of those would assert on a stub.
+#[test]
+fn a_recorded_drag_replays_to_the_commit_it_made() {
+  let snapshot = drag_board();
+  let drag_settings = RoutingSettings {
+    mode: RouterMode::MarkObstacles,
+    ..RoutingSettings::default()
+  };
+  let mut router = Router::new(&snapshot, rules(), drag_settings, sizes());
+
+  router.start_recording(&snapshot);
+  router
+    .start_dragging(DRAG_GRAB, &[TRACE_SEGMENTS[1]], false)
+    .expect("the middle segment of a trace is draggable");
+  router.move_to(Vec2::new(2_000_000, 2_500_000), None);
+  router.move_to(DRAG_RELEASE, None);
+
+  let FixOutcome::Finished(diff) = router.fix_route(DRAG_RELEASE, None, false)
+  else {
+    panic!("a clear drag refused to commit");
+  };
+
+  // The whole assembled line goes out and the dragged one comes back, so
+  // the commit accounts for all three host objects. One of them survives
+  // as an update, because the remove plus add fold pairs on
+  // `GetSourceItem` and every segment `World::add_line` creates inherits
+  // the one source the assembled line carried
+  // (`pcbnew/router/pns_router.cpp:874`).
+  assert_eq!(
+    diff.removed.len() + diff.updated.len(),
+    TRACE_SEGMENTS.len(),
+    "the commit is {diff:?}"
+  );
+  assert_eq!(diff.updated.len(), 1, "the commit is {diff:?}");
+  assert!(
+    diff.added.len() + diff.updated.len() > TRACE_SEGMENTS.len(),
+    "the sideways drag added no corner: {diff:?}"
+  );
+
+  let recording = router.take_recording().expect("a recorder is installed");
+
+  assert_eq!(
+    recording.events.first(),
+    Some(&SessionEvent::StartDragging {
+      at: DRAG_GRAB,
+      items: vec![TRACE_SEGMENTS[1]],
+      free_angle: false,
+    })
+  );
+  assert_eq!(recording.results.len(), 1);
+
+  let text = recording.to_text();
+
+  assert_eq!(
+    SessionRecording::from_text(&text),
+    Ok(recording.clone()),
+    "{text}"
+  );
   assert_replay_matches(&recording, rules);
 }
 

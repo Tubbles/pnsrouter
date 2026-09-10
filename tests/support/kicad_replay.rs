@@ -30,11 +30,14 @@
 //!   copper layer the reader recorded for that object, because the layer
 //!   span of every snapshot item is built from exactly that field; taking
 //!   it from the board keeps the resolution out of the facade.
-//! - **Dragging is refused.** The crate has no dragger yet
-//!   (`PLAN.md` milestone 8), so `EVT_START_DRAG` and
-//!   `EVT_START_MULTIDRAG` become
-//!   [`EventOutcome::Unsupported`] and the session never starts. Seven of
-//!   the eleven cases in the corpus are drags.
+//! - **Multi dragging is refused.** `EVT_START_DRAG` replays through
+//!   [`Router::start_dragging`], with the event's uuids mapped to host
+//!   ids exactly as `EVT_START_ROUTE` maps its first one, and the drag
+//!   mode of literal `0` KiCad's player passes (`:169`) becoming
+//!   `free_angle = false`, which is the only bit that mask ever carried
+//!   (note 06 erratum E2). `EVT_START_MULTIDRAG` needs `MULTI_DRAGGER`,
+//!   which is not ported, so it stays
+//!   [`EventOutcome::Unsupported`]; no case in the corpus emits one.
 //!
 //! `EVT_FIX` passes `force_finish = false`, which is KiCad's third
 //! argument at `:188`, so a fix is terminal only when the placer says the
@@ -196,7 +199,8 @@ impl LoadedCase {
 
   /// Whether every event of the log is one this harness can replay.
   ///
-  /// False for the seven drag cases; see the module documentation.
+  /// True for every case in the corpus today; see the module
+  /// documentation for the two kinds that are not replayable.
   pub fn is_replayable(&self) -> bool {
     self
       .log
@@ -316,11 +320,17 @@ pub enum EventOutcome {
     /// The layer the placement runs on.
     layer: i32,
   },
-  /// `EVT_START_ROUTE` was refused. The text is
+  /// `EVT_START_ROUTE` or `EVT_START_DRAG` was refused. The text is
   /// [`pnsrouter::router::StartError`] as it came back.
   StartRefused {
     /// Why the facade said no.
     reason: String,
+  },
+  /// `EVT_START_DRAG` started a drag on this copper layer.
+  DragStarted {
+    /// The layer the dragged object lives on, which the dragger picks up
+    /// from the object rather than from the event.
+    layer: i32,
   },
   /// `EVT_MOVE`.
   Moved,
@@ -457,6 +467,7 @@ impl ReplayReport {
   /// How many events came back with each broad outcome, for a message.
   pub fn outcome_summary(&self) -> String {
     let mut started = 0;
+    let mut dragged = 0;
     let mut refused = 0;
     let mut moved = 0;
     let mut fixed = 0;
@@ -469,6 +480,7 @@ impl ReplayReport {
     for outcome in &self.outcomes {
       match outcome {
         EventOutcome::Started { .. } => started += 1,
+        EventOutcome::DragStarted { .. } => dragged += 1,
         EventOutcome::StartRefused { .. } => refused += 1,
         EventOutcome::Moved => moved += 1,
         EventOutcome::Fixed { finished: done } => {
@@ -483,9 +495,10 @@ impl ReplayReport {
     }
 
     format!(
-      "{started} started, {refused} refused, {moved} moved, {fixed} fixed \
-       ({finished} terminal), {unfixed} unfixed, {toggled} via toggles, \
-       {ignored} ignored, {unsupported} unsupported"
+      "{started} started, {dragged} drags started, {refused} refused, \
+       {moved} moved, {fixed} fixed ({finished} terminal), {unfixed} \
+       unfixed, {toggled} via toggles, {ignored} ignored, {unsupported} \
+       unsupported"
     )
   }
 }
@@ -626,6 +639,25 @@ fn replay_event(
         reason: format!("{error:?}"),
       },
     },
+    // :169. Every uuid the event names, not only the first: KiCad hands
+    // `StartDragging` the whole `ritems` set and lets it pick the
+    // algorithm from the shape of it
+    // (`pcbnew/router/pns_router.cpp:176`). The drag mode is a literal
+    // `0` there, whose only live bit would have been `DM_FREE_ANGLE`.
+    EventKind::StartDrag => {
+      let items: Vec<pnsrouter::item::HostId> = event
+        .uuids
+        .iter()
+        .filter_map(|uuid| host_map.host_of_uuid(uuid))
+        .collect();
+
+      match router.start_dragging(at, &items, false) {
+        Ok(_frame) => EventOutcome::DragStarted { layer },
+        Err(error) => EventOutcome::StartRefused {
+          reason: format!("{error:?}"),
+        },
+      }
+    }
     // :203
     EventKind::Move => {
       if router.routing_in_progress() {
@@ -670,7 +702,7 @@ fn replay_event(
       }
     }
     // Refused above.
-    EventKind::StartDrag | EventKind::StartMultiDrag | EventKind::Abort => {
+    EventKind::StartMultiDrag | EventKind::Abort => {
       EventOutcome::Unsupported { kind: event.kind }
     }
   }
@@ -678,18 +710,19 @@ fn replay_event(
 
 /// Whether this harness can replay an event kind at all.
 ///
-/// [`None`] for the two drag events, which need milestone 8, and for
-/// `EVT_ABORT`, which KiCad declares and never emits
+/// [`None`] for `EVT_START_MULTIDRAG`, which needs `MULTI_DRAGGER`, and
+/// for `EVT_ABORT`, which KiCad declares and never emits
 /// (`pcbnew/router/pns_logger.h:65`) and whose meaning is therefore
-/// unpinned.
+/// unpinned. No case in the corpus holds either.
 pub const fn supported(kind: EventKind) -> Option<EventKind> {
   match kind {
     EventKind::StartRoute
+    | EventKind::StartDrag
     | EventKind::Move
     | EventKind::Fix
     | EventKind::Unfix
     | EventKind::ToggleVia => Some(kind),
-    EventKind::StartDrag | EventKind::StartMultiDrag | EventKind::Abort => None,
+    EventKind::StartMultiDrag | EventKind::Abort => None,
   }
 }
 

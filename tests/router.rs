@@ -13,7 +13,8 @@
 //! The board is the two layer fixture of `tests/placer.rs` re expressed
 //! as a snapshot, with an existing track and an existing via added so
 //! that the sync of `src/snapshot.rs` is exercised on every item kind a
-//! LibrePCB board holds.
+//! LibrePCB board holds. That existing track is also what the drag
+//! scenarios at the end grab.
 
 #![forbid(unsafe_code)]
 
@@ -740,4 +741,164 @@ fn two_identical_sessions_produce_the_same_diff_and_the_same_frames() {
   assert_eq!(first_diff, second_diff);
   assert_eq!(first_frames, second_frames);
   assert!(added_segments(&first_diff) >= 2, "{first_diff:?}");
+}
+
+// ---------------------------------------------------------------------
+// Dragging
+// ---------------------------------------------------------------------
+//
+// Every scenario runs in `RouterMode::MarkObstacles`, which is the one
+// drag path `src/dragger.rs` has: `dragWalkaround` and `dragShove` are
+// steps 6 and 8 of `doc/reference/kicad/06-dragger.md` section 10.2 and
+// fall back to it, so asking for one of those would assert on a stub.
+
+/// Where a drag of [`EXISTING_TRACK`] lets go, clear of everything.
+const DRAG_RELEASE: Vec2 = Vec2::new(2_000_000, 5_000_000);
+
+/// A router with a drag of [`EXISTING_TRACK`] already started.
+fn dragging() -> Router {
+  let mut router = router_in(RouterMode::MarkObstacles);
+
+  router
+    .start_dragging(TRACK_MIDDLE, &[EXISTING_TRACK], false)
+    .expect("the middle of an existing track is draggable");
+  router
+}
+
+#[test]
+fn a_drag_enters_the_drag_state_and_answers_for_the_dragged_track() {
+  let router = dragging();
+
+  assert_eq!(router.state(), RouterState::DragSegment);
+  assert!(router.routing_in_progress());
+  assert_eq!(router.current_net(), SPLIT_NET);
+  assert_eq!(router.current_layer(), Some(0));
+  // `DRAGGER::CurrentNode` is the untouched board before the first drag
+  // (`pcbnew/router/pns_dragger.cpp:1052`), so nothing is pending yet.
+  assert_eq!(router.pending_update().added.len(), 0);
+}
+
+#[test]
+fn a_drag_move_reports_the_new_geometry_as_settled_and_hides_the_old() {
+  let mut router = dragging();
+  let frame = router.move_to(DRAG_RELEASE, None);
+
+  // `moveDragging` sets no `PNS_HEAD_TRACE`
+  // (`pcbnew/router/pns_router.cpp:656`), so the dragged trace arrives as
+  // an ordinary added item of the node delta.
+  assert!(
+    head_of(&frame).is_none(),
+    "a drag drew a head trace: {frame:?}"
+  );
+  assert!(frame.items.len() > 1, "the drag drew {:?}", frame.items);
+  assert!(frame.via.is_none());
+  assert!(frame.ratline.is_none());
+  assert_eq!(frame.hidden, vec![EXISTING_TRACK]);
+
+  let pending = router.pending_update();
+
+  assert_eq!(pending.removed, vec![EXISTING_TRACK]);
+  assert!(
+    pending.added.len() > 1,
+    "the drag added {:?}",
+    pending.added
+  );
+}
+
+#[test]
+fn a_clear_drag_commits_the_track_it_moved() {
+  let mut router = dragging();
+
+  router.move_to(DRAG_RELEASE, None);
+
+  let FixOutcome::Finished(diff) = router.fix_route(DRAG_RELEASE, None, false)
+  else {
+    panic!("a clear drag refused to commit");
+  };
+
+  assert_eq!(router.state(), RouterState::Idle);
+  assert!(!router.routing_in_progress());
+  assert_eq!(
+    diff.added.len() + diff.updated.len(),
+    committed_segments(&router, SPLIT_NET)
+  );
+  assert!(
+    committed_segments(&router, SPLIT_NET) > 1,
+    "the sideways drag left the track straight"
+  );
+}
+
+#[test]
+fn stopping_a_drag_leaves_the_board_alone() {
+  // `ROUTER::CommitRouting()` commits only in `ROUTE_TRACK` (`:960`) and
+  // `StopRouting` only tears down (`:967`), so only a fix commits a drag.
+  let mut router = dragging();
+
+  router.move_to(DRAG_RELEASE, None);
+
+  assert_eq!(router.stop_routing(), CommitDiff::default());
+  assert_eq!(router.state(), RouterState::Idle);
+  assert_eq!(committed_segments(&router, SPLIT_NET), 1);
+}
+
+#[test]
+fn aborting_a_drag_leaves_the_board_alone_too() {
+  let mut router = dragging();
+
+  router.move_to(DRAG_RELEASE, None);
+  router.abort_routing();
+
+  assert_eq!(router.state(), RouterState::Idle);
+  assert_eq!(committed_segments(&router, SPLIT_NET), 1);
+  assert_eq!(router.pending_update().added.len(), 0);
+}
+
+#[test]
+fn a_drag_of_nothing_or_of_several_objects_is_refused() {
+  // `pcbnew/router/pns_router.cpp:171` refuses an empty set; `:182` sends
+  // more than one segment to `MULTI_DRAGGER`, which is not ported.
+  let mut router = router_in(RouterMode::MarkObstacles);
+
+  assert_eq!(
+    router.start_dragging(TRACK_MIDDLE, &[], false),
+    Err(StartError::NothingToDrag)
+  );
+  assert_eq!(
+    router.start_dragging(TRACK_MIDDLE, &[EXISTING_TRACK, EXISTING_VIA], false),
+    Err(StartError::MultiDragUnsupported)
+  );
+  assert_eq!(router.state(), RouterState::Idle);
+}
+
+#[test]
+fn a_drag_of_a_pad_or_of_an_unknown_object_is_refused() {
+  let mut router = router_in(RouterMode::MarkObstacles);
+
+  // The `default:` of `DRAGGER::Start`
+  // (`pcbnew/router/pns_dragger.cpp:355`), which is how a lone pad handed
+  // to a `DRAGGER` bows out.
+  assert!(matches!(
+    router.start_dragging(START, &[START_PAD], false),
+    Err(StartError::NotDraggable(_))
+  ));
+  assert_eq!(
+    router.start_dragging(START, &[HostId(99)], false),
+    Err(StartError::UnknownStartItem(HostId(99)))
+  );
+  assert_eq!(router.state(), RouterState::Idle);
+}
+
+#[test]
+fn a_drag_cannot_start_while_a_route_is_running() {
+  let mut router = router_in(RouterMode::MarkObstacles);
+
+  router
+    .start_routing(START, Some(START_PAD), 0)
+    .expect("the start pad is routable");
+
+  assert_eq!(
+    router.start_dragging(TRACK_MIDDLE, &[EXISTING_TRACK], false),
+    Err(StartError::AlreadyRouting)
+  );
+  assert_eq!(router.state(), RouterState::RouteTrack);
 }

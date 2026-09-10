@@ -153,6 +153,27 @@ pub enum SessionEvent {
     layer: i32,
   },
 
+  /// [`Router::start_dragging`]. `EVT_START_DRAG` and
+  /// `EVT_START_MULTIDRAG`, `pcbnew/router/pns_router.cpp:204`, `:206`.
+  ///
+  /// One variant rather than two: KiCad splits on the item count at the
+  /// logging site only, and a reader can split the same way.
+  ///
+  /// `free_angle` is in no KiCad log, which is why a free angle session
+  /// cannot be replayed there. It is the one input bit `DRAGGER::Start`
+  /// reads out of the drag mode mask
+  /// (`pcbnew/router/pns_dragger.cpp:314`, note 06 erratum E2), so
+  /// recording it costs one boolean and buys a replayable free angle
+  /// drag.
+  StartDragging {
+    /// The snapped point the drag starts at.
+    at: Vec2,
+    /// The objects the drag grabbed.
+    items: Vec<HostId>,
+    /// Whether the drag ignores the 45 degree regime.
+    free_angle: bool,
+  },
+
   /// [`Router::move_to`]. `EVT_MOVE`,
   /// `pcbnew/router/pns_router.cpp:497`.
   MoveTo {
@@ -471,6 +492,15 @@ fn apply(
   match event {
     SessionEvent::StartRouting { at, start, layer } => {
       if router.start_routing(*at, *start, *layer).is_ok() {
+        *frames_count += 1;
+      }
+    }
+    SessionEvent::StartDragging {
+      at,
+      items,
+      free_angle,
+    } => {
+      if router.start_dragging(*at, items, *free_angle).is_ok() {
         *frames_count += 1;
       }
     }
@@ -994,6 +1024,24 @@ fn event_text(
       vec2_text(*at),
       optional(start.map(|host| host.0))
     ),
+    SessionEvent::StartDragging {
+      at,
+      items,
+      free_angle,
+    } => {
+      let mut text = format!(
+        "event start-dragging {} {} {}",
+        vec2_text(*at),
+        u8::from(*free_angle),
+        items.len()
+      );
+
+      for host in items {
+        text.push_str(&format!(" {}", host.0));
+      }
+
+      text
+    }
     SessionEvent::MoveTo { at, end } => format!(
       "event move-to {} {}",
       vec2_text(*at),
@@ -1088,6 +1136,7 @@ impl SessionRecording {
   ///
   /// ```text
   /// start-routing <x> <y> <start-host> <layer>
+  /// start-dragging <x> <y> <free-angle> <count> <host>...
   /// move-to <x> <y> <end-host>
   /// fix-route <x> <y> <end-host> <force-finish>
   /// finish
@@ -1842,6 +1891,22 @@ fn parse_event(tokens: &mut Tokens<'_>) -> Result<ParsedEvent, ParseError> {
         at,
         start,
         layer: tokens.number("a layer index")?,
+      }
+    }
+    "start-dragging" => {
+      let at = tokens.vec2("a point")?;
+      let free_angle = tokens.flag("a free angle flag")?;
+      let count = tokens.count("an item count", 1)?;
+      let mut items = Vec::with_capacity(count);
+
+      for _ in 0..count {
+        items.push(HostId(tokens.number("a host id")?));
+      }
+
+      SessionEvent::StartDragging {
+        at,
+        items,
+        free_angle,
       }
     }
     "move-to" => {

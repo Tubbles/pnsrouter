@@ -716,7 +716,7 @@ Points that decide behaviour.
 
 ### 2.14 `optimizeAndUpdateDraggedLine`, `bestAnchorForPoint`, `pointHasBadCorner`
 
-`optimizeAndUpdateDraggedLine` (`:569` to `:619`) is where every successful drag ends, in all three modes:
+`optimizeAndUpdateDraggedLine` (`:569` to `:619`) is where a successful **walkaround** or **shove** drag ends. Its five call sites are `:553` (`dragViaWalkaround`), `:757` and `:786` (`dragWalkaround`) and `:857` and `:900` (`dragShove`); `dragMarkObstacles` never calls it, which is what makes a mark obstacles drag follow the cursor exactly and is repeated in section 2.9. An earlier revision of this line said "in all three modes", which was wrong.
 
 ```
 optimizeAndUpdateDraggedLine(aDragged, aOrig, aP):
@@ -1944,7 +1944,7 @@ Ten steps, smallest self contained piece first. Each names what it unlocks; "unl
 
 **Step 4. The session facade and the event log.**
 `Router::start_dragging`, the drag branches of `move_to`, `fix_route` and `pending_update`, `SessionEvent::StartDragging`, `RouterState::DragSegment` actually entered, and the replay harness reading `EVT_START_DRAG` (`tests/support/pns_log.rs` already parses it as `EventKind::StartDrag`).
-*Unlocks: all seven cases at **tier 1** (the session replays, terminates, and leaves nothing that violates the rules). The goldens will not match yet. Also the point at which the seven `#[ignore = "dragging is milestone 8"]` reasons in `tests/kicad_replay.rs:366` to `:411` and the module comment at `:63` to `:66` stop being true twice over: dragging is milestone 9, and the ignore reason changes per case from here on.*
+*Unlocks: all seven cases replaying and terminating. Not the whole of tier 1: with only `dragMarkObstacles` behind them, six of the seven end with the dragged trace lying across something, because that routine only reports what it runs into. The measured numbers are in `doc/work/009-dragging.md`. The goldens will not match yet. Also the point at which the seven `#[ignore = "dragging is milestone 8"]` reasons in `tests/kicad_replay.rs:366` to `:411` and the module comment at `:63` to `:66` stop being true twice over: dragging is milestone 9, and the ignore reason changes per case from here on.*
 
 **Step 5. `optimize_and_update_dragged_line`, `best_anchor_for_point`, `point_has_bad_corner`.**
 `pns_dragger.cpp:569` to `:682`. The optimizer, the preserved vertex and the restricted area. Everything it needs already exists in `src/optimizer.rs`.

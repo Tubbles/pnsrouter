@@ -18,12 +18,14 @@
 //!   (`pcbnew/router/pns_router.cpp:58`) and `ROUTER::GetInstance()` have
 //!   no counterpart; the ambient state travels as
 //!   [`crate::algo_base::AlgoContext`] (`DESIGN.md` section 8).
-//! - **Dragging, the component dragger, differential pairs and the three
-//!   tuning modes.** [`RouterState::DragSegment`] is declared so the
-//!   state machine has KiCad's shape, and nothing ever enters it. The
-//!   placer set is closed by the mode (note 03 section 9.2), so the
-//!   missing modes are missing variants and not missing trait
-//!   implementations.
+//! - **The component dragger, differential pairs and the three tuning
+//!   modes.** The placer set is closed by the mode (note 03 section 9.2),
+//!   so the missing modes are missing variants and not missing trait
+//!   implementations. Dragging is here, through
+//!   [`Router::start_dragging`] and [`RouterState::DragSegment`], as far
+//!   as [`crate::dragger`] has been built; the multi dragger and the
+//!   component dragger are not, so the item set of a drag is refused
+//!   above one item.
 //! - **`GetLastCommittedLeaderSegments`**
 //!   (`pcbnew/router/pns_router.cpp:940`). Note 03 section 1.5 shows it
 //!   is populated only by `MULTI_DRAGGER` and that `LINE_PLACER` never
@@ -58,6 +60,7 @@
 use crate::algo_base::AlgoContext;
 use crate::collide::CollisionSearchOptions;
 use crate::debug::{DebugDecorator, NoDebug};
+use crate::dragger::Dragger;
 use crate::eventlog::{Recorder, SessionEvent, SessionRecording};
 use crate::geometry::direction45::CornerMode;
 use crate::geometry::line_chain::LineChain;
@@ -102,10 +105,14 @@ pub enum RouterState {
   Idle,
   /// A single track placement is running. `ROUTE_TRACK`.
   RouteTrack,
-  /// An existing track is being dragged. `DRAG_SEGMENT`.
+  /// An existing track, corner or via is being dragged. `DRAG_SEGMENT`.
   ///
-  /// Declared so the state machine has KiCad's shape and never entered:
-  /// the dragger is out of scope for this milestone (`PLAN.md`, M8).
+  /// Entered by [`Router::start_dragging`]
+  /// (`pcbnew/router/pns_router.cpp:185`, `:190`). KiCad's
+  /// `DRAG_COMPONENT` has no variant: a component drag needs
+  /// `COMPONENT_DRAGGER`, which `PLAN.md` lists as a non goal, and
+  /// `ROUTER::GetUpdatedItems` does not even report it (note 06 erratum
+  /// E15).
   DragSegment,
 }
 
@@ -150,6 +157,34 @@ pub enum StartError {
   /// Port of the `else` branch of `StartRouting`
   /// (`pcbnew/router/pns_router.cpp:485`).
   PlacerRefused,
+
+  /// A drag was asked for with no object to drag.
+  ///
+  /// Port of `if( aStartItems.Empty() ) return false`
+  /// (`pcbnew/router/pns_router.cpp:171`), the first thing
+  /// `StartDragging` tests.
+  NothingToDrag,
+
+  /// A drag was asked for over more than one object.
+  ///
+  /// KiCad sends those to `MULTI_DRAGGER` or, when every one of them is a
+  /// solid, to `COMPONENT_DRAGGER` (`pcbnew/router/pns_router.cpp:176`,
+  /// `:182`). Neither is ported; note 06 section 9.3 asks for the
+  /// contradiction between `PLAN.md`, which lists multi drag under non
+  /// goals, and `doc/work/009-dragging.md`, which has it as a task, to be
+  /// resolved before either is written. The slice is refused rather than
+  /// silently dragged as its first item, which is what
+  /// [`crate::dragger::Dragger`] alone would do.
+  MultiDragUnsupported,
+
+  /// The object under the drag is not something a drag can move.
+  ///
+  /// Port of the `default:` of `DRAGGER::Start`
+  /// (`pcbnew/router/pns_dragger.cpp:355`), which refuses a solid, a hole
+  /// and anything else that is neither a segment, an arc nor a via, and
+  /// of `startDragArc`'s refusal, which has no counterpart while this
+  /// crate has no arcs.
+  NotDraggable(ItemId),
 }
 
 // ---------------------------------------------------------------------
@@ -532,6 +567,13 @@ pub struct Router {
   /// The single track placer, alive exactly in
   /// [`RouterState::RouteTrack`]. Port of `m_placer` (`:283`).
   placer: Option<LinePlacer>,
+  /// The dragger, alive exactly in [`RouterState::DragSegment`]. Port of
+  /// `m_dragger` (`:284`), which KiCad holds as a
+  /// `std::unique_ptr<DRAG_ALGO>` over three implementations. Note 06
+  /// section 9.3 asks for enum dispatch rather than a trait with one live
+  /// implementation, and with the multi dragger and the component dragger
+  /// both out of scope the enum has one variant, which is this field.
+  dragger: Option<Dragger>,
   /// Which algorithm is running. Port of `m_state` (`:279`).
   state: RouterState,
   /// How many copper layers the board has, from the snapshot.
@@ -584,6 +626,7 @@ impl Router {
       resolver,
       debug: Box::new(NoDebug),
       placer: None,
+      dragger: None,
       state: RouterState::Idle,
       copper_layer_count: snapshot.copper_layer_count,
       committed: Vec::new(),
@@ -762,18 +805,31 @@ impl Router {
     self.state != RouterState::Idle
   }
 
-  /// The layer being routed on. Port of `GetCurrentLayer()`,
-  /// `pcbnew/router/pns_router.cpp:1041`, whose `-1` for "no placer"
-  /// becomes [`None`].
+  /// The layer being routed or dragged on. Port of `GetCurrentLayer()`,
+  /// `pcbnew/router/pns_router.cpp:1041`, whose `-1` for "neither a
+  /// placer nor a dragger" becomes [`None`]. The placer answers first
+  /// there and here, although the two are never both alive.
+  ///
+  /// The dragger's answer is `m_draggedLine.Layer()`, which is wrong in
+  /// [`crate::dragger::DragMode::Via`] and unreachable in KiCad; see
+  /// [`Dragger::current_layer`].
   pub fn current_layer(&self) -> Option<i32> {
-    self.placer.as_ref().and_then(LinePlacer::current_layer)
+    if let Some(placer) = self.placer.as_ref() {
+      return placer.current_layer();
+    }
+
+    self.dragger.as_ref().map(Dragger::current_layer)
   }
 
-  /// The net being routed. Port of `GetCurrentNets()`,
-  /// `pcbnew/router/pns_router.cpp:1031`, which wraps the placer's one
-  /// net in a vector.
+  /// The net being routed or dragged. Port of `GetCurrentNets()`,
+  /// `pcbnew/router/pns_router.cpp:1031`, which wraps the placer's or the
+  /// dragger's one net in a vector.
   pub fn current_net(&self) -> Option<NetId> {
-    self.placer.as_ref().and_then(LinePlacer::current_net)
+    if let Some(placer) = self.placer.as_ref() {
+      return placer.current_net();
+    }
+
+    self.dragger.as_ref().and_then(Dragger::current_nets)
   }
 
   /// Whether the next fix would place a via. Port of `IsPlacingVia()`,
@@ -1047,6 +1103,109 @@ impl Router {
     Ok(self.frame())
   }
 
+  /// Begin dragging an existing object.
+  ///
+  /// Port of `ROUTER::StartDragging( aP, ITEM_SET, aDragMode )`
+  /// (`pcbnew/router/pns_router.cpp:166`). The single item overload
+  /// (`:159`) is a one line forward to this one, and the default drag
+  /// mode differs between the two declarations without either mattering,
+  /// so there is one method here.
+  ///
+  /// # Why `free_angle` and not a mode mask
+  ///
+  /// `DRAGGER::Start` reads exactly one bit out of KiCad's mask,
+  /// `DM_FREE_ANGLE` (`pcbnew/router/pns_dragger.cpp:314`), and then
+  /// `startDragSegment` and `startDragVia` overwrite `m_mode` from the
+  /// clicked item's kind and the click position. `DM_CORNER`,
+  /// `DM_SEGMENT`, `DM_VIA` and `DM_ARC` in the request are therefore
+  /// never consulted, which is note 06 erratum E2 and which is why the
+  /// QA log player passes a plain `0`
+  /// (`qa/tools/pns/pns_log_player.cpp:169`). Read the mode back off
+  /// [`Dragger::mode`] instead.
+  ///
+  /// # Which algorithm the item set picks
+  ///
+  /// KiCad dispatches on the **shape of the set** and not on the mode
+  /// (`:176` to `:190`): all solids means a component drag, more than one
+  /// segment or arc means a multi drag, anything else means a plain drag.
+  /// Only the last is ported, so a slice of more than one object is
+  /// [`StartError::MultiDragUnsupported`] rather than a drag of its first
+  /// item. The slice is still the signature, because the set overload is
+  /// the real one and multi drag will need it.
+  ///
+  /// `GetRuleResolver()->ClearCaches()` (`:174`) has no counterpart: a
+  /// [`RuleResolver`] here owns whatever caching it does and the facade
+  /// never invalidates it.
+  ///
+  /// KiCad's host follows a successful start with a `Move`, so the frame
+  /// returned here is the state of a drag that has not moved yet:
+  /// `CurrentNode()` is still the untouched board
+  /// (`pcbnew/router/pns_dragger.cpp:1052`) and the frame is empty.
+  ///
+  /// # Errors
+  ///
+  /// [`StartError::AlreadyRouting`], [`StartError::NothingToDrag`],
+  /// [`StartError::MultiDragUnsupported`],
+  /// [`StartError::UnknownStartItem`] for an object the snapshot does not
+  /// describe, and [`StartError::NotDraggable`] for one the dragger
+  /// refuses.
+  pub fn start_dragging(
+    &mut self,
+    at: Vec2,
+    items: &[HostId],
+    free_angle: bool,
+  ) -> Result<PreviewFrame, StartError> {
+    self.record(SessionEvent::StartDragging {
+      at,
+      items: items.to_vec(),
+      free_angle,
+    });
+
+    if self.routing_in_progress() {
+      return Err(StartError::AlreadyRouting);
+    }
+
+    // :171
+    let [host] = items else {
+      return Err(if items.is_empty() {
+        StartError::NothingToDrag
+      } else {
+        StartError::MultiDragUnsupported
+      });
+    };
+
+    let root = self.world.root();
+    // A drag names no layer, so any item of that host object will do; the
+    // dragger reads the kind and the geometry off it.
+    let item = self
+      .resolve_host_item(root, at, *host, None)
+      .ok_or(StartError::UnknownStartItem(*host))?;
+
+    // :187, :194. The dragger branches from the **root**, not from a
+    // branch of it, unlike the placer.
+    let mut dragger = Dragger::new(&self.world, root);
+    let context = AlgoContext {
+      resolver: self.resolver.as_ref(),
+      settings: &self.settings,
+      debug: self.debug.as_ref(),
+    };
+
+    // :193
+    dragger.set_free_angle_mode(free_angle);
+
+    // :209
+    if !dragger.start(&mut self.world, &context, at, item) {
+      // :213. KiCad drops the dragger and goes back to `IDLE`; nothing
+      // was assigned here, so there is nothing to undo.
+      return Err(StartError::NotDraggable(item));
+    }
+
+    self.dragger = Some(dragger);
+    self.state = RouterState::DragSegment;
+
+    Ok(self.frame())
+  }
+
   /// Move the end of the route.
   ///
   /// Port of `ROUTER::Move` (`pcbnew/router/pns_router.cpp:494`) through
@@ -1059,22 +1218,45 @@ impl Router {
   /// KiCad's own call sites passes the snapped point (note 05 section
   /// 4.5). An idle router answers with an empty frame, which is the
   /// `default:` branch of `ROUTER::Move` (`:508`).
+  ///
+  /// # The drag branch
+  ///
+  /// `ROUTER::Move` sends [`RouterState::DragSegment`] to `moveDragging`
+  /// (`:504`, `:656`), which erases the view, drags, and calls
+  /// `updateView( m_dragger->CurrentNode(), dragged, true )`. Two things
+  /// differ from the placing branch and both survive into the frame:
+  /// `moveDragging` never sets `PNS_HEAD_TRACE`, so the dragged geometry
+  /// reaches the host as an ordinary added item of the node delta rather
+  /// than as [`PreviewStyle::Head`], and `aEndItem` is accepted and never
+  /// used (note 06 erratum E14). The argument stays in the signature
+  /// because one facade method serves both states and the event log
+  /// records it either way.
   pub fn move_to(&mut self, at: Vec2, end: Option<HostId>) -> PreviewFrame {
     self.record(SessionEvent::MoveTo { at, end });
 
-    if self.state != RouterState::RouteTrack {
-      return PreviewFrame::default();
-    }
-
-    let end_item = self.resolve_end_item(at, end);
     let context = AlgoContext {
       resolver: self.resolver.as_ref(),
       settings: &self.settings,
       debug: self.debug.as_ref(),
     };
 
-    if let Some(placer) = self.placer.as_mut() {
-      placer.move_to(&mut self.world, &context, at, end_item);
+    match self.state {
+      // :508
+      RouterState::Idle => return PreviewFrame::default(),
+      // :501
+      RouterState::RouteTrack => {
+        let end_item = self.resolve_end_item(at, end);
+
+        if let Some(placer) = self.placer.as_mut() {
+          placer.move_to(&mut self.world, &context, at, end_item);
+        }
+      }
+      // :504, :658
+      RouterState::DragSegment => {
+        if let Some(dragger) = self.dragger.as_mut() {
+          dragger.drag(&mut self.world, &context, at);
+        }
+      }
     }
 
     self.frame()
@@ -1083,15 +1265,41 @@ impl Router {
   /// Pin the route down at a point.
   ///
   /// Port of `ROUTER::FixRoute` (`pcbnew/router/pns_router.cpp:915`)
-  /// through its `ROUTE_TRACK` branch, plus the `CommitRouting()` its
+  /// through both of its live branches, plus the `CommitRouting()` its
   /// host performs when the placer reports that the route reached its
-  /// target (note 03 section 1.6). `force_finish` is KiCad's
-  /// `aForceFinish`, which makes the fix terminal wherever it lands
-  /// (`pcbnew/router/pns_line_placer.cpp:1647`); `aForceCommit` is a
-  /// dragger only parameter the placer never sees (`:918`).
+  /// target (note 03 section 1.6).
   ///
   /// An idle router answers `Continue` with an empty frame, which is the
-  /// `default:` branch of `ROUTER::FixRoute` (`:928`).
+  /// `default:` branch of `ROUTER::FixRoute` (`:933`).
+  ///
+  /// # `force_finish` carries KiCad's two flags, because they never meet
+  ///
+  /// KiCad's signature is
+  /// `FixRoute( aP, aEndItem, aForceFinish, aForceCommit )` and the
+  /// switch drops one of the two on each branch: the placer is given
+  /// `aForceFinish` and never sees `aForceCommit` (`:926`), the dragger is
+  /// given `aForceCommit` and never sees `aP`, `aEndItem` or
+  /// `aForceFinish` (`:930`). Note 06 section 9.4 suggests a fourth
+  /// argument; one flag is taken here instead, so that every routing call
+  /// site keeps its three arguments and the recorded
+  /// [`SessionEvent::FixRoute`] and every stored fixture keep their
+  /// shape. There is no state in which both meanings apply, so nothing is
+  /// conflated.
+  ///
+  /// For the placer it is `aForceFinish`, which makes the fix terminal
+  /// wherever it lands (`pcbnew/router/pns_line_placer.cpp:1647`). For
+  /// the dragger it is `aForceCommit`, the Ctrl+click that commits a
+  /// drag the rules refuse, which
+  /// [`crate::dragger::Dragger::fix_route_node`] honours **only** in
+  /// forced mark obstacles mode (note 06 erratum E7).
+  ///
+  /// # A drag fix is always terminal
+  ///
+  /// `DRAGGER::FixRoute` either commits or refuses; there is no "one more
+  /// corner, keep going" for a drag. So the drag branch answers
+  /// [`FixOutcome::Finished`] with the commit, or
+  /// [`FixOutcome::Continue`] with the unchanged frame when the fix was
+  /// refused and the gesture is still running.
   pub fn fix_route(
     &mut self,
     at: Vec2,
@@ -1104,10 +1312,23 @@ impl Router {
       force_finish,
     });
 
-    if self.state != RouterState::RouteTrack {
-      return FixOutcome::Continue(PreviewFrame::default());
+    match self.state {
+      // :933
+      RouterState::Idle => FixOutcome::Continue(PreviewFrame::default()),
+      // :922
+      RouterState::RouteTrack => self.fix_placement(at, end, force_finish),
+      // :928
+      RouterState::DragSegment => self.fix_drag(force_finish),
     }
+  }
 
+  /// The `ROUTE_TRACK` branch of [`Router::fix_route`].
+  fn fix_placement(
+    &mut self,
+    at: Vec2,
+    end: Option<HostId>,
+    force_finish: bool,
+  ) -> FixOutcome {
     let end_item = self.resolve_end_item(at, end);
     let context = AlgoContext {
       resolver: self.resolver.as_ref(),
@@ -1132,6 +1353,30 @@ impl Router {
       FixOutcome::Finished(diff)
     } else {
       FixOutcome::Continue(self.frame())
+    }
+  }
+
+  /// The `DRAG_SEGMENT` branch of [`Router::fix_route`].
+  ///
+  /// `DRAGGER::FixRoute` (`pcbnew/router/pns_dragger.cpp:957`) commits
+  /// through `Router()->CommitRouting( node )`; here the dragger answers
+  /// which node it would commit and the facade does the committing, so
+  /// that the [`CommitDiff`] can be built before the node is folded away.
+  fn fix_drag(&mut self, force_commit: bool) -> FixOutcome {
+    let context = AlgoContext {
+      resolver: self.resolver.as_ref(),
+      settings: &self.settings,
+      debug: self.debug.as_ref(),
+    };
+    let mut node = None;
+
+    if let Some(dragger) = self.dragger.as_mut() {
+      node = dragger.fix_route_node(&mut self.world, &context, force_commit);
+    }
+
+    match node {
+      Some(node) => FixOutcome::Finished(self.commit_drag(node)),
+      None => FixOutcome::Continue(self.frame()),
     }
   }
 
@@ -1403,6 +1648,53 @@ impl Router {
   // Ending a session
   // -----------------------------------------------------------------
 
+  /// What the session has changed so far, without committing it.
+  ///
+  /// Port of `ROUTER::GetUpdatedItems`
+  /// (`pcbnew/router/pns_router.cpp:832`): the delta of the node the
+  /// placer stands on with loops removed, `CurrentNode( true )` (`:839`),
+  /// against the board. An idle router answers with nothing.
+  ///
+  /// KiCad's third out parameter, the cloned head items, is not returned:
+  /// its only consumer deletes them immediately with the comment "fixme:
+  /// update the state with the head trace (not supported in current
+  /// testsuite)" (`qa/tools/pns/pns_log_player.cpp:83`), and a host that
+  /// wants the head already has it in the [`PreviewFrame`].
+  ///
+  /// The drag branch is `:844`: the node is `m_dragger->CurrentNode()`,
+  /// with no "loops removed" flag to pass and no committed node in sight.
+  /// That makes this what the KiCad regression corpus compares a drag
+  /// case against, because none of the seven drag logs holds an
+  /// `EVT_FIX`; see note 06 section 10.1.
+  ///
+  /// See [`PendingUpdate`] for why this is not a [`CommitDiff`].
+  pub fn pending_update(&self) -> PendingUpdate {
+    let node = match self.state {
+      RouterState::Idle => None,
+      // :839
+      RouterState::RouteTrack => {
+        self.placer.as_ref().map(|placer| placer.current_node(true))
+      }
+      // :844
+      RouterState::DragSegment => {
+        self.dragger.as_ref().map(Dragger::current_node)
+      }
+    };
+    let Some(node) = node else {
+      return PendingUpdate::default();
+    };
+    let (added, removed) = self.world.get_updated_items(node);
+
+    PendingUpdate {
+      removed: removed
+        .into_iter()
+        .filter_map(|id| self.index.host_of(id))
+        .collect(),
+      added,
+      node: Some(node),
+    }
+  }
+
   /// Commit what was routed and end the session.
   ///
   /// Port of the no argument `ROUTER::CommitRouting`
@@ -1435,43 +1727,25 @@ impl Router {
   /// the ids it gave the additions back through
   /// [`Router::assign_host_ids`].
   ///
-  /// What the session has changed so far, without committing it.
-  ///
-  /// Port of `ROUTER::GetUpdatedItems`
-  /// (`pcbnew/router/pns_router.cpp:832`): the delta of the node the
-  /// placer stands on with loops removed, `CurrentNode( true )` (`:839`),
-  /// against the board. An idle router answers with nothing.
-  ///
-  /// KiCad's third out parameter, the cloned head items, is not returned:
-  /// its only consumer deletes them immediately with the comment "fixme:
-  /// update the state with the head trace (not supported in current
-  /// testsuite)" (`qa/tools/pns/pns_log_player.cpp:83`), and a host that
-  /// wants the head already has it in the [`PreviewFrame`].
-  ///
-  /// See [`PendingUpdate`] for why this is not a [`CommitDiff`].
-  pub fn pending_update(&self) -> PendingUpdate {
-    let Some(placer) = self.placer.as_ref() else {
-      return PendingUpdate::default();
-    };
-    // :839
-    let node = placer.current_node(true);
-    let (added, removed) = self.world.get_updated_items(node);
-
-    PendingUpdate {
-      removed: removed
-        .into_iter()
-        .filter_map(|id| self.index.host_of(id))
-        .collect(),
-      added,
-      node: Some(node),
-    }
-  }
-
   /// `StopRouting` also pushes the touched nets to the host so it can
   /// rebuild the ratsnest (`:971`); a host here reads them off the diff.
+  ///
+  /// # A drag commits nothing here
+  ///
+  /// `ROUTER::CommitRouting()` commits only inside
+  /// `if( m_state == ROUTE_TRACK )` (`:960`) and `StopRouting` itself
+  /// only tears the session down (`:967`), so a drag that was never fixed
+  /// is discarded whichever of the two the host calls. That is what
+  /// [`Router::fix_route`] is for: it is the only path that commits a
+  /// drag, exactly as `DRAGGER::FixRoute` is in KiCad. So this answers an
+  /// empty [`CommitDiff`] for a drag and drops the dragger, and
+  /// [`Router::abort_routing`] does the same thing without the recorded
+  /// event.
   pub fn stop_routing(&mut self) -> CommitDiff {
     self.record(SessionEvent::StopRouting);
 
+    // :960. `build_commit_plan` answers an empty plan without a placer,
+    // which is the drag and the idle case both.
     let plan = self.build_commit_plan();
 
     // :959, the placer's own commit, which folds its scratch branch into
@@ -1480,6 +1754,34 @@ impl Router {
       placer.commit_placement(&mut self.world);
     }
 
+    self.apply_commit_plan(plan)
+  }
+
+  /// Fold a drag's node into the board and end the session.
+  ///
+  /// The `Router()->CommitRouting( node )` of `DRAGGER::FixRoute`
+  /// (`pcbnew/router/pns_dragger.cpp:965`), which is
+  /// `CommitRouting( NODE* )` (`pcbnew/router/pns_router.cpp:862`) over
+  /// the dragger's node and then, in the host,
+  /// `ROUTER_TOOL::performDragging`'s `StopRouting`
+  /// (`pcbnew/router/router_tool.cpp:2591`).
+  ///
+  /// The plan is built before [`World::commit`] runs, because the commit
+  /// takes the removed items out of the arena and their handles go stale.
+  fn commit_drag(&mut self, node: NodeId) -> CommitDiff {
+    let plan = self.commit_plan_for(node);
+
+    self.world.commit(node);
+
+    self.apply_commit_plan(plan)
+  }
+
+  /// Fix the host map up after a commit and end the session.
+  ///
+  /// The tail both [`Router::stop_routing`] and [`Router::commit_drag`]
+  /// end with, once the node they were committing has been folded into
+  /// the board.
+  fn apply_commit_plan(&mut self, plan: CommitPlan) -> CommitDiff {
     // The removed items are out of the board now, and each updated one
     // has taken over the identity of the item it replaced.
     for id in plan.removed {
@@ -1703,21 +2005,30 @@ impl Router {
   /// committing, because the commit takes the removed items out of the
   /// arena and their handles go stale.
   fn build_commit_plan(&self) -> CommitPlan {
-    let mut plan = CommitPlan::default();
-
-    // :864
+    // :864. The guard is on the state, so a drag always commits and a
+    // placement that placed nothing never does.
     let Some(placer) = self.placer.as_ref() else {
-      return plan;
+      return CommitPlan::default();
     };
 
     if !placer.has_placed_anything() {
-      return plan;
+      return CommitPlan::default();
     }
 
     let Some(node) = placer.last_node() else {
-      return plan;
+      return CommitPlan::default();
     };
 
+    self.commit_plan_for(node)
+  }
+
+  /// [`Router::build_commit_plan`] over a node the caller names.
+  ///
+  /// The body of `CommitRouting( NODE* )` from `:867` on, which is the
+  /// half that does not look at the state. [`Router::commit_drag`] uses
+  /// it directly, because the dragger's node is not the placer's.
+  fn commit_plan_for(&self, node: NodeId) -> CommitPlan {
+    let mut plan = CommitPlan::default();
     let (added, removed) = self.world.get_updated_items(node);
     let mut pool: Vec<ItemId> = added
       .into_iter()
@@ -1767,8 +2078,17 @@ impl Router {
     plan
   }
 
-  /// The preview of the placer's current state.
+  /// The preview of whatever algorithm is running.
   fn frame(&self) -> PreviewFrame {
+    if let Some(dragger) = self.dragger.as_ref() {
+      return drag_preview_frame(
+        &self.world,
+        &self.index,
+        dragger,
+        self.resolver.as_ref(),
+      );
+    }
+
     self
       .placer
       .as_ref()
@@ -1784,6 +2104,8 @@ impl Router {
     let root = self.world.root();
 
     self.placer = None;
+    // :985
+    self.dragger = None;
     self.state = RouterState::Idle;
     self.world.kill_children(root);
     self
@@ -1851,7 +2173,71 @@ fn preview_frame(
       .extend(violations_of(world, index, node, resolver, &line));
   }
 
-  // :765, the node delta.
+  append_node_delta(&mut frame, world, index, node, resolver);
+
+  frame
+}
+
+/// Build the frame a host draws after one drag event.
+///
+/// `ROUTER::moveDragging` (`pcbnew/router/pns_router.cpp:656`) is three
+/// lines: erase the view, drag, and
+/// `updateView( m_dragger->CurrentNode(), m_dragger->Traces(), true )`.
+/// So the frame is [`append_node_delta`] over the drag node plus the
+/// violations of `markViolations` over the dragged geometry, and nothing
+/// else. Two consequences of that, both deliberate:
+///
+/// - the dragged line is drawn from the node delta as
+///   [`PreviewStyle::Tail`] and not as [`PreviewStyle::Head`], because
+///   `moveDragging` sets no `PNS_HEAD_TRACE` where `movePlacing` sets it
+///   on every trace (`:804`). Drawing it from
+///   [`Dragger::traces`] as well would draw it twice, since
+///   `dragMarkObstacles` adds it to the drag node
+///   (`pcbnew/router/pns_dragger.cpp:410`);
+/// - there is no [`PreviewFrame::ratline`] and no
+///   [`PreviewFrame::via`]: a drag has no head to attach and no pending
+///   via, and `ROUTER::StopRouting` never even updates the ratsnest after
+///   one (note 06 erratum E16).
+///
+/// `markViolations`'s dragged item filter (`:724`) has nothing to skip
+/// while the traces are lines: `ITEM_SET::Contains` compares `ITEM`
+/// pointers and a `LINE` is never one of the node's own items, so only a
+/// via drag, which puts the node's via in the set (`:511`), can hit it.
+/// That is step 9 of note 06 section 10.2.
+fn drag_preview_frame(
+  world: &World,
+  index: &HostIndex,
+  dragger: &Dragger,
+  resolver: &dyn RuleResolver,
+) -> PreviewFrame {
+  let node = dragger.current_node();
+  let mut frame = PreviewFrame::default();
+
+  // :700, the violations the dragged geometry runs into.
+  for line in dragger.traces() {
+    frame
+      .violations
+      .extend(violations_of(world, index, node, resolver, line));
+  }
+
+  append_node_delta(&mut frame, world, index, node, resolver);
+
+  frame
+}
+
+/// Add a node's delta to a frame.
+///
+/// The body of `ROUTER::updateView` after `markViolations`
+/// (`pcbnew/router/pns_router.cpp:765` to `:773`): every added item is
+/// drawn with its own clearance, and every removed one is hidden. It is
+/// shared by the placing and the dragging frames because `updateView` is.
+fn append_node_delta(
+  frame: &mut PreviewFrame,
+  world: &World,
+  index: &HostIndex,
+  node: NodeId,
+  resolver: &dyn RuleResolver,
+) {
   let (added, removed) = world.get_updated_items(node);
 
   for id in added {
@@ -1893,8 +2279,6 @@ fn preview_frame(
       frame.hidden.push(host);
     }
   }
-
-  frame
 }
 
 /// The clearance outline a host draws around a route.
