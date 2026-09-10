@@ -166,6 +166,8 @@
 //!   placer and the dragger share.
 //! - [`placer`]: the interactive placement state machine the facade
 //!   drives.
+//! - [`diff_pair`]: two coupled lanes, the gateways a pair route leaves
+//!   a pad pair through, and the fit that joins two gateway sets.
 //! - [`dragger`]: moving a segment, a corner or a via of an existing
 //!   trace, in any of the three modes.
 //! - [`multi_dragger`]: moving several traces at once, keeping their
@@ -195,6 +197,7 @@ pub mod arena;
 pub mod collide;
 pub mod component_dragger;
 pub mod debug;
+pub mod diff_pair;
 pub mod dragger;
 pub mod eventlog;
 pub mod geometry;

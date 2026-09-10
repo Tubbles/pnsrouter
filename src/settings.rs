@@ -595,6 +595,23 @@ impl Sizes {
     }
   }
 
+  /// The centre to centre spacing of the two lanes of a differential
+  /// pair.
+  ///
+  /// Port of `DIFF_PAIR_PLACER::gap`,
+  /// `pcbnew/router/pns_diff_pair_placer.cpp:616`, which is
+  /// `DiffPairGap() + DiffPairWidth()`. It lives here rather than on the
+  /// placer because it is pure arithmetic over the sizes, and it has a
+  /// name of its own because KiCad calls this and
+  /// [`Sizes::diff_pair_gap`] both "the gap": the first is the distance
+  /// between the two centrelines, the second the distance between the
+  /// two copper edges. Everything in [`crate::diff_pair`] that spaces
+  /// anchors, and `checkGap`, want this one; the coupling measurements
+  /// want the other. See `crate::diff_pair`'s module documentation.
+  pub const fn diff_pair_pitch(&self) -> i32 {
+    self.diff_pair_gap + self.diff_pair_width
+  }
+
   /// The copper gap between two pair vias once the hole rules are folded
   /// in.
   ///
@@ -814,6 +831,22 @@ mod tests {
 
     sizes.diff_pair_via_gap_same_as_trace_gap = false;
     assert_eq!(sizes.diff_pair_via_gap(), 200000);
+  }
+
+  /// `DIFF_PAIR_PLACER::gap` (`pns_diff_pair_placer.cpp:616`) is the
+  /// centre to centre distance and therefore the copper gap plus one
+  /// lane's width, which is the quantity every gateway builder spaces its
+  /// anchors by.
+  #[test]
+  fn the_pair_pitch_is_the_gap_plus_one_width() {
+    let sizes = Sizes {
+      diff_pair_width: 200000,
+      diff_pair_gap: 180000,
+      ..Sizes::default()
+    };
+
+    assert_eq!(sizes.diff_pair_pitch(), 380000);
+    assert_eq!(Sizes::default().diff_pair_pitch(), 125000 + 180000);
   }
 
   /// `EffectiveDiffPairViaGap` (`:146`) takes the largest of the three

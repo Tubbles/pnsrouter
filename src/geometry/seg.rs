@@ -39,8 +39,10 @@
 //!
 //! Members of `SEG` that neither the router core nor
 //! `shape_line_chain.cpp` and `shape_collisions.cpp` call are left out:
-//! `IntersectsLine`, `ParallelSeg`, `TCoef`, `CanonicalCoefs` as a public
-//! member (it stays private, [`Seg::collinear`] needs it) and `Square`.
+//! `IntersectsLine`, `ParallelSeg`, `CanonicalCoefs` as a public member
+//! (it stays private, [`Seg::collinear`] needs it) and `Square`.
+//! `TCoef` is `pub(crate)`: its only caller is the differential pair's
+//! [`crate::diff_pair::common_parallel_projection`].
 
 use crate::geometry::math::{isqrt, kiround, kiround_i64, rescale, sign};
 use crate::geometry::vec2::{Vec2, Vec2L};
@@ -290,6 +292,25 @@ impl Seg {
   /// first, so the result is exact whenever it fits in an `i64`.
   pub fn squared_length(&self) -> i64 {
     self.a.widening_sub(self.b).squared_euclidean_norm()
+  }
+
+  /// The dot product parameterisation of a point along the segment.
+  ///
+  /// Port of `SEG::TCoef`,
+  /// `libs/kimath/include/geometry/seg.h:262`, which is
+  /// `(B - A) . (point - A)`. It is zero at [`Seg::a`] and
+  /// [`Seg::squared_length`] at [`Seg::b`], so a caller after a fraction
+  /// divides by the squared length and not by the length.
+  ///
+  /// Visible to the crate rather than published, because its one caller is
+  /// [`crate::diff_pair::common_parallel_projection`]
+  /// (`pcbnew/router/pns_diff_pair.cpp:791`), which is where KiCad calls
+  /// it too.
+  ///
+  /// Deviation: both differences are widened before the products, where
+  /// KiCad takes them in `int` and lets them wrap.
+  pub(crate) fn t_coef(&self, point: Vec2) -> i64 {
+    self.b.widening_sub(self.a).dot(point.widening_sub(self.a))
   }
 
   /// The segment with its endpoints swapped.
@@ -2455,6 +2476,46 @@ mod tests {
 
     let point = Seg::from_coords(5, 5, 5, 5);
     assert_eq!(point.line_project(Vec2::new(0, 0)), Vec2::new(5, 5));
+  }
+
+  /// The dot product parameterisation, `seg.h:262`: zero at `A`, the
+  /// squared length at `B`, and blind to whatever is perpendicular to
+  /// the segment.
+  #[test]
+  fn t_coef_parameterises_the_segment_by_the_dot_product() {
+    let segment = Seg::from_coords(0, 0, 10, 0);
+
+    assert_eq!(segment.t_coef(segment.a), 0);
+    assert_eq!(segment.t_coef(segment.b), segment.squared_length());
+    assert_eq!(segment.t_coef(Vec2::new(5, 0)), 50);
+    assert_eq!(
+      segment.t_coef(Vec2::new(5, 1000)),
+      50,
+      "the perpendicular offset does not count"
+    );
+    assert_eq!(
+      segment.t_coef(Vec2::new(-3, 0)),
+      -30,
+      "a point behind the start is negative"
+    );
+    assert_eq!(
+      segment.t_coef(Vec2::new(40, 0)),
+      400,
+      "and one past the end is beyond the squared length"
+    );
+
+    let diagonal = Seg::from_coords(0, 0, 10, 10);
+
+    assert_eq!(diagonal.t_coef(Vec2::new(5, 5)), 100);
+    assert_eq!(diagonal.t_coef(diagonal.b), diagonal.squared_length());
+
+    let degenerate = Seg::from_coords(5, 5, 5, 5);
+
+    assert_eq!(
+      degenerate.t_coef(Vec2::new(1000, -1000)),
+      0,
+      "a degenerate segment has a zero direction, so every point is at 0"
+    );
   }
 
   /// Reflection across the axis, `seg.cpp:660`.
