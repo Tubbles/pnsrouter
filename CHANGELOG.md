@@ -6,6 +6,15 @@ The decision behind any entry is in [doc/log/](doc/log/), one file per day, and 
 
 ## [Unreleased]
 
+### Added
+
+- **Parallel obstacle query**, KiCad's `NODE::NearestObstacle` thread pool (`pcbnew/router/pns_node.cpp:437`) as one `std::thread::scope` per query. `node::World::set_parallelism` and `router::Router::set_parallelism` are the knob; the reduction stays sequential and ranks by (distance, uid), so an answer never depends on the thread count. **The default is 1**: measured on both boards of `doc/performance.md`, spawning threads per query cost more than the geometry it moved. The knob is on the world and not on `settings::RoutingSettings`, so a recorded session's format is unchanged.
+- `eventlog::replay_with_parallelism`, for replaying a recording at a chosen thread count.
+
+### Changed
+
+- **Parallel obstacle query, off by default.** `node::World::set_parallelism` (and `router::Router::set_parallelism`) splits the per candidate work of the obstacle query across scoped threads; the answers are identical on any thread count. It is off because it measured as no gain and a small loss on the synthetic boards, see `doc/performance.md`. `rules::RuleResolver` is not called from the threads and carries no `Send + Sync` bound.
+
 ## [0.1.0] - unreleased
 
 First release. A headless interactive router for single net traces, driven entirely through `router::Router`.

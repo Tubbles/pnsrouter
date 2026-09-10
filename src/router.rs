@@ -730,6 +730,16 @@ impl Router {
     &self.world
   }
 
+  /// How many threads the obstacle query may use.
+  ///
+  /// Forwards to [`World::set_parallelism`]. It is here and not on
+  /// [`RoutingSettings`] because a session recording serialises the
+  /// settings and a thread count belongs to the machine, not to the
+  /// session; the router answers the same whatever it is set to.
+  pub const fn set_parallelism(&mut self, threads: usize) {
+    self.world.set_parallelism(threads);
+  }
+
   /// The map between the host's ids and the engine's handles.
   pub const fn host_index(&self) -> &HostIndex {
     &self.index

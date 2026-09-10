@@ -87,7 +87,8 @@ use pnsrouter::eventlog::{SessionRecording, assert_replay_matches};
 use pnsrouter::rules::RuleResolver;
 
 use support::kicad_replay::{
-  EventOutcome, LoadedCase, ReplayReport, replay_case, unresolved_uuids,
+  EventOutcome, LoadedCase, ReplayReport, replay_case,
+  replay_case_with_parallelism, unresolved_uuids,
 };
 use support::pns_log::{RegressionCase, discover_cases};
 
@@ -410,6 +411,55 @@ fn walk_with_teardrops() {
 #[ignore = "dragging is milestone 8"]
 fn walk_drag_seg_against_board_edge() {
   assert_loads_and_maps("walk_drag_seg_against_board_edge");
+}
+
+// ---------------------------------------------------------------------
+// The thread count does not reach the answer
+// ---------------------------------------------------------------------
+
+/// The four cases this crate can replay, which is the tier 2 set above.
+const REPLAYABLE: &[&str] = &[
+  "backspace1",
+  "issue22749-shove-weird-drag-track-end",
+  "issue24132-shove-same-net-via",
+  "simple-shove-1",
+];
+
+/// Every replayable case answers the same on one thread and on eight.
+///
+/// `pnsrouter::node::World::nearest_obstacle` cuts its candidate scan
+/// into blocks and runs them on `std::thread::scope` threads, so the
+/// block boundaries move with the thread count. `DESIGN.md` section 8
+/// says the engine is a pure function of (snapshot, settings, event
+/// sequence), and a thread count is none of those. The comparison is the
+/// recorder's own text, which is the commit diffs vertex for vertex plus
+/// everything the recording carries.
+///
+/// `tests/parallelism.rs` runs the same check over the stored session
+/// fixtures and says what neither set reaches: the largest obstacle set
+/// in this corpus is 9 candidates, so these sessions stay under the
+/// block threshold and never cut a block. The split itself is pinned by
+/// unit tests in `src/node.rs`.
+#[test]
+fn every_replayable_case_replays_the_same_at_every_thread_count() {
+  for name in REPLAYABLE {
+    let case = load(name);
+    let sequential = replay_case_with_parallelism(&case, Some(1));
+    let parallel = replay_case_with_parallelism(&case, Some(8));
+
+    assert!(
+      sequential.recording.to_text() == parallel.recording.to_text(),
+      "`{name}` replays differently on one thread and on eight"
+    );
+    assert_eq!(
+      sequential.measured_added, parallel.measured_added,
+      "`{name}` adds a different set of items on eight threads"
+    );
+    assert_eq!(
+      sequential.measured_removed, parallel.measured_removed,
+      "`{name}` removes a different number of items on eight threads"
+    );
+  }
 }
 
 // ---------------------------------------------------------------------

@@ -410,12 +410,40 @@ pub fn replay(
   recording: &SessionRecording,
   resolver: Box<dyn RuleResolver>,
 ) -> ReplayOutcome {
+  replay_on(recording, resolver, None)
+}
+
+/// [`replay`] with the obstacle query pinned to a thread count.
+///
+/// The thread count is not part of a recording, and it must not change
+/// what a replay answers; see [`crate::node::World::set_parallelism`].
+/// This exists so that `tests/parallelism.rs` can replay the same
+/// recording on one thread and on many and compare the commits.
+pub fn replay_with_parallelism(
+  recording: &SessionRecording,
+  resolver: Box<dyn RuleResolver>,
+  threads: usize,
+) -> ReplayOutcome {
+  replay_on(recording, resolver, Some(threads))
+}
+
+/// The body of [`replay`] and [`replay_with_parallelism`].
+fn replay_on(
+  recording: &SessionRecording,
+  resolver: Box<dyn RuleResolver>,
+  threads: Option<usize>,
+) -> ReplayOutcome {
   let mut router = Router::new(
     &recording.snapshot,
     resolver,
     recording.settings,
     recording.sizes.clone(),
   );
+
+  if let Some(threads) = threads {
+    router.set_parallelism(threads);
+  }
+
   let mut diffs = Vec::new();
   let mut frames_count = 0;
 

@@ -24,7 +24,7 @@ Deferred during milestone 1 (geometry foundation), each with the place it surfac
 Deferred during milestone 2 (world model):
 
 - `INDEX::SetDeferred` / `BuildSpatialIndex`, KiCad's bulk load for the initial board sync (`pns_index.cpp:55`, `pns_node.cpp:1257`), is not ported. Measure the root index build on a large board before adding a second insertion path.
-- The parallel obstacle scan of `NODE::NearestObstacle` (`pns_node.cpp:437`) is not ported; the sequential scan is deterministic by construction. Profile before adding threads.
+- The parallel obstacle scan of `NODE::NearestObstacle` (`pns_node.cpp:437`) is ported as of milestone 8 and defaults to off: the profile said the threads cost more than they save. See `doc/work/008-parallel-obstacle-query.md`.
 - `NODE::FixupVirtualVias` (`pns_node.cpp:1282`) is not ported; note 02 records two errata in it (a dead `n_seg >= 3` branch, a `locked_seg` that leaks across joints). Decide with the shove work item.
 - Line versus line collisions (`pns_item.cpp:133`) are not supported since lines are never stored; the shove (`pns_shove.cpp:318`, `:481`), optimizer (`pns_optimizer.cpp:1356`) and multi dragger (`pns_multi_dragger.cpp:321`) call sites must decompose one side into segments when they are ported.
 - `check_colliding_items` (`src/node.rs`) takes items only, not lines, for the same reason.

@@ -19,6 +19,13 @@
 //! tail of the distribution turned out to be made of. See
 //! `doc/performance.md`.
 //!
+//! `PNSROUTER_PARALLELISM` overrides [`Router::set_parallelism`], the
+//! thread count of the obstacle query, whose default is 1. It lives here
+//! and not in `src/` for the same reason the clock does: the crate reads
+//! no environment. The parallel obstacle query section of
+//! `doc/performance.md` is what it was added to measure, and what says
+//! why the default is what it is.
+//!
 //! The board is a two layer Manhattan grid: horizontal traces on layer 0,
 //! vertical traces on layer 1, one gap per row and per column so that a
 //! route has somewhere to slip through, pads and vias on their own nets in
@@ -495,6 +502,9 @@ const FRAME_BUDGET: Duration = Duration::from_millis(16);
 /// The environment variable that overrides the shove's iteration budget.
 const SHOVE_BUDGET_VARIABLE: &str = "PNSROUTER_SHOVE_ITERATION_LIMIT";
 
+/// The environment variable that overrides the obstacle query's threads.
+const PARALLELISM_VARIABLE: &str = "PNSROUTER_PARALLELISM";
+
 /// What one session cost, call by call.
 struct Timings {
   /// [`Router::new`], which is where the snapshot becomes a world.
@@ -528,6 +538,16 @@ fn shove_budget() -> u32 {
     .unwrap_or_else(|| RoutingSettings::default().shove_iteration_limit)
 }
 
+/// The thread count the sessions run the obstacle query on.
+///
+/// [`None`] leaves the world at its default, which is what a host that
+/// never touches the knob gets.
+fn parallelism() -> Option<usize> {
+  env::var(PARALLELISM_VARIABLE)
+    .ok()
+    .and_then(|value| value.parse().ok())
+}
+
 /// The sizes every session places with.
 fn sizes() -> Sizes {
   let mut sizes = Sizes {
@@ -559,6 +579,11 @@ fn run_session(board: &Board, mode: RouterMode) -> Timings {
     sizes(),
   );
   let new = started.elapsed();
+
+  if let Some(threads) = parallelism() {
+    router.set_parallelism(threads);
+  }
+
   let mut timings = Timings {
     new,
     start: Duration::ZERO,

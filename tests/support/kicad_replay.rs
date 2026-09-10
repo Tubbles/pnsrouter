@@ -505,6 +505,18 @@ impl ReplayReport {
 /// starting event's item, which is where KiCad's player calls
 /// `ImportSizes` (`qa/tools/pns/pns_log_player.cpp:135`).
 pub fn replay_case(case: &LoadedCase) -> ReplayReport {
+  replay_case_with_parallelism(case, None)
+}
+
+/// [`replay_case`] with the obstacle query pinned to a thread count.
+///
+/// The thread count must not change what a case replays to; see
+/// [`pnsrouter::node::World::set_parallelism`]. `None` leaves the world
+/// at its default, which is one thread.
+pub fn replay_case_with_parallelism(
+  case: &LoadedCase,
+  threads: Option<usize>,
+) -> ReplayReport {
   let (snapshot, host_map) = snapshot_from_board(&case.board, &case.rules);
   let settings = map_settings(&case.settings);
   let start_net = start_item_net(case);
@@ -517,6 +529,10 @@ pub fn replay_case(case: &LoadedCase) -> ReplayReport {
     settings.settings,
     sizes.clone(),
   );
+
+  if let Some(threads) = threads {
+    router.set_parallelism(threads);
+  }
 
   router.start_recording(&snapshot);
 

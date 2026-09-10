@@ -364,6 +364,9 @@ pub struct World {
   clearances: BTreeMap<(ItemId, ItemId, bool), Option<i32>>,
   /// The hull cache. See [`World::hull_of`].
   hulls: BTreeMap<(ItemId, i32, i32, i32), Rc<LineChain>>,
+  /// How many threads [`World::nearest_obstacle`] may scan candidates
+  /// on. See [`World::set_parallelism`].
+  parallelism: usize,
 }
 
 impl World {
@@ -402,7 +405,48 @@ impl World {
       uids: UidCounter::new(),
       clearances: BTreeMap::new(),
       hulls: BTreeMap::new(),
+      parallelism: 1,
     }
+  }
+
+  /// The largest thread count worth asking [`World::set_parallelism`]
+  /// for.
+  ///
+  /// KiCad submits the scan to a process wide pool and so inherits its
+  /// size (`pcbnew/router/pns_node.cpp:437`). There is no pool here, one
+  /// [`std::thread::scope`] per query instead, and a scope of `n` blocks
+  /// costs about 21 microseconds per block in the container
+  /// `doc/performance.md` describes: 42 for two, 169 for eight. One
+  /// candidate costs about 2.2 microseconds to scan. Past eight blocks
+  /// the dispatch is the query.
+  pub const MAX_USEFUL_PARALLELISM: usize = 8;
+
+  /// How many threads [`World::nearest_obstacle`] may scan candidates on.
+  ///
+  /// One means sequential, and one is the **default**: measured on both
+  /// boards of `doc/performance.md`, spawning threads per query made
+  /// every tail metric worse and nothing better, because a
+  /// [`std::thread::scope`] costs more than the geometry it moves. The
+  /// parallel obstacle query section there has the numbers. A host on
+  /// hardware where thread creation is cheaper, or on boards denser than
+  /// those two, can turn it on with
+  /// `world.set_parallelism(std::thread::available_parallelism().map_or(1, NonZero::get))`,
+  /// and should measure before it does. Zero is read as one, and there
+  /// is no point going above [`World::MAX_USEFUL_PARALLELISM`].
+  ///
+  /// The knob is here and not on [`crate::settings::RoutingSettings`] on
+  /// purpose: settings are serialised into a session recording
+  /// (`crate::eventlog`) and a thread count is a property of the machine
+  /// replaying it, not of the session. The answer does not depend on it,
+  /// which is what `tests/parallelism.rs` pins.
+  pub const fn set_parallelism(&mut self, threads: usize) {
+    self.parallelism = if threads == 0 { 1 } else { threads };
+  }
+
+  /// How many threads the obstacle scan may use. See
+  /// [`World::set_parallelism`].
+  pub const fn parallelism(&self) -> usize {
+    self.parallelism
   }
 
   // -----------------------------------------------------------------
@@ -1913,11 +1957,29 @@ impl World {
   /// passes the same value into [`simplified_hull`] for the hull it walks
   /// around.
   ///
+  /// # The threads
+  ///
+  /// The per candidate scan can run on [`std::thread::scope`] threads,
+  /// which is KiCad's thread pool at `:437` without a pool. It does not
+  /// unless a host asks for it: [`World::set_parallelism`] is the knob
+  /// and its default is one, for the reason recorded there. The private
+  /// `scan_candidates` says how the blocks are cut and why the answer
+  /// cannot depend on how many there are.
+  ///
+  /// Only the scan is threaded. The query, the clearances and the hulls
+  /// stay on the calling thread, the first two because they read the
+  /// arena through `&self` while the third needs `&mut self`, and all
+  /// three because that is the split KiCad makes for the same reason
+  /// (`:346`). Nothing in this function draws to a
+  /// [`crate::debug::DebugDecorator`], so there is no trace call to keep
+  /// out of the threads.
+  ///
   /// # Not ported
   ///
-  /// The thread pool (`:437`) and, with it, the sequential hull copy that
-  /// only exists to feed it (`:346` to `:376`); [`Rc`] hulls are shared
-  /// instead.
+  /// KiCad copies each hull into an owned `SHAPE_LINE_CHAIN` before it
+  /// goes parallel (`:346` to `:376`). The copy is not needed here: the
+  /// private `HullRefs` borrows the chains out of the [`Rc`]s the cache
+  /// handed back, and the borrow checker is what makes that safe.
   pub fn nearest_obstacle(
     &mut self,
     node: NodeId,
@@ -1994,36 +2056,28 @@ impl World {
       });
     }
 
-    // :385 to :425, the per obstacle intersection scan, and :456 to
-    // :468, the winner scan, run together: `results[i]` depends on
-    // nothing but `i`, so computing it just before it is compared is the
-    // same answer and lets the early break skip the work it discards.
+    // :376. The hulls, borrowed out of the reference counts the phase
+    // above holds, so that the scan below can cross a thread boundary.
+    let borrowed: Vec<HullRefs<'_>> = hulls
+      .iter()
+      .map(|candidate| HullRefs {
+        line: candidate.line.as_deref(),
+        via: candidate.via.as_deref(),
+      })
+      .collect();
+
+    // :385 to :450, the per obstacle intersection scan, on this thread
+    // or on several.
     let path = line.shape();
+    let scan = scan_candidates(&borrowed, path, self.parallelism);
+
+    // :456 to :468, the winner scan, always on this thread and always in
+    // candidate order, which is item uid order.
     let mut best: Option<(i64, Vec2, usize)> = None;
 
-    for (index, candidate) in hulls.iter().enumerate() {
-      let mut nearest: Option<(i64, Vec2)> = None;
-
-      for hull in [&candidate.line, &candidate.via].into_iter().flatten() {
-        for crossing in hull_intersection(hull, path) {
-          let Some(theirs) = crossing.theirs else {
-            continue;
-          };
-          // :400. `index_their` is the segment hint.
-          let Some(distance) =
-            path.path_length(crossing.point, Some(theirs.index()))
-          else {
-            continue;
-          };
-
-          if nearest.is_none_or(|(closest, _)| distance < closest) {
-            nearest = Some((distance, crossing.point));
-          }
-        }
-      }
-
+    for (index, nearest) in scan.iter().enumerate() {
       // :460
-      if let Some((distance, point)) = nearest
+      if let Some((distance, point)) = *nearest
         && best.is_none_or(|(closest, _, _)| distance < closest)
       {
         best = Some((distance, point, index));
@@ -3386,6 +3440,154 @@ struct ObstacleHulls {
   /// The hull at the via's clearance, when the line ends with one
   /// (`:371`).
   via: Option<Rc<LineChain>>,
+}
+
+/// One obstacle's two hulls, borrowed out of the cache.
+///
+/// The parallel scan below reads hulls and nothing else, and
+/// [`ObstacleHulls`] cannot cross a thread boundary because [`Rc`] is
+/// neither [`Send`] nor [`Sync`]. Borrowing the chains out of the
+/// reference counts leaves the counts on the calling thread, where the
+/// sequential hull phase put them, and hands the threads a plain shared
+/// reference to immutable geometry. It is the cheap half of the copy
+/// KiCad makes for the same reason (`pcbnew/router/pns_node.cpp:346`).
+#[derive(Copy, Clone, Default)]
+struct HullRefs<'hulls> {
+  /// The hull at the line's clearance (`:361`).
+  line: Option<&'hulls LineChain>,
+  /// The hull at the via's clearance (`:371`).
+  via: Option<&'hulls LineChain>,
+}
+
+/// Where one obstacle's hulls first cross a line, and how far along it.
+///
+/// The `ObstacleResult` of `pcbnew/router/pns_node.cpp:377`, whose
+/// `INT_MAX` sentinel for "this obstacle does not cross the path at all"
+/// is [`None`] here. The distance is a path length in nanometres, so it
+/// is an `i64` where KiCad's is an `int`.
+type Crossing = Option<(i64, Vec2)>;
+
+/// How many obstacle candidates make one parallel block worth dispatching.
+///
+/// Port of `MIN_OBSTACLES_PER_BLOCK`, `pcbnew/router/pns_node.cpp:425`,
+/// whose value is 8. It is 8 there because the work goes to a pool that
+/// is already running and only has to be woken, which KiCad's own comment
+/// puts at 5 to 20 microseconds. This crate takes no dependency, so there
+/// is no pool: a block costs a whole thread, and a scope of `n` blocks
+/// measures at about 21 microseconds per block in the container
+/// `doc/performance.md` describes, against 2.2 microseconds to scan one
+/// candidate. 32 candidates is about 70 microseconds of geometry per
+/// block against 21 of dispatch, and below that ratio the threads cost
+/// more than they save. Even above it they mostly do, which is why
+/// [`World::set_parallelism`] defaults to one; the parallel obstacle
+/// query section of `doc/performance.md` has the measurement.
+const MIN_CANDIDATES_PER_BLOCK: usize = 32;
+
+/// One candidate's [`Crossing`].
+///
+/// Port of the `processObstacle` lambda,
+/// `pcbnew/router/pns_node.cpp:385` to `:425`: intersect both hulls with
+/// the path and keep the crossing with the smallest path length.
+///
+/// It is a free function taking only shared references because it is the
+/// body both the sequential and the threaded scan run, so neither can
+/// drift from the other.
+fn nearest_crossing(hulls: HullRefs<'_>, path: &LineChain) -> Crossing {
+  let mut nearest: Crossing = None;
+
+  for hull in [hulls.line, hulls.via].into_iter().flatten() {
+    for crossing in hull_intersection(hull, path) {
+      let Some(theirs) = crossing.theirs else {
+        continue;
+      };
+      // :400. `index_their` is the segment hint.
+      let Some(distance) =
+        path.path_length(crossing.point, Some(theirs.index()))
+      else {
+        continue;
+      };
+
+      if nearest.is_none_or(|(closest, _)| distance < closest) {
+        nearest = Some((distance, crossing.point));
+      }
+    }
+  }
+
+  nearest
+}
+
+/// [`nearest_crossing`] for every candidate, in candidate order.
+///
+/// Port of `pcbnew/router/pns_node.cpp:425` to `:450`: `numBlocks` is
+/// `numObstacles / MIN_OBSTACLES_PER_BLOCK` there too, and a query below
+/// the threshold runs the loop on the calling thread.
+///
+/// # Why the answer cannot depend on `parallelism`
+///
+/// `results[i]` is a pure function of `hulls[i]` and `path`, both shared
+/// and immutable, so a block boundary can fall anywhere. Nothing is
+/// reduced here: the winner scan runs afterwards, on the calling thread,
+/// over this vector in candidate order, which is item uid order. That is
+/// the whole of the determinism argument, and `tests/parallelism.rs`
+/// checks it end to end.
+///
+/// # Deviation: no early exit in the scan
+///
+/// [`World::nearest_obstacle`] used to fuse this loop with the winner
+/// scan, so a candidate at distance zero ended both. Splitting them to
+/// get the blocks costs that, exactly as it costs KiCad. It was measured
+/// on the boards of `doc/performance.md` before the split: the break
+/// fired late enough that 97.5% of the candidates were scanned anyway.
+fn scan_candidates(
+  hulls: &[HullRefs<'_>],
+  path: &LineChain,
+  parallelism: usize,
+) -> Vec<Crossing> {
+  // :443. `std::max( 1, numObstacles / MIN_OBSTACLES_PER_BLOCK )`, with
+  // the pool's size as the second cap, which KiCad gets from the pool
+  // itself.
+  let blocks = (hulls.len() / MIN_CANDIDATES_PER_BLOCK).min(parallelism);
+
+  if blocks < 2 {
+    // :447. The sequential fallback.
+    return hulls
+      .iter()
+      .map(|candidate| nearest_crossing(*candidate, path))
+      .collect();
+  }
+
+  let block_size = hulls.len().div_ceil(blocks);
+  let mut results: Vec<Crossing> = vec![None; hulls.len()];
+  let mut work: Vec<_> = hulls
+    .chunks(block_size)
+    .zip(results.chunks_mut(block_size))
+    .collect();
+  // The calling thread takes one block instead of blocking on the others,
+  // so a query of `blocks` blocks spawns `blocks - 1` threads.
+  let ours = work.pop();
+
+  std::thread::scope(|scope| {
+    for (candidates, into) in work {
+      scope.spawn(move || fill_block(candidates, into, path));
+    }
+
+    if let Some((candidates, into)) = ours {
+      fill_block(candidates, into, path);
+    }
+  });
+
+  results
+}
+
+/// [`nearest_crossing`] over one block of candidates.
+fn fill_block(
+  candidates: &[HullRefs<'_>],
+  into: &mut [Crossing],
+  path: &LineChain,
+) {
+  for (candidate, result) in candidates.iter().zip(into) {
+    *result = nearest_crossing(*candidate, path);
+  }
 }
 
 /// The clearance between two items, uncached.
@@ -5094,6 +5296,195 @@ mod tests {
     assert_eq!(from_above.ip_first, from_below.ip_first);
     assert_eq!(from_above.item, Some(above_first));
     assert_eq!(from_below.item, Some(below_first));
+  }
+
+  /// How many tracks the tie fixture stacks at one place.
+  ///
+  /// More than twice [`MIN_CANDIDATES_PER_BLOCK`], so the query splits
+  /// into at least two blocks at any parallelism above one and the tie is
+  /// actually resolved across a thread boundary rather than inside one
+  /// block.
+  const TIED_TRACKS: usize = 2 * MIN_CANDIDATES_PER_BLOCK + 1;
+
+  /// A stack of tracks the head line runs into all at once.
+  ///
+  /// Every one of them is the same segment on the same layer at the same
+  /// place, at the same width, so the resolver gives every one the same
+  /// clearance and [`World::hull_of`] builds every one the same hull:
+  /// the head enters all of them at one path length. Only the net
+  /// differs, which is what stops [`World::add_segment`] rejecting the
+  /// second one as redundant, and none of those nets is the head's, so
+  /// nothing is exempt.
+  ///
+  /// The handles come back in creation order, which is uid order, so the
+  /// first is the answer a `(distance, uid)` tie break has to give.
+  fn tied_obstacle_stack() -> (World, NodeId, Vec<ItemId>) {
+    let mut world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let root = world.root();
+    let mut tracks = Vec::with_capacity(TIED_TRACKS);
+
+    for index in 0..TIED_TRACKS {
+      let net = Some(NetId(100 + index as u32));
+      let item = track(
+        &mut world,
+        Vec2::new(NEAR_X, -50000),
+        Vec2::new(NEAR_X, 50000),
+        0,
+        net,
+      );
+
+      tracks.push(
+        world
+          .add_segment(root, item, false)
+          .expect("a track on its own net is not redundant"),
+      );
+    }
+
+    (world, root, tracks)
+  }
+
+  /// How many hulls the block split fixture holds.
+  ///
+  /// Enough for six blocks at [`MIN_CANDIDATES_PER_BLOCK`], and not a
+  /// multiple of it, so the last block is short and the chunking has to
+  /// handle a remainder.
+  const SPLIT_HULLS: usize = 6 * MIN_CANDIDATES_PER_BLOCK + 7;
+
+  /// A closed square of side `2 * radius` centred on `(x, 0)`.
+  ///
+  /// A stand in for a hull: [`nearest_crossing`] only ever reads a hull
+  /// as a chain, so a square is as good as an octagon and says exactly
+  /// where it crosses a path along the x axis.
+  fn square_hull(x: i32, radius: i32) -> LineChain {
+    LineChain::from_slice(
+      &[
+        Vec2::new(x - radius, -radius),
+        Vec2::new(x + radius, -radius),
+        Vec2::new(x + radius, radius),
+        Vec2::new(x - radius, radius),
+      ],
+      true,
+    )
+  }
+
+  /// The candidate scan gives one answer whatever the block count is.
+  ///
+  /// The direct test of the split
+  /// [`World::nearest_obstacle`] relies on: the whole result vector, not
+  /// just the winner, has to be the same at every parallelism, because
+  /// the winner scan that reads it runs afterwards and reads all of it.
+  /// The hulls are at increasing distances so that every entry is a
+  /// different number and a block that landed in the wrong place could
+  /// not go unnoticed.
+  #[test]
+  fn the_candidate_scan_answers_the_same_at_every_block_count() {
+    let hulls: Vec<LineChain> = (0..SPLIT_HULLS)
+      .map(|index| square_hull(100000 + 10000 * index as i32, 4000))
+      .collect();
+    let borrowed: Vec<HullRefs<'_>> = hulls
+      .iter()
+      .map(|hull| HullRefs {
+        line: Some(hull),
+        via: None,
+      })
+      .collect();
+    let path = LineChain::from_slice(
+      &[
+        Vec2::new(0, 0),
+        Vec2::new(100000 + 10000 * SPLIT_HULLS as i32, 0),
+      ],
+      false,
+    );
+    let sequential = scan_candidates(&borrowed, &path, 1);
+
+    // Every hull really is crossed, and at its own distance, so the
+    // comparison below has something to compare.
+    assert_eq!(sequential.len(), SPLIT_HULLS);
+    assert!(sequential.iter().all(Option::is_some));
+    assert!(
+      sequential
+        .windows(2)
+        .all(|pair| pair[0].unwrap().0 < pair[1].unwrap().0)
+    );
+
+    for threads in 2..=16 {
+      assert_eq!(
+        scan_candidates(&borrowed, &path, threads),
+        sequential,
+        "the scan answers differently on {threads} thread(s)"
+      );
+    }
+  }
+
+  /// The same tie break, over a stack big enough to be cut into blocks.
+  ///
+  /// [`a_distance_tie_is_broken_by_the_item_uid`] pins the rule on two
+  /// candidates, which is one block at any thread count. This one pins
+  /// that the rule survives the split: the winner is the lowest uid
+  /// whether the scan ran on one thread or on several, and the distance
+  /// and the crossing point it reports are the same either way.
+  #[test]
+  fn a_distance_tie_goes_to_the_lowest_uid_at_every_thread_count() {
+    let (mut world, root, tracks) = tied_obstacle_stack();
+    let head = crossing_head();
+    let options = CollisionSearchOptions::default();
+
+    // The fixture ties, and it does not tie at zero: a candidate at
+    // distance zero would end the winner scan at the first index and the
+    // test would pass without ever comparing anything.
+    let mut crossings = Vec::with_capacity(tracks.len());
+
+    for id in &tracks {
+      let clearance =
+        world.clearance_for_line(*id, &head, true, &rules()) + head.width() / 2;
+      let hull = world
+        .hull_of(*id, clearance, 0, 0)
+        .expect("a live track has a hull");
+
+      crossings.push(nearest_crossing(
+        HullRefs {
+          line: Some(hull.as_ref()),
+          via: None,
+        },
+        head.shape(),
+      ));
+    }
+
+    let tie = crossings[0].expect("the head crosses the stack");
+
+    assert!(tie.0 > 0, "the fixture ties at distance zero");
+    assert!(
+      crossings.iter().all(|crossing| *crossing == Some(tie)),
+      "the fixture does not tie: {crossings:?}"
+    );
+
+    // The whole stack really is one query's worth of candidates, so the
+    // block split below is not over an empty list.
+    assert_eq!(
+      world
+        .query_colliding_line(root, &head, &rules(), &options)
+        .len(),
+      TIED_TRACKS
+    );
+
+    for threads in [1, 2, 3, 8, 64] {
+      world.set_parallelism(threads);
+
+      let found = world
+        .nearest_obstacle(root, &head, &rules(), &options, CORNERS)
+        .expect("the head crosses the stack");
+
+      assert_eq!(
+        found.item,
+        Some(tracks[0]),
+        "with {threads} thread(s) the tie went to uid {:?} and not to the \
+         lowest, {:?}",
+        world.uid_of(found.item),
+        world.uid_of(Some(tracks[0]))
+      );
+      assert_eq!(found.dist_first, tie.0);
+      assert_eq!(found.ip_first, tie.1);
+    }
   }
 
   /// Note 04 section 9 item 4: when no hull meets the line, KiCad falls

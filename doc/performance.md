@@ -13,7 +13,7 @@ dev/in-container.sh cargo run --release --example latency -- 5000    # one board
 
 The arguments are target track segment counts, default 2000 and 20000. For each of them the example builds a board, then runs one session per routing mode: it starts on a pad, makes 96 moves of half a pitch each along a diagonal that crosses the grid, fixes a corner every 12 moves, and stops. It records the wall time of `Router::new`, `start_routing`, every `move_to`, every `fix_route` and `stop_routing`, and prints p50, p95, max and the number of moves over 16 ms.
 
-`PNSROUTER_SHOVE_ITERATION_LIMIT` overrides `RoutingSettings::shove_iteration_limit` for the run, which is what the budget table below was measured with.
+`PNSROUTER_SHOVE_ITERATION_LIMIT` overrides `RoutingSettings::shove_iteration_limit` for the run, which is what the budget table below was measured with. `PNSROUTER_PARALLELISM` overrides `World::set_parallelism`, the thread count of the obstacle query, which is what the parallel obstacle query section was measured with. Both are read in the example and nowhere else.
 
 The wall clock is read in the example and nowhere else: `src/` never reads it, per `DESIGN.md` section 8.
 
@@ -122,7 +122,7 @@ The call count is inherent too. `SHOVE::shoveLineToHullSet` tries four winding a
 
 `World::nearest_obstacle` (`src/node.rs:1921`) is 39 of the 56 samples in that row, 19.5% of `move_to`, reached 22 times from `Shove::shove_iteration` and 17 times from `Walkaround::single_step` (`src/walkaround.rs:620`). Most of the rest is the index maintenance of adding and removing the lines a shove replaces. It splits into the broad and narrow phase collision search at `src/node.rs:1930` and the hull building and intersection scan at `:2008`.
 
-**Inherent.** It is a transcription of `NODE::NearestObstacle` (`pcbnew/router/pns_node.cpp:298`), which does the same query, the same `makeHull` per obstacle and the same intersection scan. The broad phase is an R-tree per copper layer and behaves: mark obstacles mode, which uses the same query path, is flat at 0.09 ms per move across a tenfold change in item count. The port is ahead of KiCad in one place here, `World::hull_of` (`src/node.rs:3000`) memoises the hulls, and behind it in another, KiCad runs the per obstacle scan on a thread pool (`pns_node.cpp:437`) which the port leaves sequential for determinism.
+**Inherent.** It is a transcription of `NODE::NearestObstacle` (`pcbnew/router/pns_node.cpp:298`), which does the same query, the same `makeHull` per obstacle and the same intersection scan. The broad phase is an R-tree per copper layer and behaves: mark obstacles mode, which uses the same query path, is flat at 0.09 ms per move across a tenfold change in item count. The port is ahead of KiCad in one place here, `World::hull_of` (`src/node.rs:3000`) memoises the hulls. The per obstacle scan can run on threads as KiCad's does (`pns_node.cpp:437`) but does not by default; see the parallel obstacle query section below for the measurement that decided that.
 
 ## Budget tuning
 
@@ -154,8 +154,87 @@ Nothing in `src/`. The measurement found no hot spot that a small local change w
 
 One port level difference did turn up and was rejected on the evidence. `World::invalidate_caches` (`src/node.rs:3222`) scans the whole clearance cache and the whole hull cache once per removed item, where KiCad's `ClearCacheForItems` (`pcbnew/router/pns_kicad_iface.cpp:792`) scans them once per deletion batch (`pns_node.cpp:127` and `:1610`). It showed up in 4% of the samples. Replacing the body with a no op, which is the upper bound of any batching fix, moved the 20 000 board shove p50 from 49.7 to 51.0 ms, that is nowhere outside the run to run spread, because dropping the invalidation also lets the caches grow and makes every later lookup slower. Not worth the churn in the node code.
 
+## The parallel obstacle query
+
+Work item `doc/work/008-parallel-obstacle-query.md`. KiCad runs the per obstacle part of `NODE::NearestObstacle` on its process wide thread pool (`pcbnew/router/pns_node.cpp:437`). The port now does the same with `std::thread::scope`, one scope per query, because the crate takes no dependency and so has no pool. `World::set_parallelism` is the knob and **its default is 1**. This section is why.
+
+### What runs on the threads
+
+Only the intersection scan, which is KiCad's `processObstacle` (`:385` to `:425`): intersect each candidate's hulls with the head's chain and keep the crossing with the smallest path length. The broad and narrow phase query, the clearance lookups and the hull building stay on the calling thread, the last of them because `World::hull_of` memoises and needs `&mut self`. KiCad splits it in exactly the same place and for the same reason (`:346`).
+
+The winner scan is sequential and unchanged: it walks the results in candidate order, which is item uid order, and takes a strictly smaller distance, so a tie goes to the lowest uid whatever the block count. `tests/parallelism.rs`, `tests/kicad_replay.rs` and two unit tests in `src/node.rs` pin that.
+
+### The two numbers that decide it
+
+Measured in the container described above:
+
+| what | cost |
+| --- | --- |
+| one `std::thread::scope` of `n` blocks | about 21 us per block: 42 us for 2, 85 for 4, 169 for 8, 350 for 16 |
+| scanning one obstacle candidate | about 2.2 us, averaged over a whole example run |
+
+The scope cost is a thread creation and a join per spawned block, and the calling thread's own block still waits on the join, so it scales with the block count and not with the spawn count. That makes one block worth about ten candidates. KiCad's `MIN_OBSTACLES_PER_BLOCK` is 8, which works there because submitting to a running pool is the 5 to 20 microseconds its own comment quotes, not the cost of creating a thread. `MIN_CANDIDATES_PER_BLOCK` here is 32, so a query is cut into blocks only above 64 candidates and each block carries about 70 microseconds of geometry against 21 of dispatch.
+
+### How big a query actually is
+
+The candidate count of every `nearest_obstacle` call that got past the empty check, over one full example run (14 000 calls, 284 000 candidates, both boards, all three modes):
+
+| candidates | share of calls | scan cost of one call |
+| --- | --- | --- |
+| 1 | 4.6% | 2.0 us |
+| 2 to 3 | 24.2% | 4.9 us |
+| 4 to 7 | 12.2% | 10.9 us |
+| 8 to 15 | 14.1% | 25.6 us |
+| 16 to 31 | 22.6% | 57.1 us |
+| 32 to 63 | 17.1% | 97.7 us |
+| 64 to 127 | 4.8% | 182.6 us |
+| 128 to 255 | 0.5% | 528.2 us |
+| 256 and up | 0.01% | 3458 us |
+
+Two things fall out of that table. The queries that can be cut into blocks at all are the last three rows, 5.3% of them, holding 25% of the scan work. And the whole scan is 655 milliseconds of a 16 second run, so even a free scan would move the total by 4%.
+
+The same instrumentation says the early exit the split gave up is worth almost nothing: `NearestObstacle` breaks out of the winner scan at the first candidate whose distance is zero (`:466`), and 97.5% of the candidates were scanned before that fired anyway.
+
+Recorded sessions are far below all of this. The largest obstacle set in `tests/fixtures/sessions/` is 6 candidates and the largest in KiCad's regression corpus is 9, so no session in the tree cuts a single block. The counts above come from the synthetic Manhattan grid of this example, which is denser than any board either corpus holds.
+
+### What it measures
+
+Eight interleaved runs, `PNSROUTER_PARALLELISM=1` against `PNSROUTER_PARALLELISM=8`, medians of the per run figures. All times in milliseconds.
+
+| board | mode | p50 (1) | p50 (8) | p95 (1) | p95 (8) | max (1) | max (8) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 2000 | mark obstacles | 0.106 | 0.104 | 0.28 | 0.32 | 0.32 | 0.40 |
+| 2000 | walkaround | 0.799 | 0.786 | 23.08 | 21.53 | 58.21 | 53.87 |
+| 2000 | shove | 8.89 | 8.96 | 79.80 | 81.67 | 231.9 | 234.2 |
+| 20000 | mark obstacles | 0.104 | 0.103 | 0.30 | 0.34 | 0.32 | 0.37 |
+| 20000 | walkaround | 2.958 | 3.149 | 65.32 | 64.36 | 101.4 | 102.9 |
+| 20000 | shove | 53.04 | 50.26 | 507.6 | 499.8 | 871.4 | 860.6 |
+
+Every session committed the same segments and drew the same preview items at both settings, which is the point of the tests.
+
+Nothing here is a gain. Shove and walkaround move by a few percent in both directions, which is inside the run to run spread this document already records. The one effect that reproduces is a loss: the tail of mark obstacles mode. Three independent batches, always interleaved so that ordering cannot explain it:
+
+| batch | board | p95 | max |
+| --- | --- | --- | --- |
+| 6 runs, both boards | 2000 | +29% | +32% |
+| 8 runs, both boards | 2000 | +13% | +25% |
+| 10 runs, 2000 only | 2000 | +17% | +29% |
+
+In that last batch the two distributions of the worst move barely overlap: 0.267 to 0.407 ms on one thread against 0.365 to 0.478 ms on eight.
+
+### Why the tail gets worse
+
+Mark obstacles mode is the cheapest mode per move, about 0.1 ms, and it is dominated by one obstacle query over a long head. When that query crosses 64 candidates it is cut in two and pays 42 microseconds to move half of a scan that, on a short head, is only 20 to 40 microseconds. The candidate count says how many hulls there are; the cost of scanning one of them is proportional to the head's segment count as well, because `hull_intersection` is a loop over hull segments times path segments. So a candidate count threshold does not predict the work, and the mode with the cheapest candidates is the one that loses.
+
+KiCad has the same flaw in the same place. It does not show there because its dispatch is an order of magnitude cheaper than creating a thread.
+
+### The conclusion
+
+Per query thread creation does not pay on this hardware or on these boards, so the default is 1 and the whole scan runs on the calling thread, exactly as it did before. The code is not dead: `World::set_parallelism` turns it on, everything above says what to expect, and the split is worth keeping because a host on hardware with cheaper thread creation, or on a board denser than the 20 000 segment grid, can measure it for itself. A predictor that included the head's segment count would engage in fewer and better places; the right time to build one is when there is a workload that wants it.
+
+The two ways to make this actually pay are both larger than this work item. One is a persistent worker pool, which the crate cannot have without either a dependency or `'static` bounds it does not want in a `World` full of `Rc`. The other is to stop the tail of shove mode from being made of discarded iterations, which is the budget section above.
+
 ## What is left
 
-- Shove mode on a large board is not interactive and no local fix changes that. The cost is the cascade length, which is the algorithm. The realistic answers are the budget (see above), an early bail out when the cascade is clearly not converging, or the thread pool KiCad uses.
+- Shove mode on a large board is not interactive and no local fix changes that. The cost is the cascade length, which is the algorithm. The realistic answers are the budget (see above) or an early bail out when the cascade is clearly not converging. It is not the threads: see the section above.
 - `Line::walkaround` allocates one `Vec` per graph vertex for its neighbour list, at most three entries each, which is about 3% of `move_to`. An inline three element list would remove it. It needs a hand rolled type, since the crate takes no new dependencies, and a proof that no vertex can ever exceed three neighbours.
-- The parallel obstacle scan of `NODE::NearestObstacle` (`pns_node.cpp:437`) is still not ported. It was already listed as deferred in `TODO.md` under milestone 2 with "profile before adding threads". The profile now exists: the scan is inside the 28%, so threading it would buy less than shortening the walkaround work would.
