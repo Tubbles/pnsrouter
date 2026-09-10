@@ -30,7 +30,7 @@ Record a session in `tests/eventlog.rs`, write it here with `SessionRecording::t
 
 ### The `librepcb_` prefix
 
-A file named `librepcb_*.txt` was recorded by LibrePCB itself, through the directory named by `LIBREPCB_PNS_RECORD_DIR`, and needs no named test. `tests/librepcb_sessions.rs` reads the directory at run time, and for every file it finds it checks the text round trip, `assert_replay_matches` and `assert_replay_is_collision_free`, all with `FixedClearance::uniform(sizes.min_clearance)`, the board minimum clearance the file carries. Dropping a recording in here is the whole of adding a case.
+A file named `librepcb_*.txt` was recorded by LibrePCB itself, through its Help menu entry "Record Routing Sessions", and needs no named test. `tests/librepcb_sessions.rs` reads the directory at run time, and for every file it finds it checks the text round trip, `assert_replay_matches` and `assert_replay_is_collision_free`, all with `FixedClearance::uniform(sizes.min_clearance)`, the board minimum clearance the file carries. Dropping a recording in here is the whole of adding a case.
 
 The known limitation is the resolver. A recording carries `max_clearance` and the sizes but no rule table, so the uniform board minimum is the best resolver that can be reconstructed from the file. That is exact only while no net class on the board overrides the board minimum. A board that does override it will replay to different geometry than LibrePCB produced and must not be added under this prefix until recordings carry their rules, which is a `TODO.md` item. Such a board can still live here under another name, with a named test that hands `replay` a resolver of its own.
 

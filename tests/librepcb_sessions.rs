@@ -3,7 +3,7 @@
 //! Every session LibrePCB recorded, replayed.
 //!
 //! LibrePCB writes a recording of each push and shove session it runs to
-//! the directory named by `LIBREPCB_PNS_RECORD_DIR`, in the text format
+//! the directory chosen in its Help menu entry "Record Routing Sessions", in the text format
 //! of `src/eventlog.rs`. Dropping such a file into
 //! `tests/fixtures/sessions/` under the `librepcb_` prefix is the whole
 //! of adding a regression case: this test discovers the files at run

@@ -8,7 +8,7 @@ Confidence and a first crates.io release.
 
 ## Tasks
 
-- [x] Fixtures from real LibrePCB boards through the recorder. LibrePCB writes one file per routing session when `LIBREPCB_PNS_RECORD_DIR` names an existing directory, in this crate's own recorded session format. See [../librepcb-integration.md](../librepcb-integration.md) section 3.1.1 and the note there on picking a resolver for the replay.
+- [x] Fixtures from real LibrePCB boards through the recorder. LibrePCB writes one file per routing session while recording is on (Help menu, "Record Routing Sessions"), in this crate's own recorded session format. See [../librepcb-integration.md](../librepcb-integration.md) section 3.1.1 and the note there on picking a resolver for the replay.
 - [x] Property tests for geometry invariants: `tests/geometry_props.rs` covers segment distance and intersection, chain simplification, slicing, point in polygon against an even odd reference, chain intersection symmetry, collision symmetry and the gap bound, the translation vector, and hull closure, orientation, containment and growth. cargo-fuzz is deferred: it needs a nightly toolchain, which the container image does not carry (TODO.md).
 - [x] Performance profiling on a large board, budget tuning. See [../performance.md](../performance.md): the `examples/latency.rs` harness, the numbers, the profile and what the shove budget buys.
 - [x] `cargo doc` clean, README examples, CHANGELOG. The crate level documentation in `src/lib.rs` is a compiling doctest of a whole session plus a map of the modules, `README.md` carries the same example trimmed, and [../../CHANGELOG.md](../../CHANGELOG.md) says what 0.1.0 contains and what it deliberately leaves out.
