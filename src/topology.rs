@@ -26,10 +26,6 @@
 //!
 //! # What is not here
 //!
-//! - `SimplifyLine` (`:49`). Its only callers in this KiCad revision are
-//!   `pns_diff_pair_placer.cpp:853` and `:854`, and differential pairs
-//!   are out of scope (`PLAN.md`). Nothing in the single line router
-//!   calls it, so porting it now would add an untested public function.
 //! - `AssembleTuningPath`, `walkTuningPath` and `findLinesFromVia`
 //!   (`:787`, `:611`, `:536`): length tuning only.
 //! - `AssembleDiffPair` and the `DP_PARALLELITY_THRESHOLD` machinery
@@ -187,6 +183,82 @@ fn find_joint_of_line(
   line: &Line,
 ) -> Option<JointRef> {
   world.find_joint(node, pos, line.layers().start(), line.net())
+}
+
+// ---------------------------------------------------------------------
+// SimplifyLine
+// ---------------------------------------------------------------------
+
+/// Drop the redundant vertices of a stored track, in place in the node.
+///
+/// Port of `TOPOLOGY::SimplifyLine`,
+/// `pcbnew/router/pns_topology.cpp:49`. `line` is only ever read for its
+/// first link: the geometry that is simplified is whatever
+/// [`World::assemble_line`] finds from that link, which may be longer
+/// than `line` itself if the track continues past it. The answer is
+/// whether anything was rewritten.
+///
+/// Its only callers in KiCad are the two lines of
+/// `DIFF_PAIR_PLACER::FixRoute` that tidy the two lanes after they have
+/// been committed (`pcbnew/router/pns_diff_pair_placer.cpp:853`, `:854`),
+/// which is why it arrives with milestone 10 and not earlier.
+///
+/// # Simplify, not Simplify2
+///
+/// `SHAPE_LINE_CHAIN::Simplify()` with its default tolerance of zero
+/// ([`LineChain::simplify`]), not [`LineChain::simplify2`]. The two
+/// differ on what counts as collinear and on whether a closed chain may
+/// lose its first vertex; see [`LineChain::simplify`].
+///
+/// # The node is rewritten by remove and add
+///
+/// The assembled track leaves the node and a copy with the simplified
+/// shape goes back in, so every segment of the track is a new item with a
+/// new [`crate::item::ItemId`] afterwards and any handle a caller was
+/// holding is stale. KiCad has the same property; it is only less visible
+/// there because the items are pointers into a pool.
+///
+/// `NODE::Remove( LINE& )` clears the line's links before
+/// `LINE lnew( l )` copies it (`:62`, `:63`), so the copy that is added
+/// back is unlinked, which is what [`World::add_line`] requires.
+pub fn simplify_line(world: &mut World, node: NodeId, line: &Line) -> bool {
+  // :51
+  if !line.is_linked() || line.segment_count() == 0 {
+    return false;
+  }
+
+  // :54. KiCad's `GetLink( 0 )` indexes the vector directly; the line is
+  // linked, so this cannot in fact answer `None`.
+  let Some(root) = line.link_at(0) else {
+    return false;
+  };
+
+  // :55, :56
+  let mut assembled =
+    world.assemble_line(node, root, None, false, false, false);
+  let mut simplified = assembled.shape().clone();
+
+  // :58
+  simplified.simplify(0);
+
+  // :60
+  if simplified.point_count() == assembled.point_count() {
+    return false;
+  }
+
+  // :62
+  world.remove_line(node, &mut assembled);
+
+  // :63, :64
+  let mut replacement = assembled.clone();
+
+  replacement.set_shape(simplified);
+
+  // :65
+  world.add_line(node, &mut replacement, false);
+
+  // :66
+  true
 }
 
 // ---------------------------------------------------------------------
@@ -994,5 +1066,94 @@ mod tests {
 
     assert_eq!(position(left), Vec2::new(0, 0));
     assert_eq!(position(right), Vec2::new(20_000, 0));
+  }
+
+  /// A track with a collinear vertex loses it, in the node and not only
+  /// in the caller's copy.
+  ///
+  /// The three fixture segments meet at `(10000, 0)` and `(20000, 0)`;
+  /// only the first of those two joints is redundant, because the run
+  /// turns at the second.
+  #[test]
+  fn simplify_line_drops_a_collinear_vertex_from_the_node() {
+    let mut world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let root = world.root();
+    let first =
+      add_track(&mut world, root, Vec2::new(0, 0), Vec2::new(10_000, 0));
+
+    add_track(&mut world, root, Vec2::new(10_000, 0), Vec2::new(20_000, 0));
+    add_track(
+      &mut world,
+      root,
+      Vec2::new(20_000, 0),
+      Vec2::new(30_000, 10_000),
+    );
+
+    let line = world.assemble_line(root, first, None, false, false, false);
+
+    assert_eq!(line.point_count(), 4);
+
+    assert!(simplify_line(&mut world, root, &line));
+
+    // The redundant joint is gone from the node and the corner is not.
+    assert!(
+      world
+        .find_joint(root, Vec2::new(10_000, 0), 0, NET)
+        .is_none()
+    );
+    assert!(
+      world
+        .find_joint(root, Vec2::new(20_000, 0), 0, NET)
+        .is_some()
+    );
+
+    let start = world
+      .find_joint(root, Vec2::new(0, 0), 0, NET)
+      .expect("the west end still sits on a joint");
+    let link = *world
+      .joint(start)
+      .expect("the joint is live")
+      .links()
+      .first()
+      .expect("the joint holds the first segment of the run");
+    let rebuilt = world.assemble_line(root, link, None, false, false, false);
+
+    assert_eq!(rebuilt.point_count(), 3);
+    assert!(!rebuilt.shape().points().contains(&Vec2::new(10_000, 0)));
+
+    // And a run with nothing left to drop answers false, leaving the
+    // node alone.
+    assert!(!simplify_line(&mut world, root, &rebuilt));
+    assert_eq!(
+      world
+        .assemble_line(root, link, None, false, false, false)
+        .point_count(),
+      3
+    );
+  }
+
+  /// The two guards of `pns_topology.cpp:51`.
+  #[test]
+  fn simplify_line_refuses_a_line_that_is_not_in_the_node() {
+    let mut world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let root = world.root();
+    let mut loose = Line::new();
+
+    loose.set_shape(LineChain::from_slice(
+      &[Vec2::new(0, 0), Vec2::new(10_000, 0), Vec2::new(20_000, 0)],
+      false,
+    ));
+
+    // Linked to nothing, so there is no root segment to assemble from.
+    assert!(!simplify_line(&mut world, root, &loose));
+
+    // And a linked line with no segment at all is refused by the second
+    // half of the same guard.
+    let pad = add_pad(&mut world, root, Vec2::new(0, 0));
+    let mut empty = Line::new();
+
+    empty.link(pad);
+
+    assert!(!simplify_line(&mut world, root, &empty));
   }
 }

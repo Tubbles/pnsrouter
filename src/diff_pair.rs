@@ -33,9 +33,10 @@
 //! # What is not
 //!
 //! - The placer itself, `DIFF_PAIR_PLACER`, and everything that needs a
-//!   node: `EndingPrimitives`, the via placement path and the pair's
-//!   optimizer passes. They are the later slices of
-//!   `doc/work/010-differential-pairs.md`.
+//!   node: `EndingPrimitives` and the via placement path. They are the
+//!   later slices of `doc/work/010-differential-pairs.md`. The pair's
+//!   optimizer passes live with the rest of the optimizer, at
+//!   [`crate::optimizer::Optimizer::optimize_diff_pair`].
 //! - `DP_GATEWAYS::BuildOrthoProjections` (`pns_diff_pair.cpp:302`), which
 //!   has no caller anywhere in KiCad's tree and whose ortho mode flag the
 //!   pair placer stores and never reads (note 07 errata E1 and E13).

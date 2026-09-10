@@ -75,9 +75,19 @@
 //! - **`COST_ESTIMATOR::Add` / `Remove` / `Replace` / `IsBetter`** and
 //!   the whole `m_lengthCost` running total, which nothing calls
 //!   (note 04 section 4.9).
-//! - **The diff pair path**, `mergeDpSegments`, `mergeDpStep`,
-//!   `coupledBypass` and `verifyDpBypass`, together with `Tighten` and
-//!   its helpers, which nothing calls.
+//! - **`Tighten` and its helpers**, which nothing calls.
+//! - **`checkDpColliding`** (`pcbnew/router/pns_optimizer.cpp:1426`),
+//!   which has no caller either and whose two lines
+//!   [`Optimizer::verify_dp_bypass`] does inline; note 07 erratum E15.
+//!
+//! # The differential pair path
+//!
+//! [`Optimizer::optimize_diff_pair`] is a second entry point with
+//! nothing in common with the one above: one pass,
+//! [`Optimizer::merge_dp_segments`], no effort flags, no constraints and
+//! no cost estimator. What decides there is coupled length, and the
+//! reference note is `doc/reference/kicad/07-differential-pairs.md`
+//! section 6.
 //!
 //! # The drag only pass
 //!
@@ -113,6 +123,7 @@ use std::ops::{BitAnd, BitOr, BitOrAssign};
 
 use crate::algo_base::AlgoContext;
 use crate::collide::CollisionSearchOptions;
+use crate::diff_pair::DiffPair;
 use crate::geometry::box2::Box2;
 use crate::geometry::collision::collide_seg;
 use crate::geometry::direction45::{AngleType, CornerMode, Direction45};
@@ -2534,6 +2545,521 @@ impl Optimizer {
     chain.segment_count() < segments_before
   }
 
+  // -----------------------------------------------------------------
+  // The differential pair path
+  // -----------------------------------------------------------------
+
+  /// Make a differential pair shorter without decoupling it.
+  ///
+  /// Port of `OPTIMIZER::Optimize( DIFF_PAIR* )`,
+  /// `pcbnew/router/pns_optimizer.cpp:1538`, which forwards to
+  /// [`Optimizer::merge_dp_segments`] and does nothing else. The pair
+  /// placer is its only caller, on a default constructed optimizer over
+  /// the node it is routing in (`pcbnew/router/pns_diff_pair_placer.cpp:311`).
+  ///
+  /// # None of the effort flags reach this
+  ///
+  /// `m_effortLevel` is not read anywhere on the pair path and none of
+  /// the helpers below calls `checkConstraints`, so every bit of
+  /// [`EffortFlags`] is inert here, and so is
+  /// [`Optimizer::set_collision_mask`]: the collision queries run with
+  /// the node's default kind mask, exactly as
+  /// [`Optimizer::check_colliding`] already does. That is note 07
+  /// section 6's answer to "which optimizer flags are differential pair
+  /// specific": none, in either direction. The pair path also never
+  /// populates KiCad's item cache, which is dead anyway (see the module
+  /// documentation).
+  ///
+  /// # What it does not do
+  ///
+  /// Nothing here rebuilds the pair's vias, nets, width or gap; only the
+  /// two chains change, through [`crate::diff_pair::DiffPair::set_shape`].
+  pub fn optimize_diff_pair(
+    &self,
+    world: &World,
+    context: &AlgoContext<'_>,
+    pair: &mut DiffPair,
+  ) -> bool {
+    // :1540
+    self.merge_dp_segments(world, context, pair)
+  }
+
+  /// Run [`Optimizer::merge_dp_step`] over both lanes, coarse to fine.
+  ///
+  /// Port of `OPTIMIZER::mergeDpSegments`,
+  /// `pcbnew/router/pns_optimizer.cpp:1497`. The same descending span
+  /// skeleton as [`Optimizer::merge_full`], run independently on the two
+  /// lanes: each lane keeps its own span length, a lane that found a
+  /// merge keeps its length for the next pass, and a pass in which
+  /// neither lane found anything shortens **both**.
+  ///
+  /// The answer is a constant `true` (`:1534`), which is what
+  /// `OPTIMIZER::Optimize( DIFF_PAIR* )` hands its caller. It is not a
+  /// "something changed" flag and must not be read as one.
+  ///
+  /// # Deviation: the loop is bounded, erratum E14
+  ///
+  /// KiCad's loop is `while( 1 )` and leaves only through
+  /// `step_p < 1 && step_n < 1` (`:1516`), while the two counters fall
+  /// only in the pass where neither lane merged (`:1528`). A
+  /// [`Optimizer::merge_dp_step`] that keeps succeeding without shortening
+  /// either chain therefore spins forever; the single line path is bounded
+  /// by [`MERGE_PASS_LIMIT`] and this one is not. Here it is bounded by
+  /// the same constant, through the private `merge_dp_passes` the
+  /// pass limit test reads.
+  ///
+  /// The other half of E14 is transcribed rather than fixed: a span
+  /// length of exactly one satisfies neither the `step > 1` guards
+  /// (`:1522`, `:1525`) nor the `step < 1` exit, so it costs one pass per
+  /// lane and then decrements both counters. Removing it would change
+  /// how many passes a pair takes, which is observable through the bound.
+  pub fn merge_dp_segments(
+    &self,
+    world: &World,
+    context: &AlgoContext<'_>,
+    pair: &mut DiffPair,
+  ) -> bool {
+    self.merge_dp_passes(world, context, pair, MERGE_PASS_LIMIT);
+
+    // :1534
+    true
+  }
+
+  /// The bounded body of [`Optimizer::merge_dp_segments`], answering how
+  /// many passes it took.
+  ///
+  /// Split out so that the bound erratum E14 asks for is a value a test
+  /// can read rather than an argument about termination. `limit` is
+  /// [`MERGE_PASS_LIMIT`] on every path but the test's.
+  fn merge_dp_passes(
+    &self,
+    world: &World,
+    context: &AlgoContext<'_>,
+    pair: &mut DiffPair,
+    limit: usize,
+  ) -> usize {
+    // :1499, :1500
+    let mut step_p = pair.chain_p().segment_count() as isize - 2;
+    let mut step_n = pair.chain_n().segment_count() as isize - 2;
+    let mut passes = 0;
+
+    // :1502, bounded.
+    while passes < limit {
+      passes += 1;
+
+      // :1504 to :1508
+      let max_step_p = pair.chain_p().segment_count() as isize - 2;
+      let max_step_n = pair.chain_n().segment_count() as isize - 2;
+
+      // :1510, :1513
+      step_p = step_p.min(max_step_p);
+      step_n = step_n.min(max_step_n);
+
+      // :1516
+      if step_p < 1 && step_n < 1 {
+        break;
+      }
+
+      // :1519, :1520
+      let mut found_p = false;
+      let mut found_n = false;
+
+      // :1522
+      if step_p > 1 {
+        found_p =
+          self.merge_dp_step(world, context, pair, true, step_p as usize);
+      }
+
+      // :1525
+      if step_n > 1 {
+        found_n =
+          self.merge_dp_step(world, context, pair, false, step_n as usize);
+      }
+
+      // :1528. A span length of one lands here every time; see the
+      // deviation on `Optimizer::merge_dp_segments`.
+      if !found_n && !found_p {
+        step_n -= 1;
+        step_p -= 1;
+      }
+    }
+
+    passes
+  }
+
+  /// Try to bypass one span of one lane, anywhere along it.
+  ///
+  /// Port of `OPTIMIZER::mergeDpStep`,
+  /// `pcbnew/router/pns_optimizer.cpp:1434`. For each span of `step`
+  /// segments whose outer segments meet at an obtuse angle it builds the
+  /// canonical 45 degree connection between the span's outer endpoints,
+  /// then asks [`Optimizer::coupled_bypass`] for a matching bypass on the
+  /// other lane. `try_p` selects which lane is the reference: the P lane
+  /// with it set, the N lane without.
+  ///
+  /// # What decides
+  ///
+  /// The coupled length may drop by at most a tenth of what it was. The
+  /// budget is computed once from the pre merge coupled length (`:1444`,
+  /// with KiCad's "fixme: come up with something more intelligent here"
+  /// left where it stands) and both deltas are
+  /// `new - old + budget >= 0`. Length, corner cost and the constraints
+  /// play no part; [`CostEstimator`] is not consulted anywhere on this
+  /// path.
+  ///
+  /// # Two lanes, two outcomes
+  ///
+  /// When [`Optimizer::coupled_bypass`] succeeds, both lanes change. When
+  /// it fails, the reference lane may still be rewritten on its own,
+  /// under the stricter `delta_uncoupled` test and a direct
+  /// [`Optimizer::verify_dp_bypass`] (`:1480`); the coupled lane then
+  /// keeps its shape apart from the [`LineChain::simplify2`] at `:1483`,
+  /// which is why KiCad's `coupledPath` is a copy taken at `:1439` and
+  /// why it is a copy here.
+  ///
+  /// # The index the replacement uses
+  ///
+  /// `Replace( s1.Index(), s2.Index(), bypass )` (`:1463`) splices over
+  /// the span's own segment indices while the bypass ends on the point
+  /// **after** the span, so the result carries a duplicate of that point
+  /// until the [`LineChain::simplify2`] at `:1473`. The same one point
+  /// offset appears in [`Optimizer::merge_step`], and it is reproduced
+  /// for the same reason: both ranges are observable.
+  pub fn merge_dp_step(
+    &self,
+    world: &World,
+    context: &AlgoContext<'_>,
+    pair: &mut DiffPair,
+    try_p: bool,
+    step: usize,
+  ) -> bool {
+    // :1438, :1439
+    let current_path = if try_p {
+      pair.chain_p().clone()
+    } else {
+      pair.chain_n().clone()
+    };
+    let mut coupled_path = if try_p {
+      pair.chain_n().clone()
+    } else {
+      pair.chain_p().clone()
+    };
+
+    // :1441
+    let span_end = current_path.segment_count() as isize - 1;
+
+    // :1443, :1444
+    let coupled_before =
+      pair.coupled_length_of_chains(&current_path, &coupled_path);
+    let budget = coupled_before / 10;
+
+    // :1436, :1446
+    let mut index: isize = 1;
+
+    while index < span_end - step as isize {
+      let start = index as usize;
+
+      // :1448, :1449
+      let first = current_path.segment(start);
+      let second = current_path.segment(start + step);
+
+      // :1451, :1452
+      let first_direction = Direction45::from_seg(&first, false);
+      let second_direction = Direction45::from_seg(&second, false);
+
+      // :1454
+      if first_direction.is_obtuse(second_direction) {
+        // :1456
+        let bypass = LineChain::from_points(
+          Direction45::default().build_initial_trace(
+            first.a,
+            second.b,
+            first_direction.is_diagonal(),
+            CornerMode::Mitered45,
+          ),
+          false,
+        );
+
+        // :1462, :1463
+        let mut new_reference = current_path.clone();
+
+        new_reference.replace_with_chain(
+          shape_index(&first),
+          shape_index(&second),
+          &bypass,
+        );
+
+        // :1465
+        let delta_uncoupled = pair
+          .coupled_length_of_chains(&new_reference, &coupled_path)
+          - coupled_before
+          + budget;
+
+        // :1467
+        if let Some(mut new_coupled) = self.coupled_bypass(
+          world,
+          context,
+          pair,
+          try_p,
+          &new_reference,
+          &bypass,
+          &coupled_path,
+        ) {
+          // :1469
+          let delta_coupled = pair
+            .coupled_length_of_chains(&new_reference, &new_coupled)
+            - coupled_before
+            + budget;
+
+          // :1471
+          if delta_coupled >= 0 {
+            // :1473, :1474
+            new_reference.simplify2(true);
+            new_coupled.simplify2(true);
+
+            // :1476
+            pair.set_shape(new_reference, new_coupled, !try_p);
+
+            return true;
+          }
+        } else if delta_uncoupled >= 0
+          && self.verify_dp_bypass(
+            world,
+            context,
+            pair,
+            try_p,
+            &new_reference,
+            &coupled_path,
+          )
+        {
+          // :1482, :1483
+          new_reference.simplify2(true);
+          coupled_path.simplify2(true);
+
+          // :1485
+          pair.set_shape(new_reference, coupled_path, !try_p);
+
+          return true;
+        }
+      }
+
+      // :1490
+      index += 1;
+    }
+
+    false
+  }
+
+  /// Find the bypass on the coupled lane that keeps the most coupling.
+  ///
+  /// Port of `coupledBypass`, `pcbnew/router/pns_optimizer.cpp:1369`. It
+  /// starts from every vertex of the coupled lane that
+  /// [`find_coupled_vertices`] found opposite the reference bypass's
+  /// first vertex, runs a 45 degree connection from there to every
+  /// interior vertex of the lane more than one index away, and keeps the
+  /// candidate with the greatest coupled length that
+  /// [`Optimizer::verify_dp_bypass`] accepts. [`None`] is KiCad's `false`.
+  ///
+  /// # A segment index used as a point index
+  ///
+  /// [`find_coupled_vertices`] answers with **segment** indices (`:1340`)
+  /// and this reads them as **point** indices (`:1392`, `:1400`). Segment
+  /// `i` starts at point `i`, so what the code means by it is "the start
+  /// point of that segment", and the conflation is harmless because a
+  /// segment index is always a valid point index. It is transcribed as it
+  /// stands.
+  ///
+  /// # Deviations
+  ///
+  /// KiCad collects the start indices into `int vStartIdx[1024]` with the
+  /// comment "fixme: possible overflow" and no bound
+  /// (`:1373`); a lane with more than 1024 parallel segments at the gap
+  /// walks off the end of it. Here it is a [`Vec`] and the question does
+  /// not arise.
+  ///
+  /// KiCad reads `aRefBypass.CPoint( 0 )` and `aRefBypass.CSegment( 0 )`
+  /// unguarded (`:1374`). A bypass between two coincident points is a one
+  /// point chain with no segment, which [`LineChain::segment`] refuses, so
+  /// that case answers [`None`] here instead of reading out of bounds.
+  #[allow(clippy::too_many_arguments)]
+  pub fn coupled_bypass(
+    &self,
+    world: &World,
+    context: &AlgoContext<'_>,
+    pair: &DiffPair,
+    reference_is_p: bool,
+    reference: &LineChain,
+    reference_bypass: &LineChain,
+    coupled: &LineChain,
+  ) -> Option<LineChain> {
+    if reference_bypass.segment_count() == 0 {
+      return None;
+    }
+
+    let opening = reference_bypass.segment(0);
+
+    // :1374
+    let starts =
+      find_coupled_vertices(reference_bypass.point(0), opening, coupled, pair);
+
+    // :1377
+    let direction = Direction45::from_seg(&opening, false);
+
+    // :1379, :1380
+    let mut best_length: i64 = -1;
+    let mut best: Option<LineChain> = None;
+
+    // :1384
+    for start in starts {
+      // :1386
+      for end in 1..coupled.point_count().saturating_sub(1) {
+        // :1388, :1390
+        if start.abs_diff(end) <= 1 {
+          continue;
+        }
+
+        // :1392, :1393
+        let bypass = LineChain::from_points(
+          direction.build_initial_trace(
+            coupled.point(start),
+            coupled.point(end),
+            direction.is_diagonal(),
+            CornerMode::Mitered45,
+          ),
+          false,
+        );
+
+        // :1396
+        let coupled_length = pair.coupled_length_of_chains(reference, &bypass);
+
+        // :1398 to :1406. The reversal is what keeps the lane's own
+        // direction when the search runs backwards along it.
+        let mut candidate = coupled.clone();
+
+        if start < end {
+          candidate.replace_with_chain(start, end, &bypass);
+        } else {
+          candidate.replace_with_chain(end, start, &bypass.reversed());
+        }
+
+        // :1408. The score is read before the verification, so a
+        // candidate that scores no better is never checked against the
+        // node.
+        if coupled_length > best_length
+          && self.verify_dp_bypass(
+            world,
+            context,
+            pair,
+            reference_is_p,
+            reference,
+            &candidate,
+          )
+        {
+          // :1411 to :1413
+          best_length = coupled_length;
+          best = Some(candidate);
+        }
+      }
+    }
+
+    // :1419, :1422
+    best
+  }
+
+  /// Whether two candidate lane shapes clear each other and the node.
+  ///
+  /// Port of `verifyDpBypass`,
+  /// `pcbnew/router/pns_optimizer.cpp:1350`. The two chains are wrapped
+  /// in lines built from the pair's own lanes, so they carry the pair's
+  /// width, net and layer, and then three questions are asked: do the two
+  /// lanes hit each other, does the reference lane hit the node, does the
+  /// coupled lane hit the node.
+  ///
+  /// # The lane to lane test is an ordinary clearance test
+  ///
+  /// It goes through the rule resolver like any other pair of items, not
+  /// through the forced pair gap `attemptWalk` installs
+  /// (`pcbnew/router/pns_diff_pair_placer.cpp:247`). So the optimizer will
+  /// happily bring the two lanes closer together than the pair gap as
+  /// long as the netclass clearance allows it. The only thing pushing
+  /// back is the coupled length, and only as a score; see
+  /// [`Optimizer::merge_dp_step`].
+  ///
+  /// # The end vias are dropped
+  ///
+  /// `PLine()` and `NLine()` attach the pair's end via when it has one
+  /// (`pns_diff_pair.h:491`, through `updateLine` at `:545`), and the
+  /// `LINE( const LINE&, const SHAPE_LINE_CHAIN& )` constructor that
+  /// wraps them here sets `m_via = nullptr` (`pns_line.h:90`). So a pair
+  /// that ends with vias is verified without them and a bypass whose end
+  /// via would collide is accepted. [`Line::with_chain`] drops the via
+  /// for the same reason, so the behaviour comes for free; note 07
+  /// section 6.3 does not mention it.
+  ///
+  /// # The caller contract of the module documentation applies
+  ///
+  /// Both candidates are checked against the node with
+  /// [`Optimizer::check_colliding`], so the pair's own segments must not
+  /// be in it. `OPTIMIZER::Optimize( DIFF_PAIR* )` is called on a pair
+  /// that has not been fixed yet, which is how KiCad satisfies that.
+  ///
+  /// `checkDpColliding` (`:1426`) does the same node query in two lines
+  /// and has no caller anywhere in KiCad's tree; erratum E15, not ported.
+  pub fn verify_dp_bypass(
+    &self,
+    world: &World,
+    context: &AlgoContext<'_>,
+    pair: &DiffPair,
+    reference_is_p: bool,
+    new_reference: &LineChain,
+    new_coupled: &LineChain,
+  ) -> bool {
+    // :1353, :1354
+    let reference_base = if reference_is_p {
+      pair.p_line()
+    } else {
+      pair.n_line()
+    };
+    let coupled_base = if reference_is_p {
+      pair.n_line()
+    } else {
+      pair.p_line()
+    };
+    let reference_line =
+      Line::with_chain(&reference_base, new_reference.clone());
+    let coupled_line = Line::with_chain(&coupled_base, new_coupled.clone());
+
+    let options = CollisionSearchOptions {
+      limit_count: Some(1),
+      ..CollisionSearchOptions::default()
+    };
+
+    // :1356. `refLine.Collide( &coupledLine, aNode, refLine.Layer() )`
+    // has the reference lane as `this` and the coupled one as the head,
+    // which is the way round `World::collide_lines` takes them. The layer
+    // argument has no counterpart: both lines already carry the pair's
+    // layer.
+    if world
+      .collide_lines(&reference_line, &coupled_line, context.resolver, &options)
+      .is_some()
+    {
+      return false;
+    }
+
+    // :1359
+    if self.check_colliding(world, context, &reference_line) {
+      return false;
+    }
+
+    // :1362
+    if self.check_colliding(world, context, &coupled_line) {
+      return false;
+    }
+
+    // :1365
+    true
+  }
+
   /// Redraw the exit from one pad so that the trace leaves it cleanly.
   ///
   /// Port of `OPTIMIZER::smartPadsSingle`,
@@ -2960,6 +3486,71 @@ impl Optimizer {
 
     false
   }
+}
+
+// ---------------------------------------------------------------------
+// The differential pair path
+// ---------------------------------------------------------------------
+
+/// Every segment of one lane that faces a vertex of the other at the
+/// pair's gap.
+///
+/// Port of `findCoupledVertices`,
+/// `pcbnew/router/pns_optimizer.cpp:1323`, a free function in KiCad too.
+/// `vertex` and `original` are the first point and the first segment of
+/// the reference lane's bypass, and the answer is the **segment** indices
+/// of `coupled` that are [`Seg::approx_parallel`] to `original` and whose
+/// line passes the pair's gap constraint at `vertex`.
+///
+/// This is the only reader of
+/// [`crate::diff_pair::DiffPair::gap_constraint`] outside
+/// `pns_diff_pair.cpp`, and like the two coupled length routines it wants
+/// the **edge to edge** value: the pair's width is subtracted from the
+/// centre to centre distance before the constraint is asked. See the
+/// `diff_pair` module documentation on the two meanings of the gap.
+///
+/// # It does not take the absolute value
+///
+/// `CoupledSegmentPairs` and `CoupledLength` both wrap the distance in
+/// `std::abs` (`pns_diff_pair.cpp:855`, `:881`); this one does not
+/// (`:1335`). It matters for a lane narrower than the pair's own width,
+/// where the difference goes negative and no positive gap constraint can
+/// match it. Transcribed as it stands.
+///
+/// KiCad projects the vertex onto every segment before testing whether
+/// that segment is parallel at all (`:1331`); the projection is moved
+/// under the test here, which changes nothing and saves the work.
+pub fn find_coupled_vertices(
+  vertex: Vec2,
+  original: Seg,
+  coupled: &LineChain,
+  pair: &DiffPair,
+) -> Vec<usize> {
+  let mut indices = Vec::new();
+
+  // :1328
+  for index in 0..coupled.segment_count() {
+    let segment = coupled.segment(index);
+
+    // :1333
+    if !segment.approx_parallel(&original, Seg::APPROX_DISTANCE_THRESHOLD) {
+      continue;
+    }
+
+    // :1331, :1335
+    let projected = segment.line_project(vertex);
+    let distance = i64::from((projected - vertex).euclidean_norm())
+      - i64::from(pair.width());
+
+    // :1338
+    if pair.gap_constraint().matches(distance) {
+      // :1340, :1341
+      indices.push(index);
+    }
+  }
+
+  // :1346
+  indices
 }
 
 #[cfg(test)]
@@ -3841,5 +4432,308 @@ mod tests {
 
     assert!(optimizer.run_smart_pads(&world, &context, &mut line));
     assert_eq!(*line.shape(), before);
+  }
+
+  // -----------------------------------------------------------------
+  // The differential pair path
+  // -----------------------------------------------------------------
+
+  /// The width of one lane of the pair fixtures.
+  const DP_WIDTH: i32 = 100_000;
+
+  /// The edge to edge gap of the pair fixtures, which with
+  /// [`DP_WIDTH`] puts the two centre lines 500000 apart.
+  const DP_GAP: i32 = 400_000;
+
+  /// The clearance the pair fixtures are routed under. It has to sit
+  /// below the 253553 the two lanes leave each other along their 45
+  /// degree legs, which is what a gap measured across a diagonal comes
+  /// to.
+  const DP_CLEARANCE: i32 = 100_000;
+
+  /// A pair with the same detour on both lanes, at the gap along its
+  /// straight runs.
+  ///
+  /// The P lane runs east at `y = 0`, spikes out to `(2e6, -1e6)` and
+  /// comes back, runs east again and leaves on a diagonal. The N lane is
+  /// the same chain moved 500000 along y, so the two straight runs are
+  /// coupled and the four diagonals are not: a diagonal moved along y by
+  /// the pitch is only `pitch / sqrt(2)` from its twin.
+  fn spiked_pair() -> DiffPair {
+    let p = LineChain::from_slice(
+      &[
+        Vec2::new(0, 0),
+        Vec2::new(1_000_000, 0),
+        Vec2::new(2_000_000, -1_000_000),
+        Vec2::new(3_000_000, 0),
+        Vec2::new(4_000_000, 0),
+        Vec2::new(5_000_000, -1_000_000),
+      ],
+      false,
+    );
+    let n = LineChain::from_points(
+      p.points()
+        .iter()
+        .map(|point| Vec2::new(point.x, point.y + 500_000))
+        .collect(),
+      false,
+    );
+    let mut pair = DiffPair::from_chains(p, n, DP_GAP);
+
+    pair.set_width(DP_WIDTH);
+    pair.set_gap(DP_GAP);
+    pair.set_nets(Some(NetId(1)), Some(NetId(2)));
+    pair.set_layer(0);
+
+    pair
+  }
+
+  /// A round solid on a third net, on the pair fixtures' layer.
+  fn dp_obstacle(world: &mut World, at: Vec2, radius: i32) -> ItemId {
+    let body = ItemBody::Solid(Solid::new(Shape::circle(at, radius), at));
+    let mut item = world.make_item(body);
+
+    item.set_layers_and_flash_all(LayerRange::single(0));
+    item.set_net(Some(NetId(3)));
+
+    let root = world.root();
+
+    world.add_solid(root, item, None)
+  }
+
+  /// Both lanes lose their spike in one pass, and the pair comes out
+  /// more coupled than it went in.
+  ///
+  /// The reference lane's span is `[s1, s3]`, whose outer segments are a
+  /// 45 degree leg and an east leg and therefore obtuse. Its bypass runs
+  /// straight from `(1e6, 0)` to `(4e6, 0)`, which is
+  /// `coupledBypass`'s cue to straighten the N lane over the same run;
+  /// the winner there is the candidate that reaches furthest, because the
+  /// score is coupled length and nothing else.
+  #[test]
+  fn a_spike_on_both_lanes_is_merged_and_the_pair_stays_coupled() {
+    let world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let root = world.root();
+    let resolver = FixedClearance::uniform(DP_CLEARANCE);
+    let settings = RoutingSettings::default();
+    let context = AlgoContext::new(&resolver, &settings);
+    let optimizer = Optimizer::new(root);
+    let mut pair = spiked_pair();
+
+    // The two straight runs, 1e6 and 1e6 of them.
+    assert_eq!(pair.coupled_length(), 2_000_000);
+
+    assert!(optimizer.optimize_diff_pair(&world, &context, &mut pair));
+
+    assert_eq!(
+      pair.chain_p().points(),
+      &[
+        Vec2::new(0, 0),
+        Vec2::new(4_000_000, 0),
+        Vec2::new(5_000_000, -1_000_000),
+      ]
+    );
+    assert_eq!(
+      pair.chain_n().points(),
+      &[
+        Vec2::new(0, 500_000),
+        Vec2::new(4_000_000, 500_000),
+        Vec2::new(5_000_000, -500_000),
+      ]
+    );
+
+    // The whole 4e6 of straight run is coupled now, where two thirds of
+    // it used to be spent on the detour.
+    assert_eq!(pair.coupled_length(), 4_000_000);
+  }
+
+  /// The same pair, with a solid on each of the two straight runs the
+  /// bypasses want.
+  ///
+  /// Both sit at `x = 2e6`, where the detour has taken the two lanes
+  /// well out of the way: the nearer one is 353553 from the N lane and
+  /// 707107 from the P lane, the further one 707107 and 1060660, so
+  /// neither lane touches either before the merge. They are on the two
+  /// straight lines the lanes would be rewritten onto, so every
+  /// candidate fails [`Optimizer::verify_dp_bypass`] and the pair comes
+  /// out untouched.
+  ///
+  /// Both solids are needed. With only the one on the P run, the N lane
+  /// still straightens on its own: its bypass is clear, and
+  /// [`Optimizer::coupled_bypass`] then wins with the candidate that
+  /// leaves the P lane exactly as it is.
+  #[test]
+  fn a_bypass_that_would_hit_an_obstacle_is_rejected() {
+    let mut world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let root = world.root();
+    let resolver = FixedClearance::uniform(DP_CLEARANCE);
+    let settings = RoutingSettings::default();
+    let context = AlgoContext::new(&resolver, &settings);
+    let optimizer = Optimizer::new(root);
+    let mut pair = spiked_pair();
+    let before = pair.clone();
+
+    dp_obstacle(&mut world, Vec2::new(2_000_000, 0), 150_000);
+    dp_obstacle(&mut world, Vec2::new(2_000_000, 500_000), 150_000);
+
+    // Neither lane touches the two solids where they are now.
+    assert!(!optimizer.check_colliding(&world, &context, &pair.p_line()));
+    assert!(!optimizer.check_colliding(&world, &context, &pair.n_line()));
+
+    optimizer.optimize_diff_pair(&world, &context, &mut pair);
+
+    assert_eq!(pair.chain_p().points(), before.chain_p().points());
+    assert_eq!(pair.chain_n().points(), before.chain_n().points());
+  }
+
+  /// A merge that would cost more coupling than the budget allows is
+  /// refused even though nothing is in the way.
+  ///
+  /// The P lane's only obtuse span is the one that holds its whole
+  /// coupled run, so bypassing it lifts that run away from the N lane
+  /// altogether: the coupled length would fall from 2e6 to zero, where
+  /// the budget of a tenth allows it to fall by 2e5. `coupledBypass` has
+  /// nothing to offer either, because the straightened P lane is 1.4e6
+  /// from the N lane and no vertex of it matches the gap constraint.
+  #[test]
+  fn a_bypass_that_would_decouple_the_pair_is_rejected() {
+    let world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let root = world.root();
+    let resolver = FixedClearance::uniform(DP_CLEARANCE);
+    let settings = RoutingSettings::default();
+    let context = AlgoContext::new(&resolver, &settings);
+    let optimizer = Optimizer::new(root);
+    let p = LineChain::from_slice(
+      &[
+        Vec2::new(-1_000_000, 1_000_000),
+        Vec2::new(0, 1_000_000),
+        Vec2::new(1_000_000, 0),
+        Vec2::new(3_000_000, 0),
+        Vec2::new(4_000_000, 1_000_000),
+        Vec2::new(5_000_000, 1_000_000),
+        Vec2::new(6_000_000, 2_000_000),
+      ],
+      false,
+    );
+    let n = LineChain::from_slice(
+      &[
+        Vec2::new(-1_000_000, -500_000),
+        Vec2::new(6_000_000, -500_000),
+      ],
+      false,
+    );
+    let mut pair = DiffPair::from_chains(p, n, DP_GAP);
+
+    pair.set_width(DP_WIDTH);
+    pair.set_gap(DP_GAP);
+    pair.set_nets(Some(NetId(1)), Some(NetId(2)));
+    pair.set_layer(0);
+
+    let before = pair.clone();
+
+    assert_eq!(pair.coupled_length(), 2_000_000);
+
+    optimizer.optimize_diff_pair(&world, &context, &mut pair);
+
+    assert_eq!(pair.chain_p().points(), before.chain_p().points());
+    assert_eq!(pair.chain_n().points(), before.chain_n().points());
+    assert_eq!(pair.coupled_length(), 2_000_000);
+  }
+
+  /// The bound erratum E14 asks for actually stops the loop.
+  ///
+  /// A right angle staircase has no obtuse span at any length, so no
+  /// pass ever merges anything and the span counters fall by one per
+  /// pass: eighteen passes to walk a twenty segment lane down to a span
+  /// of one, and a nineteenth to leave through the exit test. Held to
+  /// three passes the loop stops after three, which is the behaviour
+  /// KiCad's `while( 1 )` cannot express.
+  #[test]
+  fn the_merge_pass_limit_bounds_the_pair_loop() {
+    let world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let root = world.root();
+    let resolver = FixedClearance::uniform(DP_CLEARANCE);
+    let settings = RoutingSettings::default();
+    let context = AlgoContext::new(&resolver, &settings);
+    let optimizer = Optimizer::new(root);
+    let mut points = vec![Vec2::new(0, 0)];
+
+    for step in 0..10 {
+      let x = (step + 1) * 100_000;
+      let y = -step * 100_000;
+
+      points.push(Vec2::new(x, y));
+      points.push(Vec2::new(x, y - 100_000));
+    }
+
+    let p = LineChain::from_points(points, false);
+    let n = LineChain::from_points(
+      p.points()
+        .iter()
+        .map(|point| Vec2::new(point.x, point.y + 500_000))
+        .collect(),
+      false,
+    );
+
+    assert_eq!(p.segment_count(), 20);
+
+    let mut pair = DiffPair::from_chains(p, n, DP_GAP);
+
+    pair.set_width(DP_WIDTH);
+    pair.set_gap(DP_GAP);
+    pair.set_nets(Some(NetId(1)), Some(NetId(2)));
+    pair.set_layer(0);
+
+    let mut bounded = pair.clone();
+
+    assert_eq!(
+      optimizer.merge_dp_passes(&world, &context, &mut pair, MERGE_PASS_LIMIT),
+      19
+    );
+    assert_eq!(
+      optimizer.merge_dp_passes(&world, &context, &mut bounded, 3),
+      3
+    );
+
+    // Neither run changed the geometry, so the two answers differ only in
+    // how long they took to say so.
+    assert_eq!(pair.chain_p().points(), bounded.chain_p().points());
+  }
+
+  /// [`find_coupled_vertices`] answers with segment indices, and it
+  /// measures edge to edge.
+  #[test]
+  fn find_coupled_vertices_picks_the_parallel_segments_at_the_gap() {
+    let pair = spiked_pair();
+    // The reference lane's bypass: straight east along `y = 0`.
+    let bypass = LineChain::from_slice(
+      &[Vec2::new(1_000_000, 0), Vec2::new(4_000_000, 0)],
+      false,
+    );
+    let found = find_coupled_vertices(
+      bypass.point(0),
+      bypass.segment(0),
+      pair.chain_n(),
+      &pair,
+    );
+
+    // The N lane's two east segments, and neither of its four diagonals.
+    assert_eq!(found, vec![0, 3]);
+
+    // A pair whose constraint holds the centre to centre pitch instead
+    // matches nothing, which is the trap the two gap meanings set.
+    let mut pitch_pair = spiked_pair();
+
+    pitch_pair.set_gap(500_000);
+
+    assert!(
+      find_coupled_vertices(
+        bypass.point(0),
+        bypass.segment(0),
+        pitch_pair.chain_n(),
+        &pitch_pair,
+      )
+      .is_empty()
+    );
   }
 }
