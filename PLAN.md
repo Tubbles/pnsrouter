@@ -21,10 +21,10 @@ Differential pairs, length tuning (meanders), multi drag, component drag, arc tr
 
 - M8 Parallel obstacle query: KiCad's thread pool in `NODE::NearestObstacle` (`pns_node.cpp:437`) ported with `std::thread::scope`, sequential below a candidate count threshold, reduction by (distance, uid) so every answer is identical on any thread count. Exit criterion: the replay fixtures and the KiCad goldens are byte identical with and without threads, and `examples/latency.rs` shows the gain on the 20 000 segment board.
 - M9 Dragging: segment, corner and via drag with the shove engine, multi drag, and the helpers deferred for them (rotation, angles, `PointAlong`, line versus line decomposition at the dragger's call sites). Exit criterion: the seven drag cases of the KiCad corpus replay to their goldens, and LibrePCB drags a trace with the select tool.
-- M10 Differential pairs: the pair placer, coupling and gap rules, the pair dragger, and the host hooks (`dp_net_pair` and friends) filled in for LibrePCB through a naming convention. Exit criterion: a pair routes in all three modes on a two layer board and the KiCad corpus has no pair case, so a recorded session from LibrePCB is the fixture.
+- M10 Differential pairs: the pair placer, coupling and gap rules, the pair dragger, and the host hooks (`dp_net_pair` and friends) filled in for LibrePCB through a naming convention. Exit criterion: a pair routes in all three modes on a synthetic two layer board in the crate's tests. The LibrePCB side is on hold until LibrePCB has a pair concept (user decision, 2026-09-10).
 - M11 Meanders: single trace length tuning, differential pair length tuning and skew tuning, chamfered corners only until arcs exist. Exit criterion: a tuned trace reaches the target length within the tolerance and replays.
 
-Later: arcs (they touch the geometry core everywhere and unlock KiCad's rounded corner modes and rounded meanders).
+Later, on hold by user decision (2026-09-10): arcs (they touch the geometry core everywhere and unlock KiCad's rounded corner modes and rounded meanders; LibrePCB traces have no arcs and upstream rates curved traces low priority) and the LibrePCB side of differential pairs.
 
 ## Work tracking
 
