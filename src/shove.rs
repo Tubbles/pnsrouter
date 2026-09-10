@@ -140,7 +140,7 @@ use std::collections::BTreeMap;
 use crate::algo_base::AlgoContext;
 use crate::collide::{CollisionSearchOptions, LineHead, collide_line_items};
 use crate::geometry::box2::Box2;
-use crate::geometry::direction45::CornerMode;
+use crate::geometry::direction45::{CornerMode, Direction45};
 use crate::geometry::line_chain::{LineChain, PointInsideTracker};
 use crate::geometry::shape::Shape;
 use crate::geometry::vec2::Vec2;
@@ -3093,7 +3093,7 @@ impl Shove {
       let mut after = before.clone();
 
       after.clear_links();
-      after.drag_corner(pushed_pos, corner);
+      after.drag_corner(pushed_pos, corner, false, Direction45::default());
       after.chain_mut().simplify2(true);
 
       dragged.push((before, after));

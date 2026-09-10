@@ -99,12 +99,17 @@
 //! - `ShowLinks` (`pcbnew/router/pns_line.h:193` and
 //!   `pcbnew/router/pns_link_holder.h:100`), whose body is `#if 0` in one
 //!   place and missing in the other.
-//! - `DragCorner`, `DragSegment`, `DragArc` and the four private drag
-//!   helpers, plus `snapDraggedCorner` and `snapToNeighbourSegments`
-//!   (`pcbnew/router/pns_line.cpp:722` to `:1397`). Their only callers
-//!   are `DRAGGER` and `MULTI_DRAGGER`, which are milestone 8. The
-//!   `snap_threshold` field they read is here, because every copy path
-//!   propagates it.
+//! - `DragArc` (`pcbnew/router/pns_line.cpp:911` to `:1141`), which needs
+//!   `SHAPE_ARC`, `CIRCLE::ConstructFromTanTanPt` and `CalcArcMid`, none
+//!   of which this crate has. The rest of the drag primitives are here:
+//!   [`Line::drag_corner`] is `DragCorner` with both of its private
+//!   halves, [`Line::drag_segment`] is `DragSegment`, and the two
+//!   snappers are `Line::snap_dragged_corner` and
+//!   `Line::snap_to_neighbour_segments`, both private.
+//! - `dragSegmentFree` (`pcbnew/router/pns_line.h:265`), declared and
+//!   never defined anywhere in the tree. `DragSegment`'s free angle
+//!   branch is `assert( false )` (`pcbnew/router/pns_line.cpp:900`),
+//!   which is why [`Line::drag_segment`] takes no free angle flag.
 //! - `ClipToNearestObstacle` (`:679`). It has no caller anywhere in
 //!   `pcbnew/router`, only its definition and its declaration, so it is
 //!   left out even now that [`World::nearest_obstacle`] exists.
@@ -999,48 +1004,80 @@ impl Line {
     self.links.reverse();
   }
 
-  /// Move one corner of the line and rebuild the 45 degree geometry
-  /// around it.
+  /// Move one corner of the line.
   ///
-  /// Port of `DragCorner` (`pcbnew/router/pns_line.cpp:884`) with
-  /// `aFreeAngle` false and no preferred ending direction, which is what
-  /// its shove call site passes: the via fanout drag
-  /// (`pcbnew/router/pns_shove.cpp:1101`) uses both defaults. The free
-  /// angle branch (`dragCornerFree`, `:857`) belongs to the dragger and
-  /// is not built here.
+  /// Port of `DragCorner` (`pcbnew/router/pns_line.cpp:884`), the
+  /// dispatcher: `free_angle` picks `dragCornerFree` (`:857`) over
+  /// `dragCorner45` (`:823`).
   ///
-  /// The three cases are `dragCorner45`'s (`:823`): dragging the first
-  /// point rebuilds the reversed chain, dragging the last point rebuilds
-  /// the chain as it stands, and dragging a middle corner rebuilds both
-  /// halves and joins them.
+  /// The signature carries KiCad's two default arguments rather than
+  /// hiding them behind a second entry point, because all four call
+  /// shapes are live in the tree: the shove's via fanout drag
+  /// (`pcbnew/router/pns_shove.cpp:1101`) takes both defaults, the
+  /// dragger passes `m_freeAngleMode` (`pcbnew/router/pns_dragger.cpp:407`)
+  /// and the multi dragger passes a preferred ending direction
+  /// (`pcbnew/router/pns_multi_dragger.cpp:863`).
   ///
-  /// `at` is a **point** index. An index past the last point leaves the
-  /// line alone, where KiCad would read out of range.
-  pub fn drag_corner(&mut self, at: Vec2, index: usize) {
+  /// `index` is a **point** index. An index past the last point leaves
+  /// the line alone, where KiCad would read out of range.
+  pub fn drag_corner(
+    &mut self,
+    at: Vec2,
+    index: usize,
+    free_angle: bool,
+    preferred_ending_direction: Direction45,
+  ) {
     if index >= self.chain.point_count() {
       return;
     }
 
+    if free_angle {
+      self.drag_corner_free(at, index);
+    } else {
+      self.drag_corner_45(at, index, preferred_ending_direction);
+    }
+  }
+
+  /// Move one corner and rebuild the 45 degree geometry around it.
+  ///
+  /// Port of `dragCorner45`, `pcbnew/router/pns_line.cpp:823`. The three
+  /// cases: dragging the first point rebuilds the reversed chain,
+  /// dragging the last point rebuilds the chain as it stands, and
+  /// dragging a middle corner rebuilds both halves and joins them. The
+  /// comment at `:844`, "fixme: awkward behaviour for outwards drags", is
+  /// the known weakness of the middle case.
+  fn drag_corner_45(
+    &mut self,
+    at: Vec2,
+    index: usize,
+    preferred_ending_direction: Direction45,
+  ) {
     let width = self.chain.width();
     let snapped = self.snap_dragged_corner(at, index);
     let last = self.chain.point_count() - 1;
 
     // :830
     let mut path = if index == 0 {
-      let mut dragged = drag_corner_internal(&self.chain.reversed(), snapped);
+      let mut dragged = drag_corner_internal(
+        &self.chain.reversed(),
+        snapped,
+        preferred_ending_direction,
+      );
 
       dragged.reverse();
 
       dragged
     } else if index == self.chain.segment_count() {
       // :834
-      drag_corner_internal(&self.chain, snapped)
+      drag_corner_internal(&self.chain, snapped, preferred_ending_direction)
     } else {
       // :845
       let head = self.chain.slice(0, index).unwrap_or_default();
       let tail = self.chain.slice(index, last).unwrap_or_default().reversed();
-      let mut first = drag_corner_internal(&head, snapped);
-      let mut second = drag_corner_internal(&tail, snapped);
+      let mut first =
+        drag_corner_internal(&head, snapped, preferred_ending_direction);
+      let mut second =
+        drag_corner_internal(&tail, snapped, preferred_ending_direction);
 
       second.reverse();
       first.append_chain(&second);
@@ -1053,6 +1090,22 @@ impl Line {
     path.set_width(width);
 
     self.chain = path;
+  }
+
+  /// Move one corner to exactly where it was asked to go.
+  ///
+  /// Port of `dragCornerFree`, `pcbnew/router/pns_line.cpp:857`, which is
+  /// the whole of the router's free angle mode: set the point and
+  /// simplify. The arc vertex insertion at `:863` to `:878` has nothing
+  /// to do here, because this crate has no arcs.
+  ///
+  /// `Simplify()` and not `Simplify2()`, so this is
+  /// [`LineChain::simplify`] with a zero tolerance
+  /// (`pcbnew/router/pns_line.cpp:881`).
+  fn drag_corner_free(&mut self, at: Vec2, index: usize) {
+    // :880
+    self.chain.set_point(index, at);
+    self.chain.simplify(0);
   }
 
   /// Pull a dragged corner onto the intersection of two of the line's own
@@ -1110,6 +1163,283 @@ impl Line {
     }
 
     best.map_or(at, |(_, point)| point)
+  }
+
+  /// Pull a dragged segment onto the supporting line of a parallel
+  /// neighbour two positions away, when one is close enough.
+  ///
+  /// Port of `snapToNeighbourSegments`,
+  /// `pcbnew/router/pns_line.cpp:1185`. A different rule from
+  /// [`Line::snap_dragged_corner`]: only the segments at `index - 2` and
+  /// `index + 2` are candidates, only when their direction is exactly the
+  /// dragged segment's, and the measure is the distance from `at` to
+  /// their **supporting line**. The nearer of the two wins, ties going to
+  /// the earlier one, and a tie in `snap_d` keeps the first because the
+  /// test is `<` and not `<=` (`:1220`).
+  ///
+  /// The answer is a **point**, `s.A` of the winning neighbour
+  /// (`:1201`, `:1211`), not a distance. [`Line::drag_segment`] turns it
+  /// into `SEG( target, target + drag_dir )` (`:1330`), so only its
+  /// projection onto the perpendicular of the drag direction matters.
+  ///
+  /// The early return is `== 0` here and `<= 0` in
+  /// [`Line::snap_dragged_corner`] (`:1192` against `:1153`), so a
+  /// negative threshold makes the two snappers disagree. That is KiCad's
+  /// and it is transcribed rather than normalised; nothing in the router
+  /// ever sets a negative threshold.
+  fn snap_to_neighbour_segments(&self, at: Vec2, index: usize) -> Vec2 {
+    // :1192
+    if self.snap_threshold == 0 {
+      return at;
+    }
+
+    let segment_count = self.chain.segment_count();
+
+    if index >= segment_count {
+      return at;
+    }
+
+    let drag_direction =
+      Direction45::from_seg(&self.chain.segment(index), false);
+    let mut candidates: [Option<(i32, Vec2)>; 2] = [None, None];
+
+    // :1195
+    if index >= 2 {
+      let previous = self.chain.segment(index - 2);
+
+      if Direction45::from_seg(&previous, false) == drag_direction {
+        candidates[0] = Some((previous.line_distance(at), previous.a));
+      }
+    }
+
+    // :1205
+    if index + 2 < segment_count {
+      let next = self.chain.segment(index + 2);
+
+      if Direction45::from_seg(&next, false) == drag_direction {
+        candidates[1] = Some((next.line_distance(at), next.a));
+      }
+    }
+
+    // :1216
+    let mut best = at;
+    let mut best_distance = i32::MAX;
+
+    for candidate in candidates.into_iter().flatten() {
+      let (distance, point) = candidate;
+
+      if distance < best_distance && distance <= self.snap_threshold {
+        best_distance = distance;
+        best = point;
+      }
+    }
+
+    best
+  }
+
+  /// Move one segment of the line sideways and rebuild the two corners
+  /// around it.
+  ///
+  /// Port of `DragSegment` (`pcbnew/router/pns_line.cpp:898`) and the
+  /// `dragSegment45` behind it (`:1230`). There is no free angle form:
+  /// KiCad's `DragSegment( aP, aIndex, true )` is `assert( false )`
+  /// (`:900` to `:903`) and the `dragSegmentFree` it would call
+  /// (`pcbnew/router/pns_line.h:265`) is declared and never defined, so
+  /// the dragger routes a free angle click to a corner drag instead
+  /// (`pcbnew/router/pns_dragger.cpp:135` to `:145`).
+  ///
+  /// The routine works on a **copy** of the chain into which zero length
+  /// segments are inserted so that the dragged segment always has a
+  /// previous and a next neighbour to bend. Four candidate paths are
+  /// built, one per pair of the two 45 degree ways out at each end, and
+  /// the shortest wins. The result is spliced back into the original
+  /// chain by the **original** index, which is what the three `Replace`
+  /// cases at `:1389` to `:1395` are doing.
+  ///
+  /// `index` is a **segment** index. KiCad asserts `aIndex <
+  /// PointCount()` (`:1235`) and then reads `CSegment( index + 1 )`, so an
+  /// index that is not a segment index is out of range there; here it
+  /// leaves the line alone.
+  ///
+  /// The `m_line.PointCount() == 1` branch at `:1387` is not ported: it
+  /// is unreachable behind the same assertion.
+  pub fn drag_segment(&mut self, at: Vec2, index: usize) {
+    if index >= self.chain.segment_count() {
+      return;
+    }
+
+    // :1231
+    let mut path = self.chain.clone();
+    // :1240
+    let target = self.snap_to_neighbour_segments(at, index);
+    let mut cursor = index;
+
+    // :1247. Guarantee a previous segment. Without arcs the only reason
+    // to pad is a drag of the very first segment, so the
+    // `index > 0 ? index + 1 : 0` insertion point is always zero.
+    if cursor == 0 {
+      path.insert(0, path.point(0));
+      cursor += 1;
+    }
+
+    // :1253. Guarantee a next segment. The `IsPtOnArc` alternative at
+    // `:1257` has nothing to match without arcs.
+    if cursor + 1 == path.segment_count() {
+      let last = path.point(path.point_count() - 1);
+
+      path.insert(path.point_count() - 1, last);
+    }
+
+    let drag_direction = Direction45::from_seg(&path.segment(cursor), false);
+    let mut direction_prev =
+      Direction45::from_seg(&path.segment(cursor - 1), false);
+    let mut direction_next =
+      Direction45::from_seg(&path.segment(cursor + 1), false);
+
+    // :1271. A neighbour running the same way as the dragged segment
+    // cannot bend, so it is split into a zero length stub that can.
+    if direction_prev == drag_direction {
+      direction_prev = direction_prev.left();
+      path.insert(cursor, path.point(cursor));
+      cursor += 1;
+    } else if !direction_prev.is_defined() {
+      // :1277
+      direction_prev = drag_direction.left();
+    }
+
+    // :1282
+    if direction_next == drag_direction {
+      direction_next = direction_next.right();
+      path.insert(cursor + 1, path.point(cursor + 1));
+    } else if !direction_next.is_defined() {
+      // :1287
+      direction_next = drag_direction.right();
+    }
+
+    // :1292
+    let previous = path.segment(cursor - 1);
+    let next = path.segment(cursor + 1);
+    let dragged = path.segment(cursor);
+
+    // :1296. Two guide lines at each end: the two 45 degree ways out.
+    // The tests are on the **original** index, so a drag of an end
+    // segment lets that end swing freely.
+    let guide_a = if index == 0 {
+      [
+        Seg::new(dragged.a, dragged.a + drag_direction.right().to_vector()),
+        Seg::new(dragged.a, dragged.a + drag_direction.left().to_vector()),
+      ]
+    } else if direction_prev
+      .angle(drag_direction)
+      .intersects(AngleType::OBTUSE.union(AngleType::HALF_FULL))
+    {
+      // :1306
+      [
+        Seg::new(previous.a, previous.a + drag_direction.left().to_vector()),
+        Seg::new(previous.a, previous.a + drag_direction.right().to_vector()),
+      ]
+    } else {
+      // :1310
+      let guide = Seg::new(dragged.a, dragged.a + direction_prev.to_vector());
+
+      [guide, guide]
+    };
+
+    // :1313
+    let guide_b = if index + 1 == self.chain.segment_count() {
+      [
+        Seg::new(dragged.b, dragged.b + drag_direction.right().to_vector()),
+        Seg::new(dragged.b, dragged.b + drag_direction.left().to_vector()),
+      ]
+    } else if direction_next
+      .angle(drag_direction)
+      .intersects(AngleType::OBTUSE.union(AngleType::HALF_FULL))
+    {
+      [
+        Seg::new(next.b, next.b + drag_direction.left().to_vector()),
+        Seg::new(next.b, next.b + drag_direction.right().to_vector()),
+      ]
+    } else {
+      let guide = Seg::new(dragged.b, dragged.b + direction_next.to_vector());
+
+      [guide, guide]
+    };
+
+    // :1330. The supporting line the dragged segment has to end up on.
+    let current = Seg::new(target, target + drag_direction.to_vector());
+    let mut best: Option<(i64, LineChain)> = None;
+
+    // :1335
+    for first in &guide_a {
+      for second in &guide_b {
+        let (Some(near), Some(far)) = (
+          current.intersect_lines(first),
+          current.intersect_lines(second),
+        ) else {
+          continue;
+        };
+
+        // `SEG s2( *ip1, *ip2 )` at `:1349` is never read; it is not
+        // transcribed.
+        let entry = Seg::new(previous.a, near);
+        let exit = Seg::new(far, next.b);
+        let mut candidate = LineChain::new();
+
+        if let Some(point) = entry.intersect(&next, false, false) {
+          // :1353. The new segment's line crosses the far neighbour, so
+          // the far corner disappears.
+          candidate.append(entry.a);
+          candidate.append(point);
+          candidate.append(next.b);
+        } else if let Some(point) = exit.intersect(&previous, false, false) {
+          // :1359
+          candidate.append(previous.a);
+          candidate.append(point);
+          candidate.append(exit.b);
+        } else if let Some(point) = entry.intersect(&exit, false, false) {
+          // :1365
+          candidate.append(previous.a);
+          candidate.append(point);
+          candidate.append(next.b);
+        } else {
+          // :1373
+          candidate.append(previous.a);
+          candidate.append(near);
+          candidate.append(far);
+          candidate.append(next.b);
+        }
+
+        // :1381
+        let length = candidate.length();
+
+        if best.as_ref().is_none_or(|(shortest, _)| length < *shortest) {
+          best = Some((length, candidate));
+        }
+      }
+    }
+
+    let best = best.map_or_else(LineChain::new, |(_, chain)| chain);
+    let last = self.chain.segment_count() - 1;
+
+    // :1389. The splice indexes the original chain, not `path`: `best`
+    // spans `previous.a` to `next.b`, which are the same two points as
+    // `index` and `index + 1` here whenever a pad was inserted at that
+    // end.
+    if index == 0 {
+      self.chain.replace_with_chain(0, 1, &best);
+    } else if index == last {
+      // :1392, KiCad's `Replace( -2, -1, best )`.
+      let point_count = self.chain.point_count();
+
+      self
+        .chain
+        .replace_with_chain(point_count - 2, point_count - 1, &best);
+    } else {
+      self.chain.replace_with_chain(index, index + 1, &best);
+    }
+
+    // :1396
+    self.chain.simplify(0);
   }
 
   /// How many corners of the given kinds the line turns.
@@ -1189,7 +1519,7 @@ impl Line {
   ///
   /// Its only caller is [`World::find_lines_between_joints`]
   /// (`pcbnew/router/pns_node.cpp:1247`); the multi dragger is the other
-  /// one and is milestone 8.
+  /// one and is milestone 9, last of it.
   ///
   /// # Panics
   ///
@@ -1652,13 +1982,12 @@ fn find_vertex(vertices: &[WalkVertex], pos: Vec2) -> Option<usize> {
 
 /// Rebuild the tail of a chain so that it ends at a point.
 ///
-/// Port of `dragCornerInternal`, `pcbnew/router/pns_line.cpp:722`, with
-/// no preferred ending direction, which is what
-/// [`Line::drag_corner`]'s only caller asks for. It walks the chain
-/// backwards looking for the last corner from which a 45 degree trace to
-/// the new point either leaves in the same direction as the segment it
-/// replaces, or turns obtusely away from the segment before it; the chain
-/// up to that corner is kept and the trace is appended.
+/// Port of `dragCornerInternal`, `pcbnew/router/pns_line.cpp:722`. It
+/// walks the chain backwards looking for the last corner from which a 45
+/// degree trace to the new point ends in `preferred_ending_direction`,
+/// or leaves in the same direction as the segment it replaces, or turns
+/// obtusely away from the segment before it; the chain up to that corner
+/// is kept and the trace is appended.
 ///
 /// KiCad builds both start postures at `:757` and classifies them at
 /// `:763`, but `BuildInitialTrace` overrides the posture whenever the
@@ -1666,13 +1995,29 @@ fn find_vertex(vertices: &[WalkVertex], pos: Vec2) -> Option<usize> {
 /// (`libs/kimath/src/geometry/direction_45.cpp` and
 /// [`Direction45::build_initial_trace`]), so the two candidates are the
 /// same chain. The loop is transcribed as it stands rather than halved,
-/// because that is where a later corner mode or a preferred ending
-/// direction would make them differ again.
+/// because that is where a later corner mode would make them differ
+/// again.
+///
+/// `preferred_ending_direction` is an undefined [`Direction45`] for every
+/// caller but `MULTI_DRAGGER` (`pcbnew/router/pns_multi_dragger.cpp:863`),
+/// and the block at `:768` is skipped for it.
+///
+/// Deviation: KiCad's preferred direction block indexes `paths[j]` with
+/// `j < dirCount`, where `dirCount` counts only the paths that produced a
+/// segment (`:759` to `:766`), so a first posture with no segments would
+/// make it read a chain it then calls `CSegment( -1 )` on. Both postures
+/// are empty only when the corner is already at `aP`, which the callers
+/// never ask for; the candidates are compacted here, which is the same
+/// answer without the out of range read.
 ///
 /// The fallback at `:813` starts the trace at the chain's **first**
 /// point, throwing the whole chain away; that looks like a bug and it is
 /// the shipped behaviour.
-fn drag_corner_internal(origin: &LineChain, at: Vec2) -> LineChain {
+fn drag_corner_internal(
+  origin: &LineChain,
+  at: Vec2,
+  preferred_ending_direction: Direction45,
+) -> LineChain {
   let trace = |from: Vec2, diagonal: bool| {
     LineChain::from_points(
       Direction45::default().build_initial_trace(
@@ -1726,6 +2071,18 @@ fn drag_corner_internal(origin: &LineChain, at: Vec2) -> LineChain {
       }
 
       candidates.push((Direction45::from_seg(&path.segment(0), false), path));
+    }
+
+    // :768. The candidate that arrives in the direction asked for.
+    if preferred_ending_direction.is_defined()
+      && let Some((_, path)) = candidates.iter().find(|(_, path)| {
+        Direction45::from_seg(&path.segment(path.segment_count() - 1), false)
+          == preferred_ending_direction
+      })
+    {
+      picked = Some((index, path.clone()));
+
+      break;
     }
 
     // :784. The candidate that leaves the way the replaced segment did.
@@ -2928,7 +3285,12 @@ mod tests {
     let mut line = dragged_line();
     let target = Vec2::new(250000, 200000);
 
-    line.drag_corner(target, line.point_count() - 1);
+    line.drag_corner(
+      target,
+      line.point_count() - 1,
+      false,
+      Direction45::default(),
+    );
 
     assert_eq!(line.point(0), Vec2::new(0, 0));
     assert_eq!(line.last_point(), Some(target));
@@ -2950,7 +3312,7 @@ mod tests {
     let mut line = dragged_line();
     let target = Vec2::new(-100000, -100000);
 
-    line.drag_corner(target, 0);
+    line.drag_corner(target, 0, false, Direction45::default());
 
     assert_eq!(line.point(0), target);
     assert_eq!(line.last_point(), Some(Vec2::new(200000, 100000)));
@@ -2961,7 +3323,12 @@ mod tests {
     let mut line = dragged_line();
     let before = line.shape().points().to_vec();
 
-    line.drag_corner(Vec2::new(1, 1), line.point_count());
+    line.drag_corner(
+      Vec2::new(1, 1),
+      line.point_count(),
+      false,
+      Direction45::default(),
+    );
 
     assert_eq!(line.shape().points().to_vec(), before);
   }
@@ -2974,5 +3341,174 @@ mod tests {
     let at = Vec2::new(123, 456);
 
     assert_eq!(line.snap_dragged_corner(at, 1), at);
+  }
+
+  /// A straight run of three horizontal segments, one nanometre grid
+  /// aligned, whose middle segment is long enough to survive a sideways
+  /// drag without collapsing into a corner.
+  fn straight_three_segment_line() -> Line {
+    let mut line = Line::new();
+
+    line.set_width(WIDTH);
+    line.set_shape(LineChain::from_slice(
+      &[
+        Vec2::new(0, 0),
+        Vec2::new(1_000_000, 0),
+        Vec2::new(3_000_000, 0),
+        Vec2::new(4_000_000, 0),
+      ],
+      false,
+    ));
+
+    line
+  }
+
+  /// Whether every segment of a line sits on the 45 degree grid.
+  fn is_on_the_grid(line: &Line) -> bool {
+    (0..line.segment_count()).all(|index| {
+      let delta = line.segment(index).b - line.segment(index).a;
+
+      delta.x == 0 || delta.y == 0 || delta.x.abs() == delta.y.abs()
+    })
+  }
+
+  #[test]
+  fn dragging_the_middle_segment_sideways_keeps_both_ends() {
+    let mut line = straight_three_segment_line();
+
+    line.drag_segment(Vec2::new(2_000_000, -500_000), 1);
+
+    assert_eq!(line.point(0), Vec2::new(0, 0));
+    assert_eq!(line.last_point(), Some(Vec2::new(4_000_000, 0)));
+    assert_eq!(line.width(), WIDTH);
+  }
+
+  #[test]
+  fn a_dragged_middle_segment_moves_to_the_cursor_and_keeps_45_degrees() {
+    let mut line = straight_three_segment_line();
+
+    line.drag_segment(Vec2::new(2_000_000, -500_000), 1);
+
+    assert!(is_on_the_grid(&line), "the drag left the 45 degree grid");
+
+    // The two zero length neighbours `dragSegment45` inserts at `:1271`
+    // and `:1282` become the two 45 degree ramps down to the new height,
+    // so the dragged segment is the only horizontal run at that height.
+    let moved: Vec<Seg> = (0..line.segment_count())
+      .map(|index| line.segment(index))
+      .filter(|seg| seg.a.y == -500_000 && seg.b.y == -500_000)
+      .collect();
+
+    assert_eq!(moved.len(), 1, "expected exactly one segment to have moved");
+    assert!(
+      moved[0].a.x < moved[0].b.x && moved[0].length() > 0,
+      "the dragged segment collapsed"
+    );
+  }
+
+  #[test]
+  fn dragging_a_segment_index_past_the_end_leaves_the_line_alone() {
+    let mut line = straight_three_segment_line();
+    let before = line.shape().points().to_vec();
+
+    line.drag_segment(Vec2::new(1, 1), line.segment_count());
+
+    assert_eq!(line.shape().points().to_vec(), before);
+  }
+
+  /// A chain whose segment 1 and segment 3 are both due east, which is
+  /// what `snapToNeighbourSegments` looks for at `index + 2`
+  /// (`pns_line.cpp:1205`).
+  fn line_with_a_parallel_neighbour() -> Line {
+    let mut line = Line::new();
+
+    line.set_width(WIDTH);
+    line.set_shape(LineChain::from_slice(
+      &[
+        Vec2::new(0, 0),
+        Vec2::new(1_000_000, 1_000_000),
+        Vec2::new(3_000_000, 1_000_000),
+        Vec2::new(4_000_000, 0),
+        Vec2::new(6_000_000, 0),
+      ],
+      false,
+    ));
+
+    line
+  }
+
+  #[test]
+  fn the_neighbour_snapper_short_circuits_on_a_zero_threshold() {
+    // `pns_line.cpp:1192`, which is `== 0` where the corner snapper is
+    // `<= 0` (`:1153`).
+    let line = line_with_a_parallel_neighbour();
+    let at = Vec2::new(2_000_000, -30_000);
+
+    assert_eq!(line.snap_threshold(), 0);
+    assert_eq!(line.snap_to_neighbour_segments(at, 1), at);
+  }
+
+  #[test]
+  fn the_neighbour_snapper_takes_a_distance_equal_to_the_threshold() {
+    // `:1220` is `snap_d[i] <= m_snapThreshhold`, so the boundary snaps.
+    let mut line = line_with_a_parallel_neighbour();
+
+    line.set_snap_threshold(30_000);
+
+    let at = Vec2::new(2_000_000, -30_000);
+
+    assert_eq!(
+      line.snap_to_neighbour_segments(at, 1),
+      Vec2::new(4_000_000, 0),
+      "the answer is `s.A` of the neighbour, not a projection of `at`"
+    );
+  }
+
+  #[test]
+  fn the_neighbour_snapper_refuses_one_nanometre_beyond_the_threshold() {
+    let mut line = line_with_a_parallel_neighbour();
+
+    line.set_snap_threshold(29_999);
+
+    let at = Vec2::new(2_000_000, -30_000);
+
+    assert_eq!(line.snap_to_neighbour_segments(at, 1), at);
+  }
+
+  #[test]
+  fn the_neighbour_snapper_ignores_a_neighbour_of_another_direction() {
+    // `:1207` compares the two directions for equality, so the segment
+    // two positions away only counts when it is exactly parallel.
+    let mut line = Line::new();
+
+    line.set_width(WIDTH);
+    line.set_shape(LineChain::from_slice(
+      &[
+        Vec2::new(0, 0),
+        Vec2::new(1_000_000, 1_000_000),
+        Vec2::new(3_000_000, 1_000_000),
+        Vec2::new(4_000_000, 0),
+        Vec2::new(4_000_000, -2_000_000),
+      ],
+      false,
+    ));
+    line.set_snap_threshold(2_000_000);
+
+    let at = Vec2::new(2_000_000, -30_000);
+
+    assert_eq!(line.snap_to_neighbour_segments(at, 1), at);
+  }
+
+  #[test]
+  fn a_free_angle_corner_drag_puts_the_point_exactly_where_it_was_asked() {
+    // `dragCornerFree`, `pns_line.cpp:857`: no 45 degree rebuild at all.
+    let mut line = dragged_line();
+    let target = Vec2::new(123_456, -654_321);
+
+    line.drag_corner(target, 1, true, Direction45::default());
+
+    assert_eq!(line.point(0), Vec2::new(0, 0));
+    assert_eq!(line.point(1), target);
+    assert_eq!(line.last_point(), Some(Vec2::new(200000, 100000)));
   }
 }

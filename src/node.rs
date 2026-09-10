@@ -1801,9 +1801,10 @@ impl World {
   /// An `ITEM_SET` can also hold `LINE`s, which KiCad's overload
   /// decomposes through the same `CheckColliding`. A [`Line`] is not an
   /// item here, so a caller with lines in its set loops over
-  /// [`World::check_colliding_line`] itself; the dragger, the one caller
-  /// that mixes the two (`pcbnew/router/pns_dragger.cpp:446`), arrives
-  /// with milestone 8.
+  /// [`World::check_colliding_line`] itself. The dragger is the one
+  /// caller that mixes the two (`pcbnew/router/pns_dragger.cpp:446`) and
+  /// `src/dragger.rs` does exactly that loop rather than widening this
+  /// signature.
   pub fn check_colliding_items(
     &self,
     node: NodeId,

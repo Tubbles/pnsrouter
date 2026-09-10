@@ -162,8 +162,14 @@
 //! - [`optimizer`]: making a committed line shorter and less cornery.
 //! - [`mouse_trail`]: which of the two 45 degree postures the head leaves
 //!   in.
+//! - [`via`]: walking a via out of what it collides with, which the
+//!   placer and the dragger share.
 //! - [`placer`]: the interactive placement state machine the facade
 //!   drives.
+//! - [`dragger`]: moving a segment, a corner or a via of an existing
+//!   trace. Its mark obstacles path is complete; the walkaround, shove
+//!   and via halves are still stubs, and the facade does not reach it
+//!   yet.
 //!
 //! # Measuring and reproducing
 //!
@@ -186,6 +192,7 @@ pub mod algo_base;
 pub mod arena;
 pub mod collide;
 pub mod debug;
+pub mod dragger;
 pub mod eventlog;
 pub mod geometry;
 pub mod index;
@@ -202,4 +209,5 @@ pub mod settings;
 pub mod shove;
 pub mod snapshot;
 pub mod topology;
+pub mod via;
 pub mod walkaround;
