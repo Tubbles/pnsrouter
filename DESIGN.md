@@ -152,6 +152,7 @@ src/
   joint.rs       JointMap
   node.rs        World, Node, branch, commit, queries, nearest obstacle, caches
   line.rs        Line, walkaround on one hull, links
+  meander.rs     meander shapes, the fitting loop, the length arithmetic
   topology.rs    connectivity queries, leading ratline
   settings.rs    RoutingSettings, Sizes, enums
   algo_base.rs   AlgoContext (resolver, settings, debug)
@@ -161,7 +162,8 @@ src/
   mouse_trail.rs posture solver
   shove.rs       effect list shove, springback stack
   via.rs         via pushout force, shared by the placer and the dragger
-  placer/        line_placer, fixed_tail
+  diff_pair.rs   differential pair geometry, gateways, fitting
+  placer/        line_placer, diff_pair_placer, fixed_tail, the Placer enum
   dragger.rs     segment, corner and via drag in all three modes
   multi_dragger.rs   several traces dragged as a bundle
   component_dragger.rs  footprints dragged by their pads

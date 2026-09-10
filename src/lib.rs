@@ -154,6 +154,8 @@
 //! - [`node`]: the branching world every query and every speculative edit
 //!   goes through.
 //! - [`mod@line`]: a run of segments seen as one polyline.
+//! - [`meander`]: the shapes a length tuned trace is folded into, and
+//!   the arithmetic that fits them to a target length.
 //! - [`topology`]: connectivity queries, including the leading ratline.
 //! - [`algo_base`]: what every routing algorithm is handed instead of a
 //!   global router.
@@ -205,6 +207,7 @@ pub mod index;
 pub mod item;
 pub mod joint;
 pub mod line;
+pub mod meander;
 pub mod mouse_trail;
 pub mod multi_dragger;
 pub mod node;
