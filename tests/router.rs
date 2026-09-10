@@ -67,6 +67,12 @@ const DEEP_PAD: HostId = HostId(5);
 /// An existing via, well away from everything else.
 const EXISTING_VIA: HostId = HostId(6);
 
+/// The first of the two parallel tracks a multi drag moves together.
+const BUNDLE_TRACK_A: HostId = HostId(7);
+
+/// The second of them, one millimetre away on its own net.
+const BUNDLE_TRACK_B: HostId = HostId(8);
+
 /// Where the route starts.
 const START: Vec2 = Vec2::new(0, 0);
 
@@ -90,6 +96,27 @@ const TRACK_B: Vec2 = Vec2::new(4_000_000, 3_000_000);
 
 /// The middle of [`EXISTING_TRACK`], which a start splits it at.
 const TRACK_MIDDLE: Vec2 = Vec2::new(2_000_000, 3_000_000);
+
+/// The net of [`BUNDLE_TRACK_A`].
+const BUNDLE_NET_A: Option<NetId> = Some(NetId(7));
+
+/// The net of [`BUNDLE_TRACK_B`].
+const BUNDLE_NET_B: Option<NetId> = Some(NetId(8));
+
+/// The left hand end of both bundle tracks.
+///
+/// The pair sits well clear of everything else on the board, so a multi
+/// drag scenario cannot disturb a routing one.
+const BUNDLE_LEFT: i32 = 0;
+
+/// The right hand end of both bundle tracks.
+const BUNDLE_RIGHT: i32 = 12_000_000;
+
+/// The y of [`BUNDLE_TRACK_A`].
+const BUNDLE_Y_A: i32 = 8_000_000;
+
+/// The y of [`BUNDLE_TRACK_B`], one millimetre away.
+const BUNDLE_Y_B: i32 = 9_000_000;
 
 /// A round pad on one copper layer.
 fn pad(id: HostId, at: Vec2, layer: i32, net: Option<NetId>) -> WorldItem {
@@ -125,6 +152,30 @@ fn board() -> WorldSnapshot {
     LayerRange::single(0),
     WorldGeometry::Segment {
       seg: Seg::new(TRACK_A, TRACK_B),
+      width: TRACK_WIDTH,
+    },
+  ));
+  snapshot.items.push(WorldItem::new(
+    BUNDLE_TRACK_A,
+    BUNDLE_NET_A,
+    LayerRange::single(0),
+    WorldGeometry::Segment {
+      seg: Seg::new(
+        Vec2::new(BUNDLE_LEFT, BUNDLE_Y_A),
+        Vec2::new(BUNDLE_RIGHT, BUNDLE_Y_A),
+      ),
+      width: TRACK_WIDTH,
+    },
+  ));
+  snapshot.items.push(WorldItem::new(
+    BUNDLE_TRACK_B,
+    BUNDLE_NET_B,
+    LayerRange::single(0),
+    WorldGeometry::Segment {
+      seg: Seg::new(
+        Vec2::new(BUNDLE_LEFT, BUNDLE_Y_B),
+        Vec2::new(BUNDLE_RIGHT, BUNDLE_Y_B),
+      ),
       width: TRACK_WIDTH,
     },
   ));
@@ -854,38 +905,146 @@ fn aborting_a_drag_leaves_the_board_alone_too() {
 }
 
 #[test]
-fn a_drag_of_nothing_or_of_several_objects_is_refused() {
-  // `pcbnew/router/pns_router.cpp:171` refuses an empty set; `:182` sends
-  // more than one segment to `MULTI_DRAGGER`, which is not ported.
+fn a_drag_of_nothing_is_refused_and_a_track_plus_a_via_is_a_single_drag() {
+  // `pcbnew/router/pns_router.cpp:171` refuses an empty set. `:182` counts
+  // segments and arcs, so one of each plus a via is still one, and the
+  // single dragger reads `aPrimitives[0]` and ignores the rest
+  // (`pcbnew/router/pns_dragger.cpp:309`).
   let mut router = router_in(RouterMode::MarkObstacles);
 
   assert_eq!(
     router.start_dragging(TRACK_MIDDLE, &[], false),
     Err(StartError::NothingToDrag)
   );
+  assert_eq!(router.state(), RouterState::Idle);
+
+  router
+    .start_dragging(TRACK_MIDDLE, &[EXISTING_TRACK, EXISTING_VIA], false)
+    .expect("a track plus a via drags the track");
+
+  assert_eq!(router.state(), RouterState::DragSegment);
+  assert_eq!(router.current_net(), SPLIT_NET);
+  // Only a multi drag hands leader segments back
+  // (`pcbnew/router/pns_drag_algo.h:125`).
+  assert!(router.last_committed_leader_segments().is_empty());
+
+  router.move_to(DRAG_RELEASE, None);
+  assert!(router.last_committed_leader_segments().is_empty());
+}
+
+#[test]
+fn a_drag_of_nothing_but_pads_is_a_component_drag_and_is_refused() {
+  // `pcbnew/router/pns_router.cpp:176`, which wins over the segment count
+  // below it, so a selection of pads is always a component drag.
+  let mut router = router_in(RouterMode::MarkObstacles);
+
   assert_eq!(
-    router.start_dragging(TRACK_MIDDLE, &[EXISTING_TRACK, EXISTING_VIA], false),
-    Err(StartError::MultiDragUnsupported)
+    router.start_dragging(START, &[START_PAD, TARGET_PAD], false),
+    Err(StartError::ComponentDragUnsupported)
   );
   assert_eq!(router.state(), RouterState::Idle);
 }
 
 #[test]
-fn a_drag_of_a_pad_or_of_an_unknown_object_is_refused() {
+fn a_drag_of_a_lone_pad_or_of_an_unknown_object_is_refused() {
   let mut router = router_in(RouterMode::MarkObstacles);
 
-  // The `default:` of `DRAGGER::Start`
-  // (`pcbnew/router/pns_dragger.cpp:355`), which is how a lone pad handed
-  // to a `DRAGGER` bows out.
-  assert!(matches!(
+  // A lone pad never reaches `DRAGGER` at all: the all solids test at
+  // `pcbnew/router/pns_router.cpp:176` catches a one element set of one
+  // solid first. `DRAGGER::Start`'s own `default:` refusal (`:355`) is
+  // covered by `tests/dragger.rs`.
+  assert_eq!(
     router.start_dragging(START, &[START_PAD], false),
-    Err(StartError::NotDraggable(_))
-  ));
+    Err(StartError::ComponentDragUnsupported)
+  );
   assert_eq!(
     router.start_dragging(START, &[HostId(99)], false),
     Err(StartError::UnknownStartItem(HostId(99)))
   );
   assert_eq!(router.state(), RouterState::Idle);
+}
+
+#[test]
+fn two_tracks_drag_together_through_the_facade_and_commit_as_one() {
+  // `pcbnew/router/pns_router.cpp:182`: two segments in the set reach
+  // `MULTI_DRAGGER`, which drags the line under the cursor and moves the
+  // other to the same perpendicular offset it had.
+  let mut router = router_in(RouterMode::MarkObstacles);
+  // The grab is at the middle of the track, so the 45 degree legs the
+  // drag builds leave the leader segment under the cursor; that is what
+  // `findNewLeaderSegment` needs to match against
+  // (`pcbnew/router/pns_multi_dragger.cpp:417`).
+  let grab = Vec2::new(BUNDLE_RIGHT / 2, BUNDLE_Y_A);
+  let release = Vec2::new(BUNDLE_RIGHT / 2, BUNDLE_Y_A + 3_000_000);
+
+  router
+    .start_dragging(grab, &[BUNDLE_TRACK_A, BUNDLE_TRACK_B], false)
+    .expect("two selected tracks are a multi drag");
+
+  assert_eq!(router.state(), RouterState::DragSegment);
+  assert!(router.routing_in_progress());
+  // `MULTI_DRAGGER::CurrentLayer` is `return 0;` (note 06 erratum E22).
+  assert_eq!(router.current_layer(), Some(0));
+
+  let frame = router.move_to(release, None);
+
+  // Both host tracks are gone from the view and both are in the pending
+  // delta, which is what says the second line moved with the first.
+  assert!(frame.hidden.contains(&BUNDLE_TRACK_A), "{frame:?}");
+  assert!(frame.hidden.contains(&BUNDLE_TRACK_B), "{frame:?}");
+
+  let pending = router.pending_update();
+
+  assert!(pending.removed.contains(&BUNDLE_TRACK_A), "{pending:?}");
+  assert!(pending.removed.contains(&BUNDLE_TRACK_B), "{pending:?}");
+
+  // The leader segments are what a host re-selects with; a segment mode
+  // multi drag answers one per line that dragged.
+  assert_eq!(router.last_committed_leader_segments().len(), 2);
+
+  let FixOutcome::Finished(diff) = router.fix_route(release, None, false)
+  else {
+    panic!("a clear multi drag refused to commit");
+  };
+
+  assert_eq!(router.state(), RouterState::Idle);
+
+  // Every one of the two host tracks is either replaced or updated.
+  let touched: Vec<HostId> = diff
+    .removed
+    .iter()
+    .copied()
+    .chain(diff.updated.iter().map(|(host, _)| *host))
+    .collect();
+
+  assert!(touched.contains(&BUNDLE_TRACK_A), "{diff:?}");
+  assert!(touched.contains(&BUNDLE_TRACK_B), "{diff:?}");
+
+  // Both nets still have copper, and both moved off their old line.
+  for net in [BUNDLE_NET_A, BUNDLE_NET_B] {
+    assert!(
+      committed_segments(&router, net) > 0,
+      "{net:?} lost its track"
+    );
+  }
+
+  let world = router.world();
+  let stayed = [BUNDLE_Y_A, BUNDLE_Y_B].iter().any(|y| {
+    world
+      .all_items_in_net(world.root(), BUNDLE_NET_A, Kind::SEGMENT)
+      .iter()
+      .filter_map(|id| world.item(*id))
+      .any(|item| match item.body() {
+        pnsrouter::item::ItemBody::Segment(body) => {
+          let seg = body.seg();
+
+          seg.a.y == *y && seg.b.y == *y && seg.a.x != seg.b.x
+        }
+        _ => false,
+      })
+  });
+
+  assert!(!stayed, "the dragged bundle did not move");
 }
 
 #[test]

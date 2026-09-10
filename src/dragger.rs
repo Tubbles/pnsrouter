@@ -41,14 +41,6 @@
 //!   [`Dragger::force_mark_obstacles_mode`], [`Dragger::fix_route_node`]
 //!   and [`Dragger::fix_route`].
 //!
-//! # What is not implemented yet
-//!
-//! - Multi drag, which is `MULTI_DRAGGER` and a module of its own; note
-//!   06 section 10.2 step 11 asks for the contradiction between
-//!   `PLAN.md`, which lists it as a non goal, and
-//!   `doc/work/009-dragging.md`, which has it as a task, to be resolved
-//!   first.
-//!
 //! # Where a drag ends
 //!
 //! Note 06 section 2.14 opens with "`optimizeAndUpdateDraggedLine` is
@@ -69,11 +61,12 @@
 //!   becomes a corner drag here where KiCad gives a via drag. Note 06
 //!   section 9.5 records the decision that has to be taken before the via
 //!   drag is finished.
-//! - `MULTI_DRAGGER` (`pcbnew/router/pns_multi_dragger.cpp`) and
-//!   `COMPONENT_DRAGGER`, both out of scope. There is deliberately no
-//!   `DRAG_ALGO` trait either: `DESIGN.md` section 11 and note 06 section
-//!   9.3 both ask for enum dispatch in the facade rather than a trait
-//!   with one live implementation.
+//! - `COMPONENT_DRAGGER`, which moves footprints rather than traces and
+//!   which `PLAN.md` has as the tail of milestone 9. `MULTI_DRAGGER` is
+//!   [`crate::multi_dragger`]. There is deliberately no `DRAG_ALGO` trait
+//!   over the two: `DESIGN.md` section 11 and note 06 section 9.3 both
+//!   ask for enum dispatch in the facade instead, which is
+//!   `router::ActiveDragger`.
 //! - The dead members note 06 section 8.1 names: `m_origViaConnections`
 //!   (`pcbnew/router/pns_dragger.h:166`), never read or written anywhere
 //!   in KiCad's tree, and `GetLastDragSolution` (`:108`), which has no

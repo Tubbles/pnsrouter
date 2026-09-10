@@ -1025,6 +1025,65 @@ impl LineChain {
     None
   }
 
+  /// The point a given distance along the chain, measured from its start.
+  ///
+  /// Port of `PointAlong`,
+  /// `libs/kimath/src/geometry/shape_line_chain.cpp:2671`. The walk sums
+  /// [`Seg::length`] segment by segment and stops at the first segment
+  /// the distance falls inside, taking the point
+  /// `A + (B - A).Resize( remaining )` on it; a distance of zero is the
+  /// first point and a distance past the end is the last one. The sum is
+  /// therefore the same rounded per segment sum [`LineChain::length`]
+  /// answers, so `point_along( length() )` is the last point exactly.
+  ///
+  /// `path_length` is an `i64` where KiCad's is an `int`, because
+  /// [`LineChain::length`] is an `i64` here and its one caller,
+  /// `clipToOtherLine` (`pcbnew/router/pns_multi_dragger.cpp:313`), feeds
+  /// that straight in. Note 06 erratum E25 is the narrowing KiCad does at
+  /// that call site, which overflows above about 2.147 metres of chain
+  /// and which this signature cannot inherit.
+  ///
+  /// [`None`] for an empty chain, where both of KiCad's returns,
+  /// `CPoint( 0 )` and `CLastPoint()`, index out of range. A negative
+  /// `path_length` answers the first point, because
+  /// [`Vec2::resize`] reverses the direction for a negative length and
+  /// the first segment always passes the `total + l >= path_length`
+  /// test; that is KiCad's behaviour too, and no caller passes one.
+  pub fn point_along(&self, path_length: i64) -> Option<Vec2> {
+    // :2675
+    if path_length == 0 {
+      return self.points.first().copied();
+    }
+
+    // :2673
+    let mut total: i64 = 0;
+
+    // :2678
+    for index in 0..self.segment_count() {
+      let seg = self.segment(index);
+      let length = i64::from(seg.length());
+
+      // :2683
+      if total + length >= path_length {
+        let delta = seg.b - seg.a;
+        // The remainder is at most this segment's own length, so it fits
+        // an `i32` for every reachable `path_length`; the clamp is only
+        // there for the unreachable negative one.
+        let remaining = (path_length - total)
+          .clamp(i64::from(i32::MIN), i64::from(i32::MAX))
+          as i32;
+
+        // :2686
+        return Some(seg.a + delta.resize(remaining));
+      }
+
+      total += length;
+    }
+
+    // :2692
+    self.points.last().copied()
+  }
+
   /// The index of the first vertex within a threshold of a point.
   ///
   /// Port of `Find`,
@@ -3325,6 +3384,48 @@ mod tests {
     // a walk along the chain.
     assert_eq!(chain.path_length(point(30, 40), None), Some(50));
     assert_eq!(LineChain::new().path_length(point(0, 0), None), None);
+  }
+
+  #[test]
+  fn point_along_walks_the_chain_by_arc_length() {
+    // `shape_line_chain.cpp:2671`.
+    let chain = LineChain::from_slice(
+      &[point(0, 0), point(100, 0), point(100, 100)],
+      false,
+    );
+
+    // :2675, the zero case, which never enters the walk.
+    assert_eq!(chain.point_along(0), Some(point(0, 0)));
+    assert_eq!(chain.point_along(40), Some(point(40, 0)));
+    // A distance that lands exactly on a vertex stops on the first
+    // segment, because the test at `:2683` is `>=`.
+    assert_eq!(chain.point_along(100), Some(point(100, 0)));
+    assert_eq!(chain.point_along(160), Some(point(100, 60)));
+    // :2692, past the end.
+    assert_eq!(chain.point_along(500), Some(point(100, 100)));
+    assert_eq!(chain.point_along(chain.length()), Some(point(100, 100)));
+  }
+
+  #[test]
+  fn point_along_a_diagonal_resizes_the_way_the_hulls_do() {
+    // The remainder is handed to `Vec2::resize`, so a 45 degree leg gets
+    // KiCad's `sqrt(1/2)` per component rather than a projection.
+    let chain = LineChain::from_slice(&[point(0, 0), point(1000, 1000)], false);
+
+    assert_eq!(chain.point_along(1414), Some(point(1000, 1000)));
+    assert_eq!(chain.point_along(707), Some(point(500, 500)));
+  }
+
+  #[test]
+  fn point_along_an_empty_or_single_point_chain() {
+    // Both of KiCad's returns index out of range on an empty chain.
+    assert_eq!(LineChain::new().point_along(0), None);
+    assert_eq!(LineChain::new().point_along(1000), None);
+
+    let dot = LineChain::from_slice(&[point(7, 9)], false);
+
+    assert_eq!(dot.point_along(0), Some(point(7, 9)));
+    assert_eq!(dot.point_along(1000), Some(point(7, 9)));
   }
 
   #[test]

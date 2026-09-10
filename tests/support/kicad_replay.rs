@@ -16,6 +16,7 @@
 //! EVT_MOVE            -> Move( p, ritem )
 //! EVT_TOGGLE_VIA      -> ToggleViaPlacement()
 //! EVT_START_DRAG      -> StartDragging( p, ritems, 0 )
+//! EVT_START_MULTIDRAG -> the same branch, KiCad falls through (`:155`)
 //! ```
 //!
 //! Three of those differ here.
@@ -30,14 +31,19 @@
 //!   copper layer the reader recorded for that object, because the layer
 //!   span of every snapshot item is built from exactly that field; taking
 //!   it from the board keeps the resolution out of the facade.
-//! - **Multi dragging is refused.** `EVT_START_DRAG` replays through
-//!   [`Router::start_dragging`], with the event's uuids mapped to host
-//!   ids exactly as `EVT_START_ROUTE` maps its first one, and the drag
-//!   mode of literal `0` KiCad's player passes (`:169`) becoming
-//!   `free_angle = false`, which is the only bit that mask ever carried
-//!   (note 06 erratum E2). `EVT_START_MULTIDRAG` needs `MULTI_DRAGGER`,
-//!   which is not ported, so it stays
-//!   [`EventOutcome::Unsupported`]; no case in the corpus emits one.
+//! - **Only `EVT_ABORT` is refused.** `EVT_START_DRAG` and
+//!   `EVT_START_MULTIDRAG` replay through [`Router::start_dragging`],
+//!   with the event's uuids mapped to host ids exactly as
+//!   `EVT_START_ROUTE` maps its first one, and the drag mode of literal
+//!   `0` KiCad's player passes (`:169`) becoming `free_angle = false`,
+//!   which is the only bit that mask ever carried (note 06 erratum E2).
+//!   The two events share one branch here because they share one in
+//!   KiCad (`qa/tools/pns/pns_log_player.cpp:155`), and the facade picks
+//!   the dragger from the shape of the item set anyway
+//!   (`pcbnew/router/pns_router.cpp:176`). **No case in the corpus emits
+//!   `EVT_START_MULTIDRAG`** (note 05 section 6.9), so supporting it
+//!   un-ignores nothing; it is here so that a log recorded from a
+//!   multi drag replays without a special case.
 //!
 //! `EVT_FIX` passes `force_finish = false`, which is KiCad's third
 //! argument at `:188`, so a fix is terminal only when the placer says the
@@ -326,7 +332,8 @@ pub enum EventOutcome {
     /// Why the facade said no.
     reason: String,
   },
-  /// `EVT_START_DRAG` started a drag on this copper layer.
+  /// `EVT_START_DRAG` or `EVT_START_MULTIDRAG` started a drag on this
+  /// copper layer.
   DragStarted {
     /// The layer the dragged object lives on, which the dragger picks up
     /// from the object rather than from the event.
@@ -639,12 +646,13 @@ fn replay_event(
         reason: format!("{error:?}"),
       },
     },
-    // :169. Every uuid the event names, not only the first: KiCad hands
-    // `StartDragging` the whole `ritems` set and lets it pick the
-    // algorithm from the shape of it
-    // (`pcbnew/router/pns_router.cpp:176`). The drag mode is a literal
-    // `0` there, whose only live bit would have been `DM_FREE_ANGLE`.
-    EventKind::StartDrag => {
+    // :155, :169. One branch for both, as KiCad's switch has. Every uuid
+    // the event names, not only the first: KiCad hands `StartDragging`
+    // the whole `ritems` set and lets it pick the algorithm from the
+    // shape of it (`pcbnew/router/pns_router.cpp:176`). The drag mode is
+    // a literal `0` there, whose only live bit would have been
+    // `DM_FREE_ANGLE`.
+    EventKind::StartDrag | EventKind::StartMultiDrag => {
       let items: Vec<pnsrouter::item::HostId> = event
         .uuids
         .iter()
@@ -702,27 +710,29 @@ fn replay_event(
       }
     }
     // Refused above.
-    EventKind::StartMultiDrag | EventKind::Abort => {
-      EventOutcome::Unsupported { kind: event.kind }
-    }
+    EventKind::Abort => EventOutcome::Unsupported { kind: event.kind },
   }
 }
 
 /// Whether this harness can replay an event kind at all.
 ///
-/// [`None`] for `EVT_START_MULTIDRAG`, which needs `MULTI_DRAGGER`, and
-/// for `EVT_ABORT`, which KiCad declares and never emits
+/// [`None`] only for `EVT_ABORT`, which KiCad declares and never emits
 /// (`pcbnew/router/pns_logger.h:65`) and whose meaning is therefore
-/// unpinned. No case in the corpus holds either.
+/// unpinned. No case in the corpus holds one.
+///
+/// `EVT_START_MULTIDRAG` became replayable with
+/// [`pnsrouter::multi_dragger::MultiDragger`]. No corpus case emits one
+/// (note 05 section 6.9), so nothing was un-ignored by that.
 pub const fn supported(kind: EventKind) -> Option<EventKind> {
   match kind {
     EventKind::StartRoute
     | EventKind::StartDrag
+    | EventKind::StartMultiDrag
     | EventKind::Move
     | EventKind::Fix
     | EventKind::Unfix
     | EventKind::ToggleVia => Some(kind),
-    EventKind::StartMultiDrag | EventKind::Abort => None,
+    EventKind::Abort => None,
   }
 }
 

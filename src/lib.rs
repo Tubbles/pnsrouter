@@ -167,9 +167,9 @@
 //! - [`placer`]: the interactive placement state machine the facade
 //!   drives.
 //! - [`dragger`]: moving a segment, a corner or a via of an existing
-//!   trace. Its mark obstacles path is complete; the walkaround, shove
-//!   and via halves are still stubs, and the facade does not reach it
-//!   yet.
+//!   trace, in any of the three modes.
+//! - [`multi_dragger`]: moving several traces at once, keeping their
+//!   spacing.
 //!
 //! # Measuring and reproducing
 //!
@@ -200,6 +200,7 @@ pub mod item;
 pub mod joint;
 pub mod line;
 pub mod mouse_trail;
+pub mod multi_dragger;
 pub mod node;
 pub mod optimizer;
 pub mod placer;

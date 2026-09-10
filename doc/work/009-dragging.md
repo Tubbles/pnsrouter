@@ -1,6 +1,6 @@
 # 009 Dragging
 
-Status: in progress (started 2026-09-10; the reference note, all three drag routines for a segment, a corner and a via, free angle mode and the session facade are in; multi drag and the LibrePCB side are not)
+Status: in progress (started 2026-09-10; the reference note, all three drag routines for a segment, a corner and a via, free angle mode, multi drag and the session facade are in; the LibrePCB side is not)
 
 ## Goal
 
@@ -14,7 +14,7 @@ Milestone 9: drag existing segments, corners and vias with the shove engine, as 
 - [x] Segment and corner drag in walkaround and shove mode (2026-09-10). `dragWalkaround` and `tryWalkaround` with its length limit factor of 30.0, `dragShove` driving the existing `Shove` through the head protocol alone, and the optimizer's drag only passes behind them: `EffortFlags::REQUIRE_OBTUSE_ANGLES`, `Constraint::ObtuseOnly` and `Optimizer::drag_fix_corners`, which `optimize_and_update_dragged_line` asks for when `restrict_angles` is set. `optimize_and_update_dragged_line` is reachable at last, so its `#[expect(dead_code)]` is gone.
 - [x] Via drag (2026-09-10): `findViaFanoutByHandle`, `dragViaMarkObstacles`, `propagateViaForces` over `via_pushout_force`, `dragViaWalkaround` and `dragShove`'s `DM_VIA` case, plus `MouseTrailTracer::trail_lead_vector`, which the force propagation negates. `Traces()` is two vectors here, `Dragger::traces` and `Dragger::traces_vias`, cleared as one. Errata E5, E6, E10, E11 and E13 are transcribed with a comment each; E5 is pinned by a test rather than repaired.
 - [x] Free angle mode (2026-09-10). It needed no new code: `startDragSegment`'s second case, `Drag`'s bypass and `Line::drag_corner`'s free angle branch all landed in earlier slices, so this is one end to end test that also pins the forced corner mode and that no shove is built.
-- [ ] Multi drag.
+- [x] Multi drag (2026-09-10). `src/multi_dragger.rs` holds `MULTI_DRAGGER` in full: `MDRAG_LINE`, `Start`'s four phases, `Drag` with `tryPosture` over its three variants, `multidragMarkObstacles` with `clipToOtherLine`, `multidragWalkaround` with its own `tryWalkaround` and its length limit factor of 3.0, `multidragShove` with the head order and the re-add block, `findNewLeaderSegment` and `restoreLeaderSegments`, and the small members. `LineChain::point_along` (`shape_line_chain.cpp:2671`) landed with it, and `World::collide_lines` was already there. `Router::start_dragging` dispatches on the shape of the item set the way `pns_router.cpp:176` does, and `Router::last_committed_leader_segments` and `Router::host_of` are what a host puts the selection back with. Errata E17 to E27 are transcribed with a comment each; E28, the unspecified corner mode line order, is the one deviation and is a tie break on the line index.
 - [x] The seven drag cases of the KiCad corpus replay in `tests/kicad_replay.rs` (2026-09-10). All seven leave nothing colliding and six of the seven match their golden. The two harness gaps that held the last two back are closed, and the one case that misses now, `issue23449`, misses because the via drag works.
 - [ ] LibrePCB: drag from the select tool through `BoardPnsRouter`, one undo entry per drag.
 
@@ -42,6 +42,14 @@ Six of the seven goldens agree and their tier 2 tests run, and every collision t
 `issue23449-shove-lone-via-drag-crash` is the one that misses, and it misses because the via drag works. Its golden is empty on all three counts, `addedItems`, `removedItems` and `headItems`, and it matched only while a via drag moved nothing; note 06 section 10.2 step 9 said in advance that it would count at tier 2 "only if the crate's drag also ends with an empty delta". All 102 moves succeed here, the shove answering `Ok` with the head via moved, and the last cursor position `(142.4, 80.0)` leaves the via at `(142.352108, 79.897157)`, clear of everything under the case's own rules. An empty delta on KiCad's side is a failure shape: either the last `Drag` failed and the restore re-branched a clean node (`pcbnew/router/pns_dragger.cpp:1039`, where `m_lastDragSolution` is default constructed in `DM_VIA` so the restore adds nothing), or `dragViaWalkaround` found an empty fanout and returned true at `:498`. The divergence is in the shove's handling of a lone "stitching" via head (`pcbnew/router/pns_shove.cpp:1120`), not in the dragger. Its tier 2 test is `#[ignore]`d with the measurement; both tier 1 tests run, and they are the crash guard the case exists for.
 
 Beside the corpus, `tests/dragger.rs` carries the via drag scenarios note 06 asked for, because the one corpus via case is a weak signal either way: a via with two fanout traces dragged in each of the three modes, its commit, and the E5 under-reporting.
+
+The corpus says nothing at all about multi drag: no log holds an `EVT_START_MULTIDRAG` (note 05 section 6.9). The harness takes the event now, sharing the branch KiCad's log player shares (`qa/tools/pns/pns_log_player.cpp:155`), so a log recorded from one would replay; nothing was un-ignored by that. `tests/multi_dragger.rs` is the coverage instead: a pair dragged in each of the three modes, a corner mode grab, a bundle with unequal spacing and a determinism check, plus the facade case in `tests/router.rs`.
+
+## The multi drag deviation
+
+KiCad sorts the set by `MDRAG_LINE::dragDist` with `std::sort`, which is not stable, and `dragDist` is only ever assigned in the segment branch of `tryPosture` (`pns_multi_dragger.cpp:907`). In corner mode every line therefore compares equal and the walkaround attempt order and the shove head order are unspecified, and both decide the result: the first line walked has the free space, and the first head shoved sets the ranks. `DESIGN.md` section 8 forbids that, so the port ties on `mdragIndex`, the order the host listed the selected items in. Segment mode keeps KiCad's order exactly.
+
+One thing that is not a deviation but is worth writing down: KiCad's `preWalkNode` (`:475`) is a local that is never deleted, so a walkaround multi drag leaks one node per mouse move. The port holds it as a member and drops it at the top of the next drag, which takes `m_lastNode` with it and subsumes the `delete m_lastNode` at `:461`.
 
 ## Acceptance
 
