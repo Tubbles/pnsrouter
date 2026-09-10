@@ -3,7 +3,7 @@
 //! The routing session facade a host drives (KiCad's `PNS::ROUTER`).
 //!
 //! Port of `PNS::ROUTER` (`pcbnew/router/pns_router.h:153`) narrowed to
-//! single track routing. The facade owns the world, the placer, the rule
+//! routing and dragging. The facade owns the world, the placer, the rule
 //! oracle and the settings, and turns a stream of user events into a
 //! [`PreviewFrame`] after every event and a [`CommitDiff`] at the end.
 //! That is `DESIGN.md` section 7 and note 05 section 7.2: both directions
@@ -18,13 +18,21 @@
 //!   (`pcbnew/router/pns_router.cpp:58`) and `ROUTER::GetInstance()` have
 //!   no counterpart; the ambient state travels as
 //!   [`crate::algo_base::AlgoContext`] (`DESIGN.md` section 8).
-//! - **Differential pairs and the three tuning modes.** The placer set is
-//!   closed by the mode (note 03 section 9.2), so the missing modes are
-//!   missing variants and not missing trait implementations. All three of
-//!   KiCad's drag algorithms are here, through
-//!   [`Router::start_dragging`], [`RouterState::DragSegment`] and
-//!   [`RouterState::DragComponent`]: [`crate::dragger`],
-//!   [`crate::multi_dragger`] and [`crate::component_dragger`].
+//! - **The three tuning modes.** The placer set is closed by the mode
+//!   (note 03 section 9.2), so the missing modes are missing
+//!   [`crate::placer::Placer`] variants and not missing trait
+//!   implementations. The two that are here are the single track placer
+//!   and the differential pair placer, through [`Router::start_routing`]
+//!   and [`Router::start_routing_diff_pair`]. All three of KiCad's drag
+//!   algorithms are here too, through [`Router::start_dragging`],
+//!   [`RouterState::DragSegment`] and [`RouterState::DragComponent`]:
+//!   [`crate::dragger`], [`crate::multi_dragger`] and
+//!   [`crate::component_dragger`].
+//! - **A router mode.** `ROUTER::SetMode` (`:1094`) is a field KiCad's
+//!   host sets before `StartRouting`, and every one of its readers is
+//!   either a start gate or a placer choice; both are entry points here,
+//!   so there is nothing left for the field to decide. Which one is
+//!   running is [`Router::current_nets`].
 //! - **`SetIterLimit` and `GetIterLimit`**
 //!   (`pcbnew/router/pns_router.h:224`), dead API read by nobody in
 //!   KiCad's tree; the real budgets live in
@@ -68,6 +76,8 @@ use crate::item::{
 use crate::line::Line;
 use crate::multi_dragger::MultiDragger;
 use crate::node::{NodeId, World};
+use crate::placer::Placer;
+use crate::placer::diff_pair_placer::{DiffPairPlacer, PairError};
 use crate::placer::line_placer::LinePlacer;
 use crate::rules::{ItemRef, RuleResolver};
 use crate::settings::{RoutingSettings, Sizes};
@@ -174,6 +184,58 @@ pub enum StartError {
   /// `StartDragging` tests.
   NothingToDrag,
 
+  /// A differential pair placement was asked for with no start object.
+  ///
+  /// Port of "Cannot start a differential pair in the middle of nowhere."
+  /// (`pcbnew/router/pns_router.cpp:345`). A pair placement **requires**
+  /// a start object, where a single track does not: the engine has no
+  /// other way to learn which two nets are being routed.
+  PairNeedsStartItem,
+
+  /// The rule resolver does not know the start object as half of a pair.
+  ///
+  /// Port of "Unable to find complementary differential pair nets..."
+  /// (`pcbnew/router/pns_diff_pair_placer.cpp:526`), which for KiCad
+  /// means the two net names do not differ in a `P`/`N` or `+`/`-`
+  /// suffix. This crate has no net names and invents no convention: the
+  /// host answers [`crate::rules::RuleResolver::dp_net_pair`], and a host
+  /// with no pair concept answers [`None`] and reaches this.
+  NotADiffPair,
+
+  /// The start object has no free end to start a pair from.
+  ///
+  /// Port of "Can't find a suitable starting point.  If starting from an
+  /// existing differential pair make sure you are at the end."
+  /// (`pcbnew/router/pns_diff_pair_placer.cpp:543`).
+  NoDanglingAnchor,
+
+  /// Nothing on the coupled net can be paired with the start object.
+  ///
+  /// Port of "Can't find a suitable starting point for coupled net"
+  /// (`pcbnew/router/pns_diff_pair_placer.cpp:598`). The candidate has to
+  /// be the same kind of object, has to have a free end of its own, and,
+  /// for a pad or a via, has to span the same layers.
+  NoCoupledStartItem(NetId),
+
+  /// The configured pair gap is below the board's minimum clearance.
+  ///
+  /// Port of "Diff pair gap is less than board minimum clearance."
+  /// (`pcbnew/router/pns_router.cpp:231`). It is the only consistency
+  /// check KiCad makes between the pair gap, which is geometry, and the
+  /// clearance rules, which are what the two lanes are then tested
+  /// against; note 07 section 8.3 spells out what happens without it.
+  PairGapBelowMinClearance,
+
+  /// The pair of tracks under the cursor is not spaced like the
+  /// configured pair.
+  ///
+  /// Port of "The differential pair gap at the start point does not match
+  /// the configured gap." (`pcbnew/router/pns_router.cpp:373`), inside a
+  /// ten percent tolerance. It applies only when starting from a segment
+  /// or an arc: the spacing of two pads or two vias is fixed by their
+  /// placement and not by routing rules (`:359`).
+  PairGapMismatch,
+
   /// The object under the drag is not something a drag can move.
   ///
   /// Port of the `default:` of `DRAGGER::Start`
@@ -182,6 +244,17 @@ pub enum StartError {
   /// of `startDragArc`'s refusal, which has no counterpart while this
   /// crate has no arcs.
   NotDraggable(ItemId),
+}
+
+/// The three ways pair identification fails, as a host sees them.
+impl From<PairError> for StartError {
+  fn from(error: PairError) -> Self {
+    match error {
+      PairError::NotADiffPair => StartError::NotADiffPair,
+      PairError::NoDanglingAnchor => StartError::NoDanglingAnchor,
+      PairError::NoCoupledItem(net) => StartError::NoCoupledStartItem(net),
+    }
+  }
 }
 
 // ---------------------------------------------------------------------
@@ -335,7 +408,16 @@ pub struct PreviewFrame {
   pub items: Vec<PreviewItem>,
 
   /// The via the next fix would place, when one is pending.
+  ///
+  /// For a differential pair this is the P lane's; the N lane's is
+  /// [`PreviewFrame::via_n`]. `movePlacing` draws one per trace
+  /// (`pcbnew/router/pns_router.cpp:806`), which for a pair is two.
   pub via: Option<PreviewVia>,
+
+  /// The second via of a pending differential pair via placement.
+  ///
+  /// Always [`None`] while a single track is being routed.
+  pub via_n: Option<PreviewVia>,
 
   /// Vias this session has already fixed into the speculative node.
   ///
@@ -354,6 +436,14 @@ pub struct PreviewFrame {
   /// rather than draws; see
   /// [`crate::placer::line_placer::LinePlacer::leading_rat_line`].
   pub ratline: Option<LineChain>,
+
+  /// The same for the N lane of a differential pair.
+  ///
+  /// `DIFF_PAIR_PLACER::updateLeadingRatLine` draws one rat line per lane
+  /// with that lane's own net
+  /// (`pcbnew/router/pns_diff_pair_placer.cpp:914`). Always [`None`]
+  /// while a single track is being routed.
+  pub ratline_n: Option<LineChain>,
 
   /// Every obstacle the route runs into.
   pub violations: Vec<ViolationMarker>,
@@ -584,6 +674,39 @@ pub struct RatsnestAnchor {
   pub item: Option<ItemId>,
 }
 
+/// What a session is routing.
+///
+/// Port of `ROUTER::GetCurrentNets` (`pcbnew/router/pns_router.cpp:1031`),
+/// a `std::vector<NET_HANDLE>` whose length is the only thing that says
+/// whether a pair is being placed. `DESIGN.md` section 11 prefers an enum
+/// over a length, so the two cases are named.
+///
+/// The nets are optional because a route need not have one: a track
+/// started in empty space takes
+/// [`crate::rules::RuleResolver::orphaned_net`].
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, Default)]
+pub enum RoutedNets {
+  /// Nothing is being routed.
+  #[default]
+  None,
+  /// One track, or one dragged object.
+  Single(Option<NetId>),
+  /// A differential pair, the positive half first.
+  Pair(Option<NetId>, Option<NetId>),
+}
+
+impl RoutedNets {
+  /// The first net, which is what `CurrentNets()[0]` means to the three
+  /// places in KiCad's router that read only one
+  /// (`pcbnew/router/pns_router.cpp:549`, `:1033`).
+  pub const fn first(self) -> Option<NetId> {
+    match self {
+      RoutedNets::None => None,
+      RoutedNets::Single(net) | RoutedNets::Pair(net, _) => net,
+    }
+  }
+}
+
 // ---------------------------------------------------------------------
 // The facade
 // ---------------------------------------------------------------------
@@ -613,7 +736,12 @@ pub struct Router {
   debug: Box<dyn DebugDecorator>,
   /// The single track placer, alive exactly in
   /// [`RouterState::RouteTrack`]. Port of `m_placer` (`:283`).
-  placer: Option<LinePlacer>,
+  ///
+  /// KiCad's `ROUTE_TRACK` covers a differential pair too: its
+  /// `RouterState` has no pair state and the mode is a separate field
+  /// (`pcbnew/router/pns_router.h:69`). So does this, and
+  /// [`crate::placer::Placer`] is what says which of the two is running.
+  placer: Option<Placer>,
   /// The dragger, alive exactly in [`RouterState::DragSegment`]. Port of
   /// `m_dragger` (`:284`), which KiCad holds as a
   /// `std::unique_ptr<DRAG_ALGO>` over three implementations. See
@@ -792,18 +920,25 @@ impl Router {
 
   /// Change the geometry the next route is placed with.
   ///
-  /// Port of `UpdateSizes` (`pcbnew/router/pns_router.cpp:781`) minus its
-  /// second half: KiCad also pushes the new sizes into a running placer,
-  /// which is how its width and via size actions take effect mid route.
-  /// [`LinePlacer`] has no such entry point yet, so a running placement
-  /// keeps the sizes it started with and a host applies a width change by
-  /// fixing and starting a new leg. Widening the placer is a milestone 5
-  /// follow up, tracked in `doc/work/005-session-api-and-event-log.md`.
+  /// Port of `UpdateSizes` (`pcbnew/router/pns_router.cpp:781`), which
+  /// also pushes the new sizes into a running placer; that is how KiCad's
+  /// width and via size actions take effect mid route.
+  ///
+  /// Only the differential pair placer takes them
+  /// (`pcbnew/router/pns_diff_pair_placer.cpp:782`). [`LinePlacer`] has
+  /// no such entry point yet, so a running single track placement keeps
+  /// the sizes it started with and a host applies a width change by
+  /// fixing and starting a new leg; that is a milestone 5 follow up,
+  /// tracked in `doc/work/005-session-api-and-event-log.md`.
   pub fn set_sizes(&mut self, sizes: Sizes) {
     self.record(SessionEvent::SetSizes {
       sizes: sizes.clone(),
     });
-    self.sizes = sizes;
+    self.sizes = sizes.clone();
+
+    if let Some(placer) = self.placer.as_mut() {
+      placer.update_sizes(sizes);
+    }
   }
 
   /// Replace the persistent settings.
@@ -887,10 +1022,31 @@ impl Router {
     self.dragger.as_ref().and_then(ActiveDragger::current_net)
   }
 
+  /// Every net the session is routing.
+  ///
+  /// Port of `ROUTER::GetCurrentNets`
+  /// (`pcbnew/router/pns_router.cpp:1031`). A differential pair answers
+  /// with both halves, P first; everything else answers with the one net
+  /// [`Router::current_net`] gives.
+  pub fn current_nets(&self) -> RoutedNets {
+    if let Some(placer) = self.placer.as_ref() {
+      return if placer.is_diff_pair() {
+        RoutedNets::Pair(placer.current_net(), placer.current_net_n())
+      } else {
+        RoutedNets::Single(placer.current_net())
+      };
+    }
+
+    match self.dragger.as_ref() {
+      Some(dragger) => RoutedNets::Single(dragger.current_net()),
+      None => RoutedNets::None,
+    }
+  }
+
   /// Whether the next fix would place a via. Port of `IsPlacingVia()`,
   /// `pcbnew/router/pns_router.cpp:1059`.
   pub fn placing_via(&self) -> bool {
-    self.placer.as_ref().is_some_and(LinePlacer::is_placing_via)
+    self.placer.as_ref().is_some_and(Placer::is_placing_via)
   }
 
   // -----------------------------------------------------------------
@@ -958,8 +1114,9 @@ impl Router {
   /// collision probe. Every other case is unchanged, because the loop
   /// clears its failure as soon as one routable item is found (`:248`).
   ///
-  /// The differential pair half of the routine (`:340` to `:427`) is out
-  /// of scope; see `PLAN.md`.
+  /// The differential pair half of the routine (`:227` and `:340` to
+  /// `:427`) is [`Router::is_starting_point_routable_diff_pair`], which
+  /// shares the per item scan and nothing else.
   pub fn is_starting_point_routable(
     &self,
     at: Vec2,
@@ -981,31 +1138,7 @@ impl Router {
       ),
     };
 
-    // :238
-    let mut failure = None;
-
-    for id in self.world.hit_test(root, at) {
-      let Some(item) = self.world.item(id) else {
-        continue;
-      };
-
-      // :245
-      if !item.layers().contains(layer) {
-        continue;
-      }
-
-      // :248
-      if item.is_routable() {
-        failure = None;
-        break;
-      }
-
-      failure = Some(StartError::NotRoutable(id));
-    }
-
-    if let Some(failure) = failure {
-      return Err(failure);
-    }
+    self.check_hovered_items_routable(at, layer)?;
 
     // :306. The degenerate two point line KiCad probes with; the second
     // append is the allow duplicate one (`:310`).
@@ -1028,6 +1161,161 @@ impl Router {
       probe.set_width(self.sizes.board_min_track_width);
 
       if self.probe_collides(&probe) {
+        return Err(StartError::StartPointViolatesRules);
+      }
+    }
+
+    Ok(())
+  }
+
+  /// The per item half of the start gate, shared by both modes.
+  ///
+  /// `pcbnew/router/pns_router.cpp:238` to `:302`: every object under the
+  /// point that reaches the layer is examined, and one routable object is
+  /// enough to clear all of them, however many unroutable ones the point
+  /// also lands on.
+  ///
+  /// # Errors
+  ///
+  /// [`StartError::NotRoutable`], naming the last unroutable object.
+  fn check_hovered_items_routable(
+    &self,
+    at: Vec2,
+    layer: i32,
+  ) -> Result<(), StartError> {
+    let root = self.world.root();
+    // :238
+    let mut failure = None;
+
+    for id in self.world.hit_test(root, at) {
+      let Some(item) = self.world.item(id) else {
+        continue;
+      };
+
+      // :245
+      if !item.layers().contains(layer) {
+        continue;
+      }
+
+      // :248
+      if item.is_routable() {
+        failure = None;
+        break;
+      }
+
+      failure = Some(StartError::NotRoutable(id));
+    }
+
+    match failure {
+      Some(failure) => Err(failure),
+      None => Ok(()),
+    }
+  }
+
+  /// Whether a differential pair may be started at a point.
+  ///
+  /// Port of the `PNS_MODE_ROUTE_DIFF_PAIR` half of
+  /// `isStartingPointRoutable` (`pcbnew/router/pns_router.cpp:227` and
+  /// `:341` to `:427`), which is much larger than the single track one.
+  /// Three gates are pair specific: the configured gap has to reach the
+  /// board minimum clearance, a start object is required, and a start on
+  /// an existing pair of tracks has to find them spaced like the
+  /// configured pair to within a tenth. Then two degenerate probe lines,
+  /// one per anchor, are tested exactly as the single track gate tests
+  /// its one.
+  ///
+  /// # Errors
+  ///
+  /// [`StartError::PairGapBelowMinClearance`],
+  /// [`StartError::PairNeedsStartItem`],
+  /// [`StartError::UnknownStartItem`], the three
+  /// [`crate::placer::diff_pair_placer::PairError`] variants,
+  /// [`StartError::PairGapMismatch`] and
+  /// [`StartError::StartPointViolatesRules`].
+  pub fn is_starting_point_routable_diff_pair(
+    &self,
+    at: Vec2,
+    start: Option<HostId>,
+    layer: i32,
+  ) -> Result<(), StartError> {
+    // :224
+    if self.settings.allow_drc_violations() {
+      return Ok(());
+    }
+
+    // :229
+    if self.sizes.diff_pair_gap < self.sizes.min_clearance {
+      return Err(StartError::PairGapBelowMinClearance);
+    }
+
+    self.check_hovered_items_routable(at, layer)?;
+
+    // :343
+    let host = start.ok_or(StartError::PairNeedsStartItem)?;
+    let root = self.world.root();
+    let start_item = self
+      .resolve_host_item(root, at, host, Some(layer))
+      .ok_or(StartError::UnknownStartItem(host))?;
+
+    // :352
+    let pair = DiffPairPlacer::find_dp_primitive_pair(
+      &self.world,
+      self.resolver.as_ref(),
+      root,
+      Some(start_item),
+    )
+    .map_err(StartError::from)?;
+
+    // :363
+    let starts_on_track = self
+      .world
+      .item(start_item)
+      .is_some_and(|item| item.of_kind(Kind::SEGMENT | Kind::ARC));
+
+    if starts_on_track {
+      // :365 to :375
+      let actual = (pair.anchor_p() - pair.anchor_n()).euclidean_norm();
+      let configured = self.sizes.diff_pair_pitch();
+      let tolerance = configured / 10;
+
+      if (actual - configured).abs() > tolerance {
+        return Err(StartError::PairGapMismatch);
+      }
+    }
+
+    // :382 to :401
+    let net_of = |primitive: crate::diff_pair::DpPrimitive| {
+      primitive
+        .stored()
+        .and_then(|id| self.world.item(id))
+        .and_then(Item::net)
+    };
+    let probe_of = |at: Vec2, net: Option<NetId>, width: i32| {
+      let mut chain = LineChain::new();
+
+      chain.append(at);
+      chain.append_allow_duplicate(at);
+
+      let mut probe = Line::new();
+
+      probe.set_shape(chain);
+      probe.set_layer(layer);
+      probe.set_net(net);
+      probe.set_width(width);
+      probe
+    };
+    let net_p = net_of(pair.prim_p());
+    let net_n = net_of(pair.prim_n());
+    let collides = |width: i32| {
+      self.probe_collides(&probe_of(pair.anchor_n(), net_n, width))
+        || self.probe_collides(&probe_of(pair.anchor_p(), net_p, width))
+    };
+
+    // :403
+    if collides(self.sizes.diff_pair_width) {
+      // :408, the same "do not stop the user over a width they can fix
+      // later" relaxation the single track gate makes.
+      if collides(self.sizes.board_min_track_width) {
         return Err(StartError::StartPointViolatesRules);
       }
     }
@@ -1152,7 +1440,68 @@ impl Router {
       return Err(StartError::PlacerRefused);
     }
 
-    self.placer = Some(placer);
+    self.placer = Some(Placer::Line(Box::new(placer)));
+    self.state = RouterState::RouteTrack;
+
+    Ok(self.frame())
+  }
+
+  /// Begin routing a differential pair.
+  ///
+  /// Port of `ROUTER::StartRouting` (`pcbnew/router/pns_router.cpp:434`)
+  /// for `PNS_MODE_ROUTE_DIFF_PAIR`. KiCad reaches the same function
+  /// through a mode its host set earlier with `SetMode` (`:1094`); note
+  /// 07 section 12.4 recommends a second entry point instead, because the
+  /// preconditions really are different (a start object is required) and
+  /// because a mode field would make [`Router::start_routing`] fallible
+  /// in a way its signature does not show. The recording gains one
+  /// variant rather than a mode event.
+  ///
+  /// Which two nets are routed is entirely the host's answer, through
+  /// [`crate::rules::RuleResolver::dp_net_pair`] on the start object.
+  /// KiCad's own answer is a net **name** convention
+  /// (`BOARD::MatchDpSuffix`, `pcbnew/board.cpp:2780`); this crate has no
+  /// net names and invents no convention.
+  ///
+  /// # Errors
+  ///
+  /// [`StartError::AlreadyRouting`], everything
+  /// [`Router::is_starting_point_routable_diff_pair`] refuses, and
+  /// [`StartError::PlacerRefused`].
+  pub fn start_routing_diff_pair(
+    &mut self,
+    at: Vec2,
+    start: Option<HostId>,
+    layer: i32,
+  ) -> Result<PreviewFrame, StartError> {
+    self.record(SessionEvent::StartRoutingDiffPair { at, start, layer });
+
+    if self.routing_in_progress() {
+      return Err(StartError::AlreadyRouting);
+    }
+
+    self.is_starting_point_routable_diff_pair(at, start, layer)?;
+
+    let root = self.world.root();
+    let host = start.ok_or(StartError::PairNeedsStartItem)?;
+    let start_item = self
+      .resolve_host_item(root, at, host, Some(layer))
+      .ok_or(StartError::UnknownStartItem(host))?;
+
+    // :443 to :471, in KiCad's order.
+    let mut placer = DiffPairPlacer::new(&self.world, root, self.sizes.clone());
+    let context = AlgoContext {
+      resolver: self.resolver.as_ref(),
+      settings: &self.settings,
+      debug: self.debug.as_ref(),
+    };
+
+    placer.set_layer(&mut self.world, &context, layer);
+
+    // :473
+    placer.start(&mut self.world, &context, at, Some(start_item))?;
+
+    self.placer = Some(Placer::DiffPair(Box::new(placer)));
     self.state = RouterState::RouteTrack;
 
     Ok(self.frame())
@@ -1567,17 +1916,17 @@ impl Router {
     let host = anchor.item.and_then(|id| self.index.host_of(id));
 
     // :594. Five tries, stopping as soon as the end stops moving.
-    let mut settled = self.placer.as_ref().and_then(LinePlacer::current_end);
+    let mut settled = self.placer.as_ref().and_then(Placer::current_end);
 
     // This routine picks its own anchor, so it is one event and the moves
     // and the fix it drives are not recorded on their own.
     self.suspend_recording();
 
     for _ in 0..5 {
-      settled = self.placer.as_ref().and_then(LinePlacer::current_end);
+      settled = self.placer.as_ref().and_then(Placer::current_end);
       self.move_to(anchor.at, host);
 
-      if self.placer.as_ref().and_then(LinePlacer::current_end) == settled {
+      if self.placer.as_ref().and_then(Placer::current_end) == settled {
         break;
       }
     }
@@ -1625,7 +1974,7 @@ impl Router {
     let anchor = self.nearest_ratsnest_anchor()?;
     let host = anchor.item.and_then(|id| self.index.host_of(id));
     let layer = self.current_layer()?;
-    let end = self.placer.as_ref().and_then(LinePlacer::current_end)?;
+    let end = self.placer.as_ref().and_then(Placer::current_end)?;
 
     // This routine picks its own anchor, so it is one event and the
     // commit, the restart and the move it drives are not recorded on
@@ -1750,7 +2099,13 @@ impl Router {
     };
     let armed = !placer.is_placing_via();
 
-    placer.toggle_via(armed)
+    let context = AlgoContext {
+      resolver: self.resolver.as_ref(),
+      settings: &self.settings,
+      debug: self.debug.as_ref(),
+    };
+
+    placer.toggle_via(&mut self.world, &context, armed)
   }
 
   /// Turn the route's first corner the other way.
@@ -1765,8 +2120,14 @@ impl Router {
       return;
     }
 
+    let context = AlgoContext {
+      resolver: self.resolver.as_ref(),
+      settings: &self.settings,
+      debug: self.debug.as_ref(),
+    };
+
     if let Some(placer) = self.placer.as_mut() {
-      placer.flip_posture();
+      placer.flip_posture(&mut self.world, &context);
     }
   }
 
@@ -2186,11 +2547,7 @@ impl Router {
       return CommitPlan::default();
     };
 
-    if !placer.has_placed_anything() {
-      return CommitPlan::default();
-    }
-
-    let Some(node) = placer.last_node() else {
+    let Some(node) = placer.commit_node() else {
       return CommitPlan::default();
     };
 
@@ -2485,17 +2842,19 @@ struct CommitPlan {
 fn preview_frame(
   world: &World,
   index: &HostIndex,
-  placer: &LinePlacer,
+  placer: &Placer,
   resolver: &dyn RuleResolver,
 ) -> PreviewFrame {
   let node = placer.current_node(true);
   let mut frame = PreviewFrame {
     ratline: placer.leading_rat_line().cloned(),
+    ratline_n: placer.leading_rat_line_n().cloned(),
     ..PreviewFrame::default()
   };
 
-  // :796, the route itself and the via it ends with.
-  for line in placer.traces() {
+  // :796, the route itself and the via it ends with. The loop runs twice
+  // for a differential pair, P then N, and each lane draws its own via.
+  for (lane, line) in placer.traces().into_iter().enumerate() {
     if line.segment_count() > 0 {
       frame.items.push(PreviewItem {
         chain: line.shape().clone(),
@@ -2508,7 +2867,11 @@ fn preview_frame(
     }
 
     if let Some(via) = preview_via(world, resolver, &line) {
-      frame.via = Some(via);
+      if lane == 0 {
+        frame.via = Some(via);
+      } else {
+        frame.via_n = Some(via);
+      }
     }
 
     // :700, the violations this line runs into.

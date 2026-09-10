@@ -29,12 +29,14 @@
 //!   [`DpGateways::filter_by_orientation`].
 //! - The fit: [`DiffPair::build_initial`], [`check_connection_angle`] and
 //!   [`fit_gateways`].
+//! - [`DiffPair::ending_primitives`], which is what a fixed leg hands the
+//!   next one, over the [`DpPrimitive`] that lets a primitive pair name
+//!   an object no node holds.
 //!
 //! # What is not
 //!
-//! - The placer itself, `DIFF_PAIR_PLACER`, and everything that needs a
-//!   node: `EndingPrimitives` and the via placement path. They are the
-//!   later slices of `doc/work/010-differential-pairs.md`. The pair's
+//! - The placer itself, which is
+//!   [`crate::placer::diff_pair_placer::DiffPairPlacer`]. The pair's
 //!   optimizer passes live with the rest of the optimizer, at
 //!   [`crate::optimizer::Optimizer::optimize_diff_pair`].
 //! - `DP_GATEWAYS::BuildOrthoProjections` (`pns_diff_pair.cpp:302`), which
@@ -64,6 +66,7 @@
 //! always called a pitch, on [`DpGateways::new`], on [`fit_gateways`] and
 //! on [`crate::settings::Sizes::diff_pair_pitch`].
 
+use std::borrow::Cow;
 use std::f64::consts::{FRAC_1_SQRT_2, SQRT_2};
 
 use crate::geometry::direction45::{AngleType, CornerMode, Direction45};
@@ -636,6 +639,67 @@ impl DiffPair {
   /// `pcbnew/router/pns_diff_pair.h:496`.
   pub fn n_line(&self) -> Line {
     self.line_of(&self.n, self.net_n, self.via_n.as_ref())
+  }
+
+  /// What a following leg carries on from.
+  ///
+  /// Port of `EndingPrimitives`,
+  /// `pcbnew/router/pns_diff_pair.cpp:764`, which the pair placer assigns
+  /// to `m_prevPair` once a leg is fixed
+  /// (`pcbnew/router/pns_diff_pair_placer.cpp:856`). A pair that ends
+  /// with vias answers with those two vias, anchored at their centres; a
+  /// pair that does not answers with the last segment of each lane,
+  /// anchored at its far end.
+  ///
+  /// Neither answer is an arena item, which is why [`DpPrimitive`]
+  /// exists: KiCad builds the two segments on the stack and lets
+  /// `DP_PRIMITIVE_PAIR`'s constructor clone them, and hands over
+  /// pointers to the pair's own two `VIA` members, which are values as
+  /// well. Note 07 section 5.10 records the stack objects and section
+  /// 12.1 assumes handles, so this is the one place the two do not meet.
+  ///
+  /// [`None`] where KiCad would read `CSegment( -1 )` of an empty chain,
+  /// which its caller keeps unreachable by refusing to fix a pair with an
+  /// empty lane (`pns_diff_pair_placer.cpp:813`).
+  pub fn ending_primitives(&self) -> Option<DpPrimitivePair> {
+    // :766
+    if self.has_vias {
+      let via_p = self.via_p.as_ref()?;
+      let via_n = self.via_n.as_ref()?;
+      let primitive = |via: &Item| match via.body() {
+        ItemBody::Via(body) => Some(DpPrimitive::Via {
+          pos: body.pos(),
+          layers: via.layers(),
+          diameter: body.diameter(via.layers(), via.layers().start()),
+        }),
+        _ => None,
+      };
+
+      let anchor_p = via_p.anchor(0);
+      let anchor_n = via_n.anchor(0);
+
+      return Some(DpPrimitivePair::from_primitives(
+        primitive(via_p)?,
+        primitive(via_n)?,
+        anchor_p,
+        anchor_n,
+      ));
+    }
+
+    // :772 to :778
+    if self.p.segment_count() == 0 || self.n.segment_count() == 0 {
+      return None;
+    }
+
+    let seg_p = self.p.segment(self.p.segment_count() - 1);
+    let seg_n = self.n.segment(self.n.segment_count() - 1);
+
+    Some(DpPrimitivePair::from_primitives(
+      DpPrimitive::Segment(seg_p),
+      DpPrimitive::Segment(seg_n),
+      seg_p.b,
+      seg_n.b,
+    ))
   }
 
   /// The shared body of [`DiffPair::p_line`] and [`DiffPair::n_line`].
@@ -1218,14 +1282,131 @@ impl DpGateway {
 pub struct DpPrimitivePair {
   /// The P object, if the pair started on one. Port of `m_primP`,
   /// `pcbnew/router/pns_diff_pair.h:145`.
-  prim_p: Option<ItemId>,
+  prim_p: DpPrimitive,
   /// The N object. Port of `m_primN`.
-  prim_n: Option<ItemId>,
+  prim_n: DpPrimitive,
   /// The point on the P object a route leaves from. Port of `m_anchorP`,
   /// `pcbnew/router/pns_diff_pair.h:147`.
   anchor_p: Vec2,
   /// The point on the N object. Port of `m_anchorN`.
   anchor_n: Vec2,
+}
+
+/// One half of a [`DpPrimitivePair`]: the object a route leaves from.
+///
+/// KiCad's `m_primP` is an owned `ITEM*` clone, so it does not care
+/// whether the object it describes is on the board. Two of the three
+/// things it is ever given are **not**: [`DiffPair::ending_primitives`]
+/// (`pcbnew/router/pns_diff_pair.cpp:764`) builds two stack `SEGMENT`s
+/// out of the last segment of each lane, and, when the pair ends with
+/// vias, hands over the pair's own two `VIA` members, which
+/// `DIFF_PAIR_PLACER::FixRoute` clones into the node separately
+/// (`pns_diff_pair_placer.cpp:838`). Neither is an arena item here, so a
+/// bare [`ItemId`] cannot express them.
+///
+/// [`DpPrimitive::Segment`] and [`DpPrimitive::Via`] carry everything the
+/// readers below and [`DpGateways::build_from_primitive_pair`] ask of
+/// such an object: its kind, its two anchors, its shape and its layers.
+/// A via's diameter is carried only so that its shape is the circle
+/// `BuildFromPrimitivePair` dispatches on (`:457`); nothing reads the
+/// size.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
+pub enum DpPrimitive {
+  /// No object on this side. KiCad's null `m_primP`.
+  #[default]
+  None,
+  /// A board object in the arena.
+  Stored(ItemId),
+  /// A segment that is in no node.
+  Segment(Seg),
+  /// A via that is in no node.
+  Via {
+    /// Where it sits, which is its only anchor.
+    pos: Vec2,
+    /// The copper layers it spans.
+    layers: LayerRange,
+    /// Its copper diameter, so that [`DpPrimitive::shape`] is a circle.
+    diameter: i32,
+  },
+}
+
+impl DpPrimitive {
+  /// The `ITEM::Kind()` of the object, if there is one.
+  pub fn kind(&self, world: &World) -> Option<Kind> {
+    match self {
+      DpPrimitive::None => None,
+      DpPrimitive::Stored(id) => world.item(*id).map(Item::kind),
+      DpPrimitive::Segment(_) => Some(Kind::SEGMENT),
+      DpPrimitive::Via { .. } => Some(Kind::VIA),
+    }
+  }
+
+  /// Whether the object is one of the kinds in a mask, `ITEM::OfKind`.
+  pub fn of_kind(&self, world: &World, mask: Kind) -> bool {
+    self.kind(world).is_some_and(|kind| kind.of_kind(mask))
+  }
+
+  /// One of the object's connection points, `ITEM::Anchor`.
+  pub fn anchor(&self, world: &World, index: usize) -> Option<Vec2> {
+    match self {
+      DpPrimitive::None => None,
+      DpPrimitive::Stored(id) => world.item(*id).map(|item| item.anchor(index)),
+      DpPrimitive::Segment(seg) => Some(if index == 0 { seg.a } else { seg.b }),
+      DpPrimitive::Via { pos, .. } => Some(*pos),
+    }
+  }
+
+  /// The segment the object is, when it is one.
+  pub fn seg(&self, world: &World) -> Option<Seg> {
+    match self {
+      DpPrimitive::Stored(id) => match world.item(*id)?.body() {
+        ItemBody::Segment(body) => Some(body.seg()),
+        _ => None,
+      },
+      DpPrimitive::Segment(seg) => Some(*seg),
+      DpPrimitive::None | DpPrimitive::Via { .. } => None,
+    }
+  }
+
+  /// The object's shape over its whole padstack, `Shape( -1 )`.
+  pub fn shape<'a>(&self, world: &'a World) -> Option<Cow<'a, Shape>> {
+    match self {
+      DpPrimitive::None => None,
+      DpPrimitive::Stored(id) => world.item(*id)?.shape(-1),
+      DpPrimitive::Segment(seg) => Some(Cow::Owned(Shape::Segment {
+        seg: *seg,
+        width: 0,
+      })),
+      DpPrimitive::Via { pos, diameter, .. } => {
+        Some(Cow::Owned(Shape::circle(*pos, diameter / 2)))
+      }
+    }
+  }
+
+  /// The copper layers the object spans.
+  pub fn layers(&self, world: &World) -> Option<LayerRange> {
+    match self {
+      DpPrimitive::None => None,
+      DpPrimitive::Stored(id) => world.item(*id).map(Item::layers),
+      DpPrimitive::Segment(_) => None,
+      DpPrimitive::Via { layers, .. } => Some(*layers),
+    }
+  }
+
+  /// Whether there is an object at all, KiCad's `m_primP != nullptr`.
+  pub const fn is_some(&self) -> bool {
+    !matches!(self, DpPrimitive::None)
+  }
+
+  /// The arena handle, when the object is a board object.
+  pub const fn stored(&self) -> Option<ItemId> {
+    match self {
+      DpPrimitive::Stored(id) => Some(*id),
+      DpPrimitive::None | DpPrimitive::Segment(_) | DpPrimitive::Via { .. } => {
+        None
+      }
+    }
+  }
 }
 
 /// The answer of [`DpPrimitivePair::cursor_orientation`].
@@ -1251,11 +1432,31 @@ impl DpPrimitivePair {
     prim_n: ItemId,
   ) -> Option<Self> {
     Some(Self {
-      prim_p: Some(prim_p),
-      prim_n: Some(prim_n),
+      prim_p: DpPrimitive::Stored(prim_p),
+      prim_n: DpPrimitive::Stored(prim_n),
       anchor_p: world.item(prim_p)?.anchor(0),
       anchor_n: world.item(prim_n)?.anchor(0),
     })
+  }
+
+  /// A pair of two objects that need not be in the arena, at anchors the
+  /// caller names.
+  ///
+  /// The shape [`DiffPair::ending_primitives`] needs: KiCad builds its
+  /// `DP_PRIMITIVE_PAIR` from two stack objects and then calls
+  /// `SetAnchors` (`pcbnew/router/pns_diff_pair.cpp:773`, `:776`).
+  pub const fn from_primitives(
+    prim_p: DpPrimitive,
+    prim_n: DpPrimitive,
+    anchor_p: Vec2,
+    anchor_n: Vec2,
+  ) -> Self {
+    Self {
+      prim_p,
+      prim_n,
+      anchor_p,
+      anchor_n,
+    }
   }
 
   /// A pair of two bare points.
@@ -1264,8 +1465,8 @@ impl DpPrimitivePair {
   /// `pcbnew/router/pns_diff_pair.cpp:56`.
   pub const fn from_anchors(anchor_p: Vec2, anchor_n: Vec2) -> Self {
     Self {
-      prim_p: None,
-      prim_n: None,
+      prim_p: DpPrimitive::None,
+      prim_n: DpPrimitive::None,
       anchor_p,
       anchor_n,
     }
@@ -1273,13 +1474,13 @@ impl DpPrimitivePair {
 
   /// The P object. Port of `PrimP`,
   /// `pcbnew/router/pns_diff_pair.h:136`.
-  pub const fn prim_p(&self) -> Option<ItemId> {
+  pub const fn prim_p(&self) -> DpPrimitive {
     self.prim_p
   }
 
   /// The N object. Port of `PrimN`,
   /// `pcbnew/router/pns_diff_pair.h:137`.
-  pub const fn prim_n(&self) -> Option<ItemId> {
+  pub const fn prim_n(&self) -> DpPrimitive {
     self.prim_n
   }
 
@@ -1308,10 +1509,7 @@ impl DpPrimitivePair {
   /// `pcbnew/router/pns_diff_pair.cpp:97`, which tests the **P** object
   /// only and answers false when there is none.
   pub fn directional(&self, world: &World) -> bool {
-    self
-      .prim_p
-      .and_then(|id| world.item(id))
-      .is_some_and(|item| item.of_kind(Kind::SEGMENT | Kind::ARC))
+    self.prim_p.of_kind(world, Kind::SEGMENT | Kind::ARC)
   }
 
   /// Which way the P object arrives at its anchor.
@@ -1349,39 +1547,36 @@ impl DpPrimitivePair {
     cursor: Vec2,
   ) -> Option<CursorOrientation> {
     // :125
-    let item_p = world.item(self.prim_p?)?;
-    let item_n = world.item(self.prim_n?)?;
+    if !self.prim_p.is_some() || !self.prim_n.is_some() {
+      return None;
+    }
 
-    let (point_p, point_n) =
-      if item_p.of_kind(Kind::SEGMENT) && item_n.of_kind(Kind::SEGMENT) {
-        // :131
-        let point_p = item_p.anchor(1);
-        let point_n = item_n.anchor(1);
+    let (point_p, point_n) = if self.prim_p.of_kind(world, Kind::SEGMENT)
+      && self.prim_n.of_kind(world, Kind::SEGMENT)
+    {
+      // :131
+      let point_p = self.prim_p.anchor(world, 1)?;
+      let point_n = self.prim_n.anchor(world, 1)?;
 
-        // :136 to :145
-        if let (ItemBody::Segment(segment_p), ItemBody::Segment(segment_n)) =
-          (item_p.body(), item_n.body())
-        {
-          let seg_p = segment_p.seg();
-          let seg_n = segment_n.seg();
+      // :136 to :145
+      if let (Some(seg_p), Some(seg_n)) =
+        (self.prim_p.seg(world), self.prim_n.seg(world))
+        && seg_p.b != seg_p.a
+        && seg_n.b != seg_n.a
+        && seg_p.approx_parallel(&seg_n, Seg::APPROX_DISTANCE_THRESHOLD)
+      {
+        return Some(CursorOrientation {
+          midpoint: midpoint_of(point_p, point_n),
+          direction: (seg_p.b - seg_p.a)
+            .resize((point_p - point_n).euclidean_norm()),
+        });
+      }
 
-          if seg_p.b != seg_p.a
-            && seg_n.b != seg_n.a
-            && seg_p.approx_parallel(&seg_n, Seg::APPROX_DISTANCE_THRESHOLD)
-          {
-            return Some(CursorOrientation {
-              midpoint: midpoint_of(point_p, point_n),
-              direction: (seg_p.b - seg_p.a)
-                .resize((point_p - point_n).euclidean_norm()),
-            });
-          }
-        }
-
-        (point_p, point_n)
-      } else {
-        // :149
-        (item_p.anchor(0), item_n.anchor(0))
-      };
+      (point_p, point_n)
+    } else {
+      // :149
+      (self.prim_p.anchor(world, 0)?, self.prim_n.anchor(world, 0)?)
+    };
 
     // :153 to :157
     let midpoint = midpoint_of(point_p, point_n);
@@ -1419,21 +1614,23 @@ fn midpoint_of(first: Vec2, second: Vec2) -> Vec2 {
 /// world does not know, give an undefined direction.
 fn anchor_direction(
   world: &World,
-  item: Option<ItemId>,
+  primitive: DpPrimitive,
   point: Vec2,
 ) -> Direction45 {
-  let Some(item) = item.and_then(|id| world.item(id)) else {
-    return Direction45::default();
-  };
-
-  if !item.of_kind(Kind::SEGMENT | Kind::ARC) {
+  if !primitive.of_kind(world, Kind::SEGMENT | Kind::ARC) {
     return Direction45::default();
   }
 
-  if item.anchor(0) == point {
-    Direction45::from_vector(item.anchor(0) - item.anchor(1), false)
+  let (Some(first), Some(second)) =
+    (primitive.anchor(world, 0), primitive.anchor(world, 1))
+  else {
+    return Direction45::default();
+  };
+
+  if first == point {
+    Direction45::from_vector(first - second, false)
   } else {
-    Direction45::from_vector(item.anchor(1) - item.anchor(0), false)
+    Direction45::from_vector(second - first, false)
   }
 }
 
@@ -1962,23 +2159,26 @@ impl DpGateways {
     let segment_or_arc = Kind::SEGMENT | Kind::ARC;
 
     // :426
-    let Some(prim_p) = pair.prim_p() else {
+    let prim_p = pair.prim_p();
+    let prim_n = pair.prim_n();
+
+    if !prim_p.is_some() {
       self.build_generic(pair.anchor_p(), pair.anchor_n(), true, false);
       return Ok(());
-    };
+    }
 
-    let Some(prim_n) = pair.prim_n() else {
+    if !prim_n.is_some() {
       return Err(DpGatewayError::MixedPrimitiveKinds);
-    };
+    }
 
-    let item_p = world.item(prim_p).ok_or(DpGatewayError::UnknownPrimitive)?;
-    let item_n = world.item(prim_n).ok_or(DpGatewayError::UnknownPrimitive)?;
+    let kind_p = prim_p.kind(world).ok_or(DpGatewayError::UnknownPrimitive)?;
+    let kind_n = prim_n.kind(world).ok_or(DpGatewayError::UnknownPrimitive)?;
 
-    let shape = if item_p.of_kind(pad_or_via) && item_n.of_kind(pad_or_via) {
+    let shape = if kind_p.of_kind(pad_or_via) && kind_n.of_kind(pad_or_via) {
       // :434 to :440. The "all layers" pseudo layer, with KiCad's
       // padstack TODO above it.
-      item_p.shape(-1).ok_or(DpGatewayError::NoShape)?
-    } else if item_p.of_kind(segment_or_arc) && item_n.of_kind(segment_or_arc) {
+      prim_p.shape(world).ok_or(DpGatewayError::NoShape)?
+    } else if kind_p.of_kind(segment_or_arc) && kind_n.of_kind(segment_or_arc) {
       // :442
       self.build_dp_continuation(world, pair, prefer_diagonal);
       return Ok(());

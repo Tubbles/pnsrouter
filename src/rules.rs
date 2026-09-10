@@ -653,6 +653,121 @@ impl RuleResolver for FixedClearance {
   }
 }
 
+// ---------------------------------------------------------------------
+// CoupledNets
+// ---------------------------------------------------------------------
+
+/// A [`FixedClearance`] that also knows about one differential pair.
+///
+/// KiCad's answer to "which two nets form a pair" is a net **name**
+/// convention and nothing else: `BOARD::MatchDpSuffix`
+/// (`pcbnew/board.cpp:2780`) walks a net name backwards over digits and
+/// underscores and pairs it with the name that differs in the one
+/// `P`/`N` or `+`/`-` character it stops at. There is no pair object on a
+/// KiCad board and no pair property on a net.
+///
+/// This crate has no net names, so it cannot have that convention, and
+/// note 07 section 15.2 says why none is invented: the engine's contract
+/// is that the **host** says which nets are coupled, through the three
+/// hooks below. This is the smallest host that says so, and it is what
+/// the crate's own differential pair tests answer with. A real host
+/// answers from whatever its board model calls a pair.
+///
+/// It answers the pair hooks and forwards everything else, so the
+/// clearance the two lanes are tested against is the ordinary one: there
+/// is no suppression of P against N collisions anywhere in the router,
+/// and note 07 section 8.3 spells out the consequence, that a clearance
+/// above the configured pair gap makes every pair collide with itself.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct CoupledNets {
+  /// The clearances, and every rule that is not about pairs.
+  pub inner: FixedClearance,
+  /// The positive half.
+  pub net_p: NetId,
+  /// The negative half.
+  pub net_n: NetId,
+}
+
+impl CoupledNets {
+  /// One pair over one clearance.
+  pub const fn new(inner: FixedClearance, net_p: NetId, net_n: NetId) -> Self {
+    Self {
+      inner,
+      net_p,
+      net_n,
+    }
+  }
+}
+
+impl RuleResolver for CoupledNets {
+  fn clearance(
+    &self,
+    a: ItemRef<'_>,
+    b: Option<ItemRef<'_>>,
+    use_epsilon: bool,
+  ) -> Option<i32> {
+    self.inner.clearance(a, b, use_epsilon)
+  }
+
+  fn clearance_epsilon(&self) -> i32 {
+    self.inner.clearance_epsilon()
+  }
+
+  fn is_keepout(&self, obstacle: ItemRef<'_>, item: ItemRef<'_>) -> Keepout {
+    self.inner.is_keepout(obstacle, item)
+  }
+
+  fn is_drilled_hole(&self, item: ItemRef<'_>) -> bool {
+    self.inner.is_drilled_hole(item)
+  }
+
+  fn is_non_plated_slot(&self, item: ItemRef<'_>) -> bool {
+    self.inner.is_non_plated_slot(item)
+  }
+
+  fn net_code(&self, net: NetId) -> i32 {
+    self.inner.net_code(net)
+  }
+
+  fn orphaned_net(&self) -> NetId {
+    self.inner.orphaned_net()
+  }
+
+  /// The other half, `BOARD::DpCoupledNet` (`pcbnew/board.cpp:2828`).
+  fn dp_coupled_net(&self, net: NetId) -> Option<NetId> {
+    if net == self.net_p {
+      Some(self.net_n)
+    } else if net == self.net_n {
+      Some(self.net_p)
+    } else {
+      None
+    }
+  }
+
+  /// The sign `MatchDpSuffix` returns: `1` for the positive half, `-1`
+  /// for the negative one, `0` for a net that is not part of a pair.
+  fn dp_net_polarity(&self, net: NetId) -> i32 {
+    if net == self.net_p {
+      1
+    } else if net == self.net_n {
+      -1
+    } else {
+      0
+    }
+  }
+
+  /// Both halves, positive first, whichever half the item belongs to.
+  ///
+  /// That normalisation is `PNS_PCBNEW_RULE_RESOLVER::DpNetPair`'s
+  /// (`pcbnew/router/pns_kicad_iface.cpp:1376`) and it is why the pair
+  /// placer needs no [`RuleResolver::dp_net_polarity`].
+  fn dp_net_pair(&self, item: ItemRef<'_>) -> Option<(NetId, NetId)> {
+    let net = item.item().net()?;
+
+    (net == self.net_p || net == self.net_n).then_some((self.net_p, self.net_n))
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;

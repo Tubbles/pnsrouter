@@ -392,6 +392,20 @@ The FFI grew two functions and three enum values. `ffi_pnsrouter_start_dragging(
 
 Two host side decisions are worth recording. Snapping is off for the duration of a drag and only the grid point is used: `TOOL_BASE::checkSnap` refuses to snap to the line being dragged, which is what `DRAGGER::GetOriginalLine` exists for, there is no such exclusion in `findItemsAtPos`, and without one the cursor snaps onto the very object being dragged and pins it where it started. And locks are not consulted, because neither a trace nor a via can be locked in LibrePCB, where the lock lives on devices, planes, zones, polygons, stroke texts, holes and pads; `Dragger::start` clears `MK_LOCKED` rather than honouring it and leaves the decision to its host, so `BoardEditorState::getIgnoreLocks()` is where that check belongs if traces ever become lockable.
 
+### 3.7 Differential pairs, and what a host would need for them
+
+The engine can route a pair as of milestone 10 (`router::Router::start_routing_diff_pair`), and LibrePCB cannot drive it, because LibrePCB has no differential pair concept: no pair object, no pair property on a net, and no naming convention. That is a user decision of 2026-09-10 and it is why `doc/work/010-differential-pairs.md` leaves this side on hold. This subsection records what wiring it up would take, so that the decision can be revisited without re-deriving it.
+
+Three things, and none of them is in the crate.
+
+**Which two nets are coupled.** `rules::RuleResolver` has three hooks, `dp_net_pair`, `dp_coupled_net` and `dp_net_polarity`, all defaulted to "not supported"; the placer needs only the first, and it needs it to answer for a pad, a via, a segment and an arc. KiCad's whole notion of a pair is `BOARD::MatchDpSuffix` (`pcbnew/board.cpp:2780`), two nets whose names differ in one `P`/`N` or `+`/`-` character. The crate deliberately does not have that: it has no net names, and inventing a convention for LibrePCB is upstream's call, not this fork's. `BoardPnsRules` (section 2) is where the answer would go, from whatever LibrePCB grows: a pair object on the netclass, a property on the two nets, or, if upstream chooses it, a suffix rule over `NetSignal::getName()`. Without it the engine refuses the start with `StartError::NotADiffPair`, which is the correct behaviour and not a bug.
+
+**Three more sizes.** `settings::Sizes` already carries `diff_pair_width`, `diff_pair_gap` and `diff_pair_via_gap` with KiCad's defaults, plus the two hole rules `effective_diff_pair_via_gap` folds in. `PnsRouterSettings` would carry the three the user edits, and the toolbar would need somewhere to edit them; KiCad has a submenu of preset triples plus a custom dialog (`router_tool.cpp:476`). The gap has to reach the board's minimum clearance or the start gate refuses with `StartError::PairGapBelowMinClearance`, which is the only consistency check between the pair geometry and the clearance rules.
+
+**A mode on the tool.** `start_routing_diff_pair` is a second entry point rather than a mode flag, so the FFI would grow one function beside `ffi_pnsrouter_start_routing` and `PnsStartResult` would grow the six pair variants of `router::StartError`. The tool state would decide which of the two to call from a toolbar toggle, and would have to require a start object: a pair placement cannot begin in empty space, where a single track can. Everything after the start is unchanged, because `move_to`, `fix_route`, `switch_layer`, `toggle_via_placement`, `stop_routing` and `abort_routing` all branch on the placer inside the crate. The preview grows a second lane, a second via (`PreviewFrame::via_n`) and a second rat line (`PreviewFrame::ratline_n`); the commit applier needs no change at all, since a pair commits as segments and vias on two nets and the applier already stitches per net.
+
+One gesture would be missing and would stay missing: there is no differential pair **dragger** to wire up, because KiCad has none either. Selecting both traces and using the multi drag is what a KiCad user gets, and `Router::start_dragging` already does that.
+
 ## 4. The commit applier
 
 ### 4.1 The shape of the problem

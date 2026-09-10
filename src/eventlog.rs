@@ -153,6 +153,28 @@ pub enum SessionEvent {
     layer: i32,
   },
 
+  /// [`Router::start_routing_diff_pair`].
+  ///
+  /// KiCad has no such event: `ROUTER_MODE` is not in its log format at
+  /// all (note 05 section 6.2), which is why its regression corpus holds
+  /// no differential pair case and why one cannot be recorded there. Note
+  /// 07 section 12.4 asks for a second variant rather than a mode event,
+  /// so that a reader can never be in doubt about which placer a session
+  /// ran.
+  ///
+  /// The fields are `start-routing`'s, `start` included: a pair start
+  /// without an object is refused with
+  /// [`crate::router::StartError::PairNeedsStartItem`] rather than being
+  /// unrepresentable, so a recording can carry that refusal too.
+  StartRoutingDiffPair {
+    /// The snapped point the route starts at.
+    at: Vec2,
+    /// The object it starts on. A pair needs one.
+    start: Option<HostId>,
+    /// The copper layer to route on.
+    layer: i32,
+  },
+
   /// [`Router::start_dragging`]. `EVT_START_DRAG` and
   /// `EVT_START_MULTIDRAG`, `pcbnew/router/pns_router.cpp:204`, `:206`.
   ///
@@ -492,6 +514,11 @@ fn apply(
   match event {
     SessionEvent::StartRouting { at, start, layer } => {
       if router.start_routing(*at, *start, *layer).is_ok() {
+        *frames_count += 1;
+      }
+    }
+    SessionEvent::StartRoutingDiffPair { at, start, layer } => {
+      if router.start_routing_diff_pair(*at, *start, *layer).is_ok() {
         *frames_count += 1;
       }
     }
@@ -1024,6 +1051,11 @@ fn event_text(
       vec2_text(*at),
       optional(start.map(|host| host.0))
     ),
+    SessionEvent::StartRoutingDiffPair { at, start, layer } => format!(
+      "event start-routing-diff-pair {} {} {layer}",
+      vec2_text(*at),
+      optional(start.map(|host| host.0))
+    ),
     SessionEvent::StartDragging {
       at,
       items,
@@ -1141,6 +1173,7 @@ impl SessionRecording {
   ///
   /// ```text
   /// start-routing <x> <y> <start-host> <layer>
+  /// start-routing-diff-pair <x> <y> <start-host> <layer>
   /// start-dragging <x> <y> <free-angle> <count> <host>...
   /// move-to <x> <y> <end-host>
   /// fix-route <x> <y> <end-host> <force-finish>
@@ -1905,6 +1938,16 @@ fn parse_event(tokens: &mut Tokens<'_>) -> Result<ParsedEvent, ParseError> {
         layer: tokens.number("a layer index")?,
       }
     }
+    "start-routing-diff-pair" => {
+      let at = tokens.vec2("a point")?;
+      let start = tokens.optional_host()?;
+
+      SessionEvent::StartRoutingDiffPair {
+        at,
+        start,
+        layer: tokens.number("a layer index")?,
+      }
+    }
     "start-dragging" => {
       let at = tokens.vec2("a point")?;
       let free_angle = tokens.flag("a free angle flag")?;
@@ -2228,7 +2271,12 @@ fn resolve_block(
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::geometry::shape::Shape;
   use crate::item::LayerRange;
+  use crate::node::World;
+  use crate::rules::{CoupledNets, FixedClearance};
+  use crate::settings::RouterMode;
+  use crate::snapshot::{WorldGeometry, WorldItem};
 
   /// A recording over an empty two layer board.
   fn empty() -> SessionRecording {
@@ -2313,6 +2361,119 @@ mod tests {
       committed_nets(&diffs),
       vec![None, Some(NetId(2)), Some(NetId(7))]
     );
+  }
+
+  /// The differential pair fixture of note 07 section 15, cut to what a
+  /// round trip needs: two nets, two pairs of round pads a pitch apart.
+  ///
+  /// `tests/diff_pair_placer.rs` carries the whole board with its
+  /// obstacles; this one only has to make a pair session that commits
+  /// something.
+  fn diff_pair_board() -> WorldSnapshot {
+    let mut snapshot = WorldSnapshot::new(2, World::DEFAULT_MAX_CLEARANCE);
+    let pad = |id: u64, at: Vec2, net: NetId| {
+      WorldItem::new(
+        HostId(id),
+        Some(net),
+        LayerRange::single(0),
+        WorldGeometry::Solid {
+          shape: Shape::circle(at, 150_000),
+          pos: at,
+          offset: Vec2::new(0, 0),
+          orientation_degrees: 0.0,
+          anchors: Vec::new(),
+        },
+      )
+    };
+
+    snapshot
+      .items
+      .push(pad(1, Vec2::new(0, -200_000), NetId(1)));
+    snapshot.items.push(pad(2, Vec2::new(0, 200_000), NetId(2)));
+    snapshot
+      .items
+      .push(pad(3, Vec2::new(6_000_000, -200_000), NetId(1)));
+    snapshot
+      .items
+      .push(pad(4, Vec2::new(6_000_000, 200_000), NetId(2)));
+
+    snapshot
+  }
+
+  /// The sizes the pair fixture places with.
+  fn diff_pair_sizes() -> Sizes {
+    let mut sizes = Sizes {
+      track_width: 200_000,
+      board_min_track_width: 100_000,
+      min_clearance: 100_000,
+      diff_pair_width: 200_000,
+      diff_pair_gap: 200_000,
+      diff_pair_via_gap: 200_000,
+      diff_pair_via_gap_same_as_trace_gap: false,
+      via_diameter: 600_000,
+      via_drill: 300_000,
+      ..Sizes::default()
+    };
+
+    sizes.add_layer_pair(0, 1);
+    sizes
+  }
+
+  /// The resolver the pair fixture answers with.
+  fn diff_pair_rules() -> Box<dyn RuleResolver> {
+    Box::new(CoupledNets::new(
+      FixedClearance::uniform(100_000),
+      NetId(1),
+      NetId(2),
+    ))
+  }
+
+  /// A pair session records, survives the text format and replays to the
+  /// same commit.
+  ///
+  /// The acceptance criterion of `doc/work/010-differential-pairs.md`.
+  /// [`SessionEvent::StartRoutingDiffPair`] is the one event a pair
+  /// session has that a single track session does not, so this is also
+  /// what pins its writer and its reader against each other.
+  #[test]
+  fn a_diff_pair_session_replays_to_the_same_commit() {
+    let snapshot = diff_pair_board();
+    let settings = RoutingSettings {
+      mode: RouterMode::Walkaround,
+      ..RoutingSettings::default()
+    };
+    let start = Vec2::new(0, -200_000);
+    let target = Vec2::new(6_000_000, -200_000);
+    let mut router =
+      Router::new(&snapshot, diff_pair_rules(), settings, diff_pair_sizes());
+
+    router.start_recording(&snapshot);
+    router
+      .start_routing_diff_pair(start, Some(HostId(1)), 0)
+      .expect("the start pad pair is routable");
+    router.move_to(target, Some(HostId(3)));
+
+    let recorded = match router.fix_route(target, Some(HostId(3)), false) {
+      FixOutcome::Finished(diff) => diff,
+      FixOutcome::Continue(_) => panic!("a fix on the target pair finishes"),
+    };
+    let recording = router.take_recording().expect("a recording was running");
+
+    assert!(
+      matches!(
+        recording.events.first(),
+        Some(SessionEvent::StartRoutingDiffPair { .. })
+      ),
+      "{:?}",
+      recording.events.first()
+    );
+    assert!(!recorded.added.is_empty(), "{recorded:?}");
+
+    let text = recording.to_text();
+    let read = SessionRecording::from_text(&text).expect(&text);
+
+    assert_eq!(read, recording, "{text}");
+    assert_eq!(replay(&read, diff_pair_rules()).diffs, vec![recorded]);
   }
 
   #[test]
