@@ -56,7 +56,7 @@ The crate documentation has the whole thing as a compiling example, the four thi
 
 ## Scope of the first milestone
 
-Interactive single net trace routing with the three interaction modes of the KiCad router (highlight collisions, walk around, shove), via placement with layer switching, 45 degree posture handling and the post route optimizer. Dragging existing traces, differential pairs, length tuning and arc tracks come later. See [PLAN.md](PLAN.md).
+Interactive single net trace routing with the three interaction modes of the KiCad router (highlight collisions, walk around, shove), via placement with layer switching, 45 degree posture handling and the post route optimizer, plus dragging an existing segment, corner or via in any of the three modes. Multi drag, differential pairs, length tuning and arc tracks come later. See [PLAN.md](PLAN.md).
 
 ## Relationship to KiCad
 

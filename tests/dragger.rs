@@ -10,10 +10,10 @@
 //! integration tests here each own their fixture, because
 //! `tests/support/` is the KiCad fixture reader and nothing else.
 //!
-//! Only the mark obstacles path exists yet, so every scenario runs in
-//! [`RouterMode::MarkObstacles`]. The walkaround and shove drags fall
-//! back to it, which is why no scenario here sets another mode: it would
-//! assert on a stub.
+//! All three drag routines are here, for a segment, a corner and a via,
+//! so a scenario picks the [`RouterMode`] its assertion is about. Free
+//! angle mode has its own scenario at the end, because it bypasses the
+//! mode entirely (note 06 section 2.17).
 
 #![forbid(unsafe_code)]
 
@@ -498,4 +498,467 @@ fn two_identical_drags_answer_identically() {
   };
 
   assert_eq!(run(), run());
+}
+// ---------------------------------------------------------------------
+// The via drag
+// ---------------------------------------------------------------------
+
+/// Where the via a fanout drag starts on sits.
+const FANOUT_VIA: Vec2 = Vec2::new(0, 0);
+
+/// The net the fanout via and both of its traces are on.
+const FANOUT_NET: Option<NetId> = Some(NetId(3));
+
+/// The corners of the trace that leaves the fanout via eastwards on layer
+/// 0.
+const FANOUT_EAST: [Vec2; 3] = [
+  Vec2::new(0, 0),
+  Vec2::new(2_000_000, 0),
+  Vec2::new(4_000_000, 0),
+];
+
+/// The corners of the trace that leaves it northwards on layer 1.
+const FANOUT_NORTH: [Vec2; 3] = [
+  Vec2::new(0, 0),
+  Vec2::new(0, -2_000_000),
+  Vec2::new(0, -4_000_000),
+];
+
+/// Add one track segment to the root.
+fn add_track(
+  world: &mut World,
+  seg: Seg,
+  layer: i32,
+  net: Option<NetId>,
+) -> ItemId {
+  let root = world.root();
+  let body = ItemBody::Segment(Segment::new(seg, TRACK_WIDTH));
+  let mut item = world.make_item(body);
+
+  item.set_layers_and_flash_all(LayerRange::single(layer));
+  item.set_net(net);
+
+  world
+    .add_segment(root, item, false)
+    .expect("a test track is neither degenerate nor redundant")
+}
+
+/// Add one round pad to the root.
+fn add_pad(
+  world: &mut World,
+  at: Vec2,
+  radius: i32,
+  layer: i32,
+  net: Option<NetId>,
+) -> ItemId {
+  let root = world.root();
+  let body = ItemBody::Solid(Solid::new(Shape::circle(at, radius), at));
+  let mut item = world.make_item(body);
+
+  item.set_layers_and_flash_all(LayerRange::single(layer));
+  item.set_net(net);
+
+  world.add_solid(root, item, None)
+}
+
+/// A two layer board with one through via and one trace leaving it on
+/// each layer.
+///
+/// The joint at the via therefore has three links, a via and two
+/// segments, which is what `findViaFanoutByHandle`
+/// (`pcbnew/router/pns_dragger.cpp:267`) walks and what stops
+/// `AssembleLine` from running one trace into the other.
+fn build_via_fanout() -> (World, ItemId) {
+  let mut world = World::new(World::DEFAULT_MAX_CLEARANCE);
+  let root = world.root();
+  let body = ItemBody::Via(Via::new(
+    FANOUT_VIA,
+    VIA_DIAMETER,
+    VIA_DRILL,
+    ViaType::Through,
+  ));
+  let mut item = world.make_item(body);
+
+  item.set_layers_and_flash_all(LayerRange::new(0, 1));
+  item.set_net(FANOUT_NET);
+
+  let via = world.add_via(root, item);
+
+  for pair in FANOUT_EAST.windows(2) {
+    add_track(&mut world, Seg::new(pair[0], pair[1]), 0, FANOUT_NET);
+  }
+
+  for pair in FANOUT_NORTH.windows(2) {
+    add_track(&mut world, Seg::new(pair[0], pair[1]), 1, FANOUT_NET);
+  }
+
+  (world, via)
+}
+
+/// Where a via item sits, by handle.
+fn via_position(world: &World, id: ItemId) -> Option<Vec2> {
+  match world.item(id)?.body() {
+    ItemBody::Via(body) => Some(body.pos()),
+    _ => None,
+  }
+}
+
+/// The positions of the vias a node's delta adds and removes.
+fn delta_vias(world: &World, node: NodeId) -> (Vec<Vec2>, Vec<Vec2>) {
+  let (added, removed) = world.get_updated_items(node);
+  let vias = |ids: Vec<ItemId>| -> Vec<Vec2> {
+    ids
+      .into_iter()
+      .filter_map(|id| via_position(world, id))
+      .collect()
+  };
+
+  (vias(added), vias(removed))
+}
+
+/// The trace of `traces()` that starts nearest a point.
+fn trace_from(dragger: &Dragger, at: Vec2) -> &pnsrouter::line::Line {
+  dragger
+    .traces()
+    .iter()
+    .find(|line| line.point(0) == at)
+    .unwrap_or_else(|| {
+      panic!(
+        "no dragged trace starts at {at:?}; they start at {:?}",
+        dragger
+          .traces()
+          .iter()
+          .map(|line| line.point(0))
+          .collect::<Vec<_>>()
+      )
+    })
+}
+
+#[test]
+fn a_via_drag_in_mark_obstacles_mode_moves_the_via_and_both_trace_ends() {
+  // `dragViaMarkObstacles` (`pns_dragger.cpp:452`): no forces and no
+  // walkaround, every fanout line's near corner follows the cursor and
+  // the via is replaced by a copy at the cursor.
+  let (mut world, via) = build_via_fanout();
+  let rules = rules();
+  let settings = settings_for(RouterMode::MarkObstacles);
+  let context = AlgoContext::new(&rules, &settings);
+  let root = world.root();
+  let mut dragger = Dragger::new(&world, root);
+  let target = Vec2::new(1_000_000, -1_000_000);
+
+  assert!(dragger.start(&mut world, &context, FANOUT_VIA, via));
+  assert_eq!(dragger.mode(), DragMode::Via);
+  assert!(dragger.drag(&mut world, &context, target));
+
+  let node = dragger.current_node();
+
+  // The via itself, `:478` to `:484`. One entry, because
+  // `findViaFanoutByHandle` keeps at most one via per joint (`:293`).
+  assert_eq!(dragger.traces_vias().len(), 1);
+  assert_eq!(via_position(&world, dragger.traces_vias()[0]), Some(target));
+
+  let (added_vias, removed_vias) = delta_vias(&world, node);
+
+  assert_eq!(added_vias, vec![target]);
+  assert_eq!(removed_vias, vec![FANOUT_VIA]);
+
+  // Both traces, `:462` to `:474`. Each starts at the cursor because
+  // `findViaFanoutByHandle` reversed it to start at the via (`:286`), and
+  // each keeps its far end.
+  assert_eq!(dragger.traces().len(), 2);
+
+  let east = trace_from(&dragger, target);
+
+  assert_eq!(east.layer(), 0);
+  assert_eq!(east.last_point(), Some(FANOUT_EAST[2]));
+
+  let north = dragger
+    .traces()
+    .iter()
+    .find(|line| line.layer() == 1)
+    .expect("the northward trace was dragged too");
+
+  assert_eq!(north.point(0), target);
+  assert_eq!(north.last_point(), Some(FANOUT_NORTH[2]));
+
+  for line in dragger.traces() {
+    assert!(
+      is_on_the_grid(line.shape().points()),
+      "a dragged fanout line left the 45 degree regime: {:?}",
+      line.shape().points()
+    );
+  }
+}
+
+#[test]
+fn a_via_drag_in_walkaround_mode_bends_a_fanout_trace_around_a_pad() {
+  // `dragViaWalkaround` (`:492`): the via first, through
+  // `propagateViaForces`, then every fanout line, and the ones that
+  // collide go through `tryWalkaround` and the post drag optimizer.
+  let (mut world, via) = build_via_fanout();
+
+  // On layer 0 only, so it is the eastward trace that has to bend.
+  add_pad(
+    &mut world,
+    Vec2::new(1_400_000, -600_000),
+    500_000,
+    0,
+    OBSTACLE_NET,
+  );
+
+  let rules = rules();
+  let settings = settings_for(RouterMode::Walkaround);
+  let context = AlgoContext::new(&rules, &settings);
+  let root = world.root();
+  let mut dragger = Dragger::new(&world, root);
+  let target = Vec2::new(0, -1_400_000);
+
+  assert!(dragger.start(&mut world, &context, FANOUT_VIA, via));
+  assert!(dragger.drag(&mut world, &context, target));
+
+  let node = dragger.current_node();
+  let (added_vias, removed_vias) = delta_vias(&world, node);
+
+  // The force propagation had nothing to push against, so the via
+  // reached the cursor exactly (`:519`, `:523`).
+  assert_eq!(added_vias, vec![target]);
+  assert_eq!(removed_vias, vec![FANOUT_VIA]);
+
+  // The eastward trace now starts at the via's new position and reaches
+  // its old far end without touching the pad.
+  let (added, _) = delta_segments(&world, node);
+
+  assert!(
+    added.iter().any(|seg| seg.a == target || seg.b == target),
+    "nothing in the delta starts at the via's new position: {added:?}"
+  );
+  assert!(
+    added.len() > FANOUT_EAST.len() + FANOUT_NORTH.len() - 2,
+    "the walk added no detour: {added:?}"
+  );
+}
+
+#[test]
+fn a_via_drag_in_walkaround_mode_under_reports_its_traces() {
+  // Note 06 erratum E5, `pns_dragger.cpp:617`.
+  //
+  // `dragViaWalkaround` adds the dragged via to the set at `:511` and
+  // every clear fanout line at `:557`, and then the **first** line that
+  // needs a walkaround reaches `optimizeAndUpdateDraggedLine`, which
+  // clears the whole set and puts only its own optimized line back
+  // (`:617`, `:618`). So `Traces()` reports one line and no via at all,
+  // although the via moved and two lines were dragged, which is what
+  // makes `ROUTER::markViolations` stop skipping the dragged via
+  // (`pcbnew/router/pns_router.cpp:726`) and draw it as colliding with
+  // itself. Transcribed rather than repaired: the note's proposal, to add
+  // rather than replace, is a behaviour change with no fixture behind it.
+  let (mut world, via) = build_via_fanout();
+
+  add_pad(
+    &mut world,
+    Vec2::new(1_400_000, -600_000),
+    500_000,
+    0,
+    OBSTACLE_NET,
+  );
+
+  let rules = rules();
+  let settings = settings_for(RouterMode::Walkaround);
+  let context = AlgoContext::new(&rules, &settings);
+  let root = world.root();
+  let mut dragger = Dragger::new(&world, root);
+  let target = Vec2::new(0, -1_400_000);
+
+  assert!(dragger.start(&mut world, &context, FANOUT_VIA, via));
+  assert!(dragger.drag(&mut world, &context, target));
+
+  // The node still holds all of it.
+  let (added_vias, _) = delta_vias(&world, dragger.current_node());
+
+  assert_eq!(added_vias, vec![target]);
+
+  // The set does not. The joint's links are in insertion order, so the
+  // fanout is the via, then the eastward trace, then the northward one:
+  // the via and the walked line are added first and the optimizer wipes
+  // both, and only the trace dragged **after** it survives beside the
+  // optimized one.
+  assert!(
+    dragger.traces_vias().is_empty(),
+    "the dragged via survived the optimizer, so erratum E5 is gone"
+  );
+  assert_eq!(
+    dragger.traces().len(),
+    2,
+    "the set holds neither everything that moved nor only the optimized \
+     line: {:?}",
+    dragger
+      .traces()
+      .iter()
+      .map(|line| line.point(0))
+      .collect::<Vec<_>>()
+  );
+}
+
+#[test]
+fn a_via_drag_in_shove_mode_pushes_a_track_out_of_the_way() {
+  // `dragShove`'s `DM_VIA` case (`:908`): the via goes in as a shove head
+  // under `SHP_SHOVE` alone and the engine does the rest.
+  let (mut world, via) = build_via_fanout();
+  // A track on another net across the via's path, close enough that the
+  // via cannot sit where the cursor asks without moving it.
+  let pushed = add_track(
+    &mut world,
+    Seg::new(
+      Vec2::new(-2_000_000, -1_400_000),
+      Vec2::new(2_000_000, -1_400_000),
+    ),
+    0,
+    OBSTACLE_NET,
+  );
+  let rules = rules();
+  let settings = settings_for(RouterMode::Shove);
+  let context = AlgoContext::new(&rules, &settings);
+  let root = world.root();
+  let mut dragger = Dragger::new(&world, root);
+  let target = Vec2::new(0, -1_200_000);
+
+  assert!(dragger.start(&mut world, &context, FANOUT_VIA, via));
+  assert!(dragger.drag(&mut world, &context, target));
+
+  let node = dragger.current_node();
+  let (added_vias, removed_vias) = delta_vias(&world, node);
+
+  assert_eq!(removed_vias, vec![FANOUT_VIA]);
+  assert_eq!(added_vias.len(), 1);
+  assert_ne!(added_vias[0], FANOUT_VIA);
+
+  // A successful via shove clears the set and puts nothing back
+  // (`:941`, and `:946` adds nothing), so the answer is read off the
+  // node.
+  assert!(dragger.traces().is_empty());
+  assert!(dragger.traces_vias().is_empty());
+
+  let (_, removed) = delta_segments(&world, node);
+  let pushed_seg = match world.item(pushed).map(pnsrouter::item::Item::body) {
+    Some(ItemBody::Segment(body)) => body.seg(),
+    _ => panic!("the obstacle track is a segment"),
+  };
+
+  assert!(
+    removed.contains(&pushed_seg),
+    "the shove left the obstacle track where it was: {removed:?}"
+  );
+}
+
+#[test]
+fn a_via_drag_commits_the_moved_via_and_its_fanout() {
+  // `FixRoute`'s `m_dragStatus` branch (`:963`) does not care which of
+  // the three gestures produced the node, so a via drag commits through
+  // exactly the same path a segment drag does.
+  let (mut world, via) = build_via_fanout();
+  let rules = rules();
+  let settings = settings_for(RouterMode::MarkObstacles);
+  let context = AlgoContext::new(&rules, &settings);
+  let root = world.root();
+  let mut dragger = Dragger::new(&world, root);
+  let target = Vec2::new(1_000_000, -1_000_000);
+
+  assert!(dragger.start(&mut world, &context, FANOUT_VIA, via));
+  assert!(dragger.drag(&mut world, &context, target));
+  assert!(dragger.fix_route(&mut world, &context, false));
+
+  // Exactly one via on the net is left in the root, at the cursor.
+  let moved = world
+    .all_items_in_net(root, FANOUT_NET, pnsrouter::item::Kind::VIA)
+    .into_iter()
+    .filter_map(|id| via_position(&world, id))
+    .collect::<Vec<_>>();
+
+  assert_eq!(moved, vec![target]);
+
+  // And both traces reach it.
+  let ends: Vec<Seg> = world
+    .all_items_in_net(root, FANOUT_NET, pnsrouter::item::Kind::SEGMENT)
+    .into_iter()
+    .filter_map(|id| match world.item(id)?.body() {
+      ItemBody::Segment(body) => Some(body.seg()),
+      _ => None,
+    })
+    .filter(|seg| seg.a == target || seg.b == target)
+    .collect();
+
+  assert_eq!(
+    ends.len(),
+    2,
+    "the committed board has {} track ends at the via: {ends:?}",
+    ends.len()
+  );
+}
+
+// ---------------------------------------------------------------------
+// Free angle mode
+// ---------------------------------------------------------------------
+
+#[test]
+fn a_free_angle_drag_is_a_corner_drag_that_follows_the_cursor_exactly() {
+  // Note 06 section 2.17, end to end: `Start` latches the flag and does
+  // **not** build a shove (`:314`, `:323`), `startDragSegment` forces
+  // `DM_CORNER` even for a mid segment click (`:135` to `:145`), `Drag`
+  // routes to `dragMarkObstacles` before the mode switch is reached
+  // (`:1005`), and `dragMarkObstacles` passes the flag to `DragCorner`
+  // (`:407`), which is `dragCornerFree`: set the point, simplify, no 45
+  // degree rebuild and no optimizer.
+  //
+  // The routing mode is [`RouterMode::Shove`] here on purpose: free angle
+  // has to win over it.
+  let (mut world, board) = build();
+  let rules = rules();
+  let settings = settings_for(RouterMode::Shove);
+  let context = AlgoContext::new(&rules, &settings);
+  let root = world.root();
+  let mut dragger = Dragger::new(&world, root);
+  let target = Vec2::new(2_100_000, -700_000);
+
+  dragger.set_free_angle_mode(true);
+
+  assert!(dragger.start(
+    &mut world,
+    &context,
+    Vec2::new(2_000_000, 0),
+    board.trace[1]
+  ));
+  // A mid segment click is a corner drag in free angle mode, where the
+  // same click without it is a segment drag.
+  assert_eq!(dragger.mode(), DragMode::Corner);
+
+  assert!(dragger.drag(&mut world, &context, target));
+
+  let points = dragger.traces()[0].shape().points().to_vec();
+
+  assert_eq!(points.first(), Some(&TRACE[0]));
+  assert_eq!(points.last(), Some(&TRACE[3]));
+  assert!(
+    points.contains(&target),
+    "the drag did not put a corner on the cursor: {points:?}"
+  );
+  assert!(
+    !is_on_the_grid(&points),
+    "a free angle drag stayed on the 45 degree grid: {points:?}"
+  );
+
+  // The same click and the same cursor without free angle mode stays on
+  // the grid and never puts a corner on the cursor.
+  let (mut world, board) = build();
+  let mut dragger = Dragger::new(&world, world.root());
+
+  assert!(dragger.start(
+    &mut world,
+    &context,
+    Vec2::new(2_000_000, 0),
+    board.trace[1]
+  ));
+  assert_eq!(dragger.mode(), DragMode::Segment);
+  assert!(dragger.drag(&mut world, &context, target));
+  assert!(is_on_the_grid(dragger.traces()[0].shape().points()));
 }

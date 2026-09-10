@@ -44,7 +44,7 @@ Deferred during milestone 4 (shove):
 
 - The via anti snap loop in `src/shove.rs` is bounded at 1000 iterations and returns `Incomplete`; KiCad's is unbounded. Revisit if a fixture needs more.
 - `World::collide_lines` (`src/node.rs`) does not decompose a via on the obstacle side; every shove call site keeps the via carrying line on the head side. Needed only if a future caller collides two via ended lines.
-- `ShoveDraggingVia` is declared and never defined in KiCad; the dragger milestone decides whether it exists at all.
+- `ShoveDraggingVia` is declared and never defined in KiCad. Decided in milestone 9 (2026-09-10): it does not exist here either. `dragShove`'s `DM_VIA` case leaves the call commented out (`pns_dragger.cpp:919`) and drives the via through `AddHeads( VIA_HANDLE, pos, policy )` and `Run` like any other head, which is what `Dragger::drag_shove` does.
 - `reduceSpringback` keeps its bottom frame (`pns_shove.cpp:926`), so the first move's shove is sticky within a session; reproduced, worth a look with a real board fixture.
 - Arcs throughout the shove are marked `TODO(arcs)`.
 

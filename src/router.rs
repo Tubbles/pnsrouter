@@ -2200,10 +2200,12 @@ fn preview_frame(
 ///   one (note 06 erratum E16).
 ///
 /// `markViolations`'s dragged item filter (`:724`) has nothing to skip
-/// while the traces are lines: `ITEM_SET::Contains` compares `ITEM`
-/// pointers and a `LINE` is never one of the node's own items, so only a
-/// via drag, which puts the node's via in the set (`:511`), can hit it.
-/// That is step 9 of note 06 section 10.2.
+/// here. KiCad walks the node's own changed items and skips the ones the
+/// drag is moving, which for a via drag includes the dragged via itself
+/// (`:511`); this walks [`Dragger::traces`] and asks what each **line**
+/// runs into, so a dragged via is never a candidate to begin with and
+/// reaches the host as an ordinary added item of the node delta. A host
+/// that wants KiCad's skip list has [`Dragger::traces_vias`].
 fn drag_preview_frame(
   world: &World,
   index: &HostIndex,

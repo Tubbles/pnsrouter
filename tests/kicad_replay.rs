@@ -16,7 +16,7 @@
 //!    assertions, because the drag cases reached the first before they
 //!    reached the second; every case reaches both now.
 //! 2. **The counts of added and removed items equal the golden stored in
-//!    the log.** All four routing cases reach it, and five of the seven
+//!    the log.** All four routing cases reach it, and six of the seven
 //!    drag cases. Should one stop, the convention is to `#[ignore]` its
 //!    tier 2 test with the measured and the expected numbers in the
 //!    reason string, so `cargo test -- --ignored` still shows the
@@ -59,37 +59,26 @@
 //! `support::kicad_replay::unresolved_uuids` checks, and a case matched
 //! to the wrong board would fail it.
 //!
-//! # Where the two drag cases that still miss their golden diverge
+//! # The one drag case that misses its golden
 //!
 //! Seven of the eleven cases open with `EVT_START_DRAG`. All seven replay,
-//! all seven leave nothing colliding, and five of the seven match their
-//! golden. The two that do not diverge in the **snapshot the harness
-//! builds**, not in the drag:
+//! all seven leave nothing colliding, and six of the seven match their
+//! golden.
 //!
-//! - `drag-acute-fallback` detours around pad 2 of `C1`, a rounded
-//!   rectangle. `support::kicad_snapshot` maps every rectangular pad,
-//!   rounded or not, to a
-//!   [`pnsrouter::geometry::shape::Shape::Rect`] and drops the corner
-//!   radius, and `BuildHullForPrimitiveShape` gives an `SH_RECT` an
-//!   octagonal hull with **no** chamfer
-//!   (`pcbnew/router/pns_utils.cpp:488`). KiCad's own pad sync sees a
-//!   roundrect as a compound of five shapes, so it falls to the polygon
-//!   branch (`pcbnew/router/pns_kicad_iface.cpp:1733`) and gets
-//!   `ConvexHull` (`pcbnew/router/pns_utils.cpp:300`), whose diagonals are
-//!   pushed in until they touch the outline. The crate's detour therefore
-//!   hugs a square corner where KiCad's cuts it at 45 degrees, and comes
-//!   out one segment shorter.
-//! - `walk-with-teardrops` has one pair of parallel tracks at exactly the
-//!   0.2 mm net class clearance. `support::kicad_snapshot`'s
-//!   `RuleResolver::clearance_epsilon` answers zero, where KiCad's rule
-//!   resolver answers the board's DRC epsilon
-//!   (`pcbnew/router/pns_kicad_iface.cpp:338`, subtracted at `:972`), so
-//!   the pair collides here and does not there. The whole drag then goes
-//!   through a walkaround it should never have needed, and that walk
-//!   circles the board.
+//! Two of them used to miss because of the **snapshot the harness
+//! builds** rather than because of the drag, and both are fixed in
+//! `support::kicad_snapshot`: a rounded rectangle pad is polygonised the
+//! way `syncPad` polygonises it instead of being flattened to a sharp
+//! rectangle, which is what `drag-acute-fallback` detours around, and
+//! `KicadRules::clearance_epsilon` answers KiCad's 500 nm DRC epsilon
+//! instead of zero, which is what sent `walk-with-teardrops` round the
+//! board outline.
 //!
-//! Neither is a drag defect and neither is loosened here; both are
-//! recorded in `SUGGESTIONS.md`.
+//! The one that misses is `issue23449-shove-lone-via-drag-crash`, whose
+//! golden is empty on all three counts. It matched while the via drag
+//! moved nothing and stopped matching when it started to; the difference
+//! is in the shove's lone via head, not in the dragger, and the case's
+//! own tier 2 test says where it first appears.
 //!
 //! `EVT_START_MULTIDRAG` is still refused, and no case in the corpus
 //! emits one.
@@ -411,11 +400,15 @@ fn drag_acute_fallback_leaves_nothing_colliding() {
   assert_collision_free(&replay_case(&load("drag-acute-fallback")));
 }
 
-/// Tier 2 for the case above, which the roundrect pad hull keeps one
-/// segment short; see the module documentation.
+/// Tier 2 for the case above, the golden the roundrect pad hull unlocked.
+///
+/// The drag detours around pad 2 of `C1`, a `0.9 x 0.95` roundrect. While
+/// `support::kicad_snapshot` mapped it to a
+/// [`pnsrouter::geometry::shape::Shape::Rect`] the detour hugged a square
+/// corner, reached the drag anchor in one segment where KiCad needs two,
+/// and came out at 10 added against the golden's 11. With the pad
+/// polygonised the way `syncPad` polygonises it the two agree.
 #[test]
-#[ignore = "the roundrect pad hull has no 45 degree chamfer here: measured \
-            added 10 versus golden 11, measured removed 6 versus golden 6"]
 fn drag_acute_fallback_matches_the_golden() {
   assert_tier_two(&replay_case(&load("drag-acute-fallback")));
 }
@@ -473,19 +466,36 @@ fn issue23449_shove_lone_via_drag_crash_replays_without_a_violation() {
   assert_tier_one(&replay_case(&case));
 }
 
-/// Tier 2 for the case above, which the empty golden makes a weak signal.
+/// Tier 2 for the case above, which the via drag turned from an accident
+/// into a real disagreement.
 ///
 /// The log holds one `EVT_START_DRAG` on a lone via and 102 moves, and
-/// KiCad answered with nothing added and nothing removed, so the case is
-/// a pure crash regression (note 05 section 6.9). This crate answers with
-/// nothing too, and for a second reason: the via drag is step 9 of note
-/// 06 section 10.2, so a via drag currently starts, reports
-/// [`pnsrouter::dragger::DragMode::Via`] and moves nothing. The test is
-/// kept un-ignored because it is a real regression guard against a panic
-/// and against the drag suddenly reporting geometry, and note 06 asks for
-/// a crate scenario test of a via drag that actually moves something to
-/// stand beside it when step 9 lands.
+/// KiCad answered with **nothing**: `addedItems`, `removedItems` and
+/// `headItems` are all empty. It matched while the via drag was a stub
+/// that moved nothing, which note 06 section 10.2 step 9 predicted would
+/// not last ("at tier 2 only if the crate's drag also ends with an empty
+/// delta"). It does not: this crate now drags the via.
+///
+/// Where the two diverge, in one sentence: every one of the 102 moves
+/// succeeds here, `Shove::run` answering `Ok` with the head via moved,
+/// and the last cursor position `(142.4, 80.0)` leaves the via at
+/// `(142.352108, 79.897157)`, clear of everything under the case's own
+/// rules. An empty delta on KiCad's side needs the opposite: either the
+/// last `Drag` failed and the restore branch re-branched a clean node
+/// (`pcbnew/router/pns_dragger.cpp:1039`, and `m_lastDragSolution` is a
+/// default constructed `LINE` in `DM_VIA`, so the restore adds nothing),
+/// or `dragViaWalkaround` found an empty fanout and returned true at
+/// `:498` having changed nothing. Both are failure shapes, which fits a
+/// case whose name ends in `crash`. The disagreement is in the shove's
+/// handling of a lone "stitching" via head
+/// (`pcbnew/router/pns_shove.cpp:1120`), not in the dragger, so it is not
+/// loosened here.
+///
+/// Its two tier 1 tests still run and are the real regression guard.
 #[test]
+#[ignore = "the via drag moves the via where KiCad's recorded session \
+            moved nothing: measured added 2 versus golden 0, measured \
+            removed 1 versus golden 0"]
 fn issue23449_shove_lone_via_drag_crash_matches_the_golden() {
   assert_tier_two(&replay_case(&load("issue23449-shove-lone-via-drag-crash")));
 }
@@ -534,12 +544,15 @@ fn walk_with_teardrops_leaves_nothing_colliding() {
   assert_collision_free(&replay_case(&load("walk-with-teardrops")));
 }
 
-/// Tier 2 for the case above, which the zero clearance epsilon sends
-/// round the board; see the module documentation.
+/// Tier 2 for the case above, the golden the DRC epsilon unlocked.
+///
+/// One pair of 0.2 mm tracks on this board sits at exactly the 0.2 mm net
+/// class clearance. While `KicadRules::clearance_epsilon` answered zero
+/// the pair collided here and not in KiCad, so the very first move ran a
+/// walkaround it never needed and that walk circled the board outline,
+/// giving 15 added against the golden's 17. With the 500 nm epsilon
+/// `PNS_PCBNEW_RULE_RESOLVER` subtracts, the two agree.
 #[test]
-#[ignore = "a pair of tracks at exactly the net class clearance collides \
-            under a zero clearance epsilon: measured added 15 versus \
-            golden 17, measured removed 19 versus golden 19"]
 fn walk_with_teardrops_matches_the_golden() {
   assert_tier_two(&replay_case(&load("walk-with-teardrops")));
 }

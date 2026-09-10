@@ -55,13 +55,19 @@
 //! ([`MouseTrailTracer::flip_posture`]), which wins over everything for
 //! the life of the trail.
 //!
-//! # What is left out
+//! # The lead vector
 //!
 //! `GetTrailLeadVector` (`pcbnew/router/pns_mouse_trail_tracer.cpp:279`)
-//! has no callers in KiCad's tree and is not ported; note 03 section 9.5
-//! lists it. There is therefore no lead vector parameter anywhere in this
-//! module: `GetPosture` takes the cursor position and nothing else
-//! (`pcbnew/router/pns_mouse_trail_tracer.h:50`).
+//! is not part of the posture solver at all and has exactly one caller in
+//! KiCad's tree, `DRAGGER::propagateViaForces`
+//! (`pcbnew/router/pns_dragger.cpp:67`), which negates it so that a via
+//! the barycentric force cannot free is pushed back against the direction
+//! of travel. An earlier revision of note 03 section 9.5 listed it as
+//! callerless, which is wrong against the source and is corrected there;
+//! note 06 section 9.2 asks for it and it is
+//! [`MouseTrailTracer::trail_lead_vector`]. It is still not a parameter
+//! anywhere else in this module: `GetPosture` takes the cursor position
+//! and nothing else (`pcbnew/router/pns_mouse_trail_tracer.h:50`).
 //!
 //! # The one place the singleton was reached
 //!
@@ -261,6 +267,25 @@ impl MouseTrailTracer {
   /// dropping branch of `buildInitialLine` (`:2053`).
   pub const fn is_manually_forced(&self) -> bool {
     self.manually_forced
+  }
+
+  /// Where the trail has led, as one vector.
+  ///
+  /// Port of `GetTrailLeadVector`,
+  /// `pcbnew/router/pns_mouse_trail_tracer.cpp:279`: the last trail point
+  /// minus the first, and `(0, 0)` for a trail of fewer than two points.
+  /// It is the straight line from where a gesture started to where the
+  /// cursor is now, not the length of the path, so a trail that wandered
+  /// and came back answers something short.
+  ///
+  /// Its one caller is the via drag's force propagation
+  /// (`pcbnew/router/pns_dragger.cpp:67`), which **negates** it.
+  pub fn trail_lead_vector(&self) -> Vec2 {
+    if self.trail.point_count() < 2 {
+      return Vec2::new(0, 0);
+    }
+
+    self.trail.point(self.trail.point_count() - 1) - self.trail.point(0)
   }
 
   /// Turn the answer by 45 degrees and pin it there.
@@ -1088,5 +1113,33 @@ mod tests {
         .iter()
         .any(|label| label == "mt-diag")
     );
+  }
+
+  /// The lead vector is the straight line from the trail's first point to
+  /// its last.
+  #[test]
+  fn the_lead_vector_is_the_last_trail_point_minus_the_first() {
+    // `pcbnew/router/pns_mouse_trail_tracer.cpp:281`, the guard, and
+    // `:287`, the difference.
+    let fixture = Fixture::new();
+    let context = fixture.context();
+    let mut tracer = tracer();
+
+    assert_eq!(tracer.trail_lead_vector(), Vec2::new(0, 0));
+
+    tracer.add_trail_point(&context, Vec2::new(1_000_000, 1_000_000));
+
+    assert_eq!(tracer.trail_lead_vector(), Vec2::new(0, 0));
+
+    tracer.add_trail_point(&context, Vec2::new(3_000_000, 1_000_000));
+
+    assert_eq!(tracer.trail_lead_vector(), Vec2::new(2_000_000, 0));
+
+    // A trail that wandered and came back answers the straight line, not
+    // the path: the middle point is simplified away and the two ends are
+    // all that is left.
+    tracer.add_trail_point(&context, Vec2::new(3_000_000, 4_000_000));
+
+    assert_eq!(tracer.trail_lead_vector(), Vec2::new(2_000_000, 3_000_000));
   }
 }

@@ -996,7 +996,7 @@ The area test is the core: it closes the polygon formed by the candidate two-seg
 
 `FlipPosture` (`:271`) is `m_direction = m_direction.Right(); m_forced = true; m_manuallyForced = true;`. `Right()` on a non-90-degree direction is a 45 degree turn (`libs/kimath/include/geometry/direction45.h:260`), which is exactly the straight/diagonal toggle. `m_manuallyForced` is sticky for the life of the trail and is read by the placer to suppress smart pads (`pcbnew/router/pns_line_placer.cpp:764`, `:984`), suppress FANOUT_CLEANUP (`:1045`), and enable the tail-dropping branch in `buildInitialLine` (`:2053`).
 
-`GetTrailLeadVector` (`:279`) returns `last - first` of the trail, or zero for a degenerate trail. It has no callers in this tree.
+`GetTrailLeadVector` (`:279`) returns `last - first` of the trail, or zero for a degenerate trail. **Correction (2026-09-10):** an earlier revision of this note said it has no callers. It has one, `DRAGGER::propagateViaForces` (`pcbnew/router/pns_dragger.cpp:67`), which negates it to push a dragged via back against the direction of travel; note 06 section 2.12 has the detail.
 
 ---
 
@@ -1486,7 +1486,6 @@ The split is not the same as the settings/sizes split, and getting it wrong is w
 - `ROUTER::SetIterLimit` / `GetIterLimit` / `m_iterLimit` (`pcbnew/router/pns_router.h:224`), never read.
 - `WALKAROUND::SetForceWinding`, `SetPickShortestPath`, `m_forceWinding`, `m_forceCw`, `m_useShortestPath`, `m_forceLongerPath`, `m_cursorPos`, `m_lastP`, and the undefined `Route(const LINE&, LINE&, bool)` overload (`pcbnew/router/pns_walkaround.h:112-158`).
 - `ROUTING_SETTINGS::SuggestFinish` and `WalkaroundTimeLimit` (no consumers; the latter is never even initialised).
-- `MOUSE_TRAIL_TRACER::GetTrailLeadVector` (`pcbnew/router/pns_mouse_trail_tracer.cpp:279`), no callers.
 - `LINE_PLACER::AbortPlacement` (`pcbnew/router/pns_line_placer.cpp:2150`), no callers in this revision.
 - `PNS::HULL_MARGIN` (`pcbnew/router/pns_utils.h:34`), shadowed by the macro that is actually used.
 - The local-minimum branch of `cursorDistMinimum`, hard-disabled at `pcbnew/router/pns_line_placer.cpp:515`.

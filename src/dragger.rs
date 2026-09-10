@@ -11,37 +11,43 @@
 //!
 //! # What is implemented
 //!
-//! Steps 1 to 8 of that order, which is all three drag routines for a
-//! segment or a corner:
+//! Steps 1 to 10 of that order, which is every `DRAGGER` routine a board
+//! without arcs can reach:
 //!
 //! - [`Dragger::start`] with the mode decision of `startDragSegment`
-//!   (`:118`) and the state half of `startDragVia` (`:257`);
+//!   (`:118`) and `startDragVia` (`:257`);
 //! - [`Dragger::drag`]'s dispatch, its first drag fallback and its
 //!   restore branch (`:998`);
-//! - `dragMarkObstacles` (`:381`) for the segment and corner cases,
-//!   which is [`Dragger::drag`] in [`RouterMode::MarkObstacles`], in free
-//!   angle mode, and after any first drag failure;
+//! - `dragMarkObstacles` (`:381`), which is [`Dragger::drag`] in
+//!   [`RouterMode::MarkObstacles`], in free angle mode, and after any
+//!   first drag failure;
 //! - `dragWalkaround` (`:709`) and `tryWalkaround` (`:685`), the
 //!   [`RouterMode::Walkaround`] path;
-//! - `dragShove` (`:802`) for the segment and corner cases, the
-//!   [`RouterMode::Shove`] path, which drives the [`Shove`]
-//!   [`Dragger::start`] built through the head protocol alone;
+//! - `dragShove` (`:802`), the [`RouterMode::Shove`] path, which drives
+//!   the [`Shove`] [`Dragger::start`] built through the head protocol
+//!   alone;
+//! - the via drag: `findViaFanoutByHandle` (`:267`),
+//!   `dragViaMarkObstacles` (`:452`), `propagateViaForces` (`:62`),
+//!   `dragViaWalkaround` (`:492`) and `dragShove`'s `DM_VIA` case
+//!   (`:908`);
 //! - `optimizeAndUpdateDraggedLine` (`:569`), `bestAnchorForPoint`
-//!   (`:639`) and `pointHasBadCorner` (`:622`), where both of those end;
-//! - [`Dragger::traces`], [`Dragger::current_node`],
-//!   [`Dragger::current_nets`], [`Dragger::force_mark_obstacles_mode`],
-//!   [`Dragger::fix_route_node`] and [`Dragger::fix_route`].
+//!   (`:639`) and `pointHasBadCorner` (`:622`), where the walkaround and
+//!   the shove both end;
+//! - free angle mode end to end (note 06 section 2.17), which is
+//!   [`Dragger::set_free_angle_mode`], `startDragSegment`'s second case
+//!   and [`Dragger::drag`]'s bypass, and which never builds a shove;
+//! - [`Dragger::traces`], [`Dragger::traces_vias`],
+//!   [`Dragger::current_node`], [`Dragger::current_nets`],
+//!   [`Dragger::force_mark_obstacles_mode`], [`Dragger::fix_route_node`]
+//!   and [`Dragger::fix_route`].
 //!
 //! # What is not implemented yet
 //!
-//! - Everything about the via drag except the handles `startDragVia`
-//!   stores: `findViaFanoutByHandle` (`:267`), `dragViaMarkObstacles`
-//!   (`:452`), `dragViaWalkaround` (`:492`), `propagateViaForces`
-//!   (`:62`) and `dragShove`'s `DM_VIA` case (`:908`), step 9. The three
-//!   drag routines all have a [`DragMode::Via`] arm and all three of them
-//!   move nothing; the two that can fail report failure there, so
-//!   [`Dragger::drag`] latches the mark obstacles fallback on the first
-//!   move of a via drag.
+//! - Multi drag, which is `MULTI_DRAGGER` and a module of its own; note
+//!   06 section 10.2 step 11 asks for the contradiction between
+//!   `PLAN.md`, which lists it as a non goal, and
+//!   `doc/work/009-dragging.md`, which has it as a task, to be resolved
+//!   first.
 //!
 //! # Where a drag ends
 //!
@@ -97,13 +103,15 @@ use crate::geometry::direction45::{AngleType, Direction45};
 use crate::geometry::line_chain::LineChain;
 use crate::geometry::seg::Seg;
 use crate::geometry::vec2::Vec2;
-use crate::item::{ItemBody, ItemId, Kind, MarkerFlags, NetId};
+use crate::item::{Item, ItemBody, ItemId, Kind, MarkerFlags, NetId};
 use crate::line::Line;
 use crate::mouse_trail::MouseTrailTracer;
 use crate::node::{NodeId, World};
 use crate::optimizer::{EffortFlags, Optimizer};
+use crate::rules::ItemRef;
 use crate::settings::RouterMode;
 use crate::shove::{Shove, ShovePolicy, ShoveStatus, ViaHandle};
+use crate::via::{move_via_by, move_via_to, via_pushout_force};
 use crate::walkaround::{WalkPolicy, Walkaround, WalkaroundStatus};
 
 // ---------------------------------------------------------------------
@@ -255,11 +263,21 @@ pub struct Dragger {
   last_valid_point: Vec2,
   /// What [`Dragger::traces`] answers. Port of `m_draggedItems` (`:170`).
   ///
-  /// KiCad's `ITEM_SET` can hold a dragged `VIA` as well as the lines
-  /// (`:511`), which is what the via drag of step 9 will need; the mark
+  /// KiCad's `ITEM_SET` holds a dragged `VIA` as well as the lines
+  /// (`:511`), which is [`Dragger::dragged_vias`] here; the mark
   /// obstacles path for a segment or a corner only ever puts one line in
   /// it (`:413`).
   dragged_items: Vec<Line>,
+  /// The via half of what [`Dragger::traces`] answers, as
+  /// [`Dragger::traces_vias`]. The other half of `m_draggedItems`
+  /// (`:170`).
+  ///
+  /// KiCad's `ITEM_SET` holds lines and items in one vector, so a via
+  /// drag's dragged via (`:511`) and its dragged lines (`:557`) share a
+  /// set and are cleared together. A [`Line`] is not an
+  /// [`crate::item::Item`] here, so the set is two vectors that
+  /// [`Dragger::clear_dragged_items`] always empties as one.
+  dragged_vias: Vec<ItemId>,
   /// Whether the drag ignores the 45 degree regime. Port of
   /// `m_freeAngleMode` (`:173`), set from the request mask at `:314` and
   /// here by [`Dragger::set_free_angle_mode`].
@@ -321,6 +339,7 @@ impl Dragger {
       current_mode: RouterMode::MarkObstacles,
       last_valid_point: Vec2::new(0, 0),
       dragged_items: Vec::new(),
+      dragged_vias: Vec::new(),
       free_angle_mode: false,
       force_mark_obstacles_mode: false,
       mouse_trail: MouseTrailTracer::new(),
@@ -366,6 +385,22 @@ impl Dragger {
   /// borrow of owned [`Line`] values has neither hazard.
   pub fn traces(&self) -> &[Line] {
     &self.dragged_items
+  }
+
+  /// The vias the drag is moving, as they stand in
+  /// [`Dragger::current_node`].
+  ///
+  /// The other half of `Traces` (`:1058`): KiCad's `ITEM_SET` holds a
+  /// dragged `VIA` beside the lines (`:478` to `:484`, `:508` to `:511`),
+  /// and only a via drag ever puts one there. `ROUTER::markViolations`
+  /// reads the set to skip what the drag is moving
+  /// (`pcbnew/router/pns_router.cpp:726`), which is the one place the
+  /// distinction is observable.
+  ///
+  /// At most one entry today, because `findViaFanoutByHandle` keeps at
+  /// most one via per joint (`:293`).
+  pub fn traces_vias(&self) -> &[ItemId] {
+    &self.dragged_vias
   }
 
   /// The net the drag is on.
@@ -455,7 +490,7 @@ impl Dragger {
 
     // :311 to :316
     self.last_node = None;
-    self.dragged_items.clear();
+    self.clear_dragged_items();
     self.current_mode = context.settings.mode;
     self.force_mark_obstacles_mode = false;
     self.last_valid_point = at;
@@ -585,11 +620,12 @@ impl Dragger {
   /// [`World::find_via_by_handle`] resolves the handle again in whatever
   /// node the caller now stands on.
   ///
-  /// The routines that make the via actually move,
-  /// `dragViaMarkObstacles` (`:452`), `dragViaWalkaround` (`:492`) and
-  /// `dragShove`'s `DM_VIA` case (`:908`), are step 9 of note 06 section
-  /// 10.2 and are not here yet, so a via drag starts, reports
-  /// [`DragMode::Via`] and then moves nothing.
+  /// [`Dragger::initial_via`] is what `dragViaMarkObstacles` (`:452`) and
+  /// `dragViaWalkaround` (`:492`) look the fanout up from every time, so
+  /// those two always re-derive from the position the drag started at.
+  /// [`Dragger::dragged_via`] is the one `dragShove` (`:908`) tracks as
+  /// the shove moves it, and the one the shove path's walkaround
+  /// fallback uses (`:945`).
   ///
   /// KiCad returns true unconditionally; this returns false for a handle
   /// that cannot be built, which needs the item to have stopped being a
@@ -698,7 +734,7 @@ impl Dragger {
     world.drop_node(last);
 
     self.last_node = Some(restored);
-    self.dragged_items.clear();
+    self.clear_dragged_items();
 
     // :1043, :1044
     self.last_drag_solution.clear_links();
@@ -788,16 +824,15 @@ impl Dragger {
         world.add_line(last, &mut dragged, false);
 
         // :412, :413
-        self.dragged_items.clear();
+        self.clear_dragged_items();
         self.dragged_items.push(dragged);
       }
       DragMode::Via => {
-        // :437. TODO(step 9): `dragViaMarkObstacles( m_initialVia,
-        // m_lastNode, aP )`, `pcbnew/router/pns_dragger.cpp:452`, with
-        // `findViaFanoutByHandle` behind it. Until then a via drag
-        // rebuilds an untouched node and reports no dragged items, which
-        // is what `:458` does for an empty fanout anyway.
-        self.dragged_items.clear();
+        // :437, :438. The answer is discarded, exactly as KiCad discards
+        // it: the status below is the collision test and nothing else.
+        if let Some(handle) = self.initial_via {
+          self.drag_via_mark_obstacles(world, handle, last, at);
+        }
       }
     }
 
@@ -824,10 +859,27 @@ impl Dragger {
     context: &AlgoContext<'_>,
     node: NodeId,
   ) -> bool {
+    let options = CollisionSearchOptions {
+      limit_count: Some(1),
+      ..CollisionSearchOptions::default()
+    };
+
     self
       .dragged_items
       .iter()
       .any(|line| line_collides(world, context, node, line))
+      || self.dragged_vias.iter().any(|id| {
+        world.item(*id).is_some_and(|item| {
+          world
+            .check_colliding(
+              node,
+              ItemRef::stored(*id, item),
+              context.resolver,
+              &options,
+            )
+            .is_some()
+        })
+      })
   }
 
   /// Move the drag and bend it around what is in the way.
@@ -952,13 +1004,13 @@ impl Dragger {
         }
       }
       DragMode::Via => {
-        // :791, :792. TODO(step 9): `dragViaWalkaround( m_initialVia,
-        // m_lastNode, aP )`, `pcbnew/router/pns_dragger.cpp:492`. Until
-        // then a via walkaround drag fails, which is what KiCad answers
-        // when its force propagation cannot free the via, and
-        // `Dragger::drag` latches the mark obstacles fallback on the
-        // first one.
-        ok = false;
+        // :791, :792. Note that the fanout is looked up from
+        // [`Dragger::initial_via`], the position the drag started at, and
+        // not from wherever a previous shove left the via: only
+        // `dragShove` tracks the via as it moves.
+        ok = self.initial_via.is_some_and(|handle| {
+          self.drag_via_walkaround(world, context, handle, last, at)
+        });
       }
     }
 
@@ -1110,14 +1162,60 @@ impl Dragger {
         // :861
         self.drag_status = ok;
       }
+      // :908
       DragMode::Via => {
-        // :908. TODO(step 9): `DisablePostShoveOptimizations`,
-        // `AddHeads( m_draggedVia, aP, SHP_SHOVE )` and the
-        // `dragViaWalkaround` fallback,
-        // `pcbnew/router/pns_dragger.cpp:908` to `:948`. Until then a via
-        // shove drag fails and `Dragger::drag` latches the mark obstacles
-        // fallback on the first one, which moves nothing.
-        self.drag_status = false;
+        let (Some(shove), Some(handle)) =
+          (self.shove.as_mut(), self.dragged_via)
+        else {
+          self.drag_status = false;
+
+          return false;
+        };
+
+        // :914, the "hack that disables it, before I figure out a more
+        // reliable solution" of KiCad's own comment. It is called on
+        // every via drag move and never undone.
+        shove.disable_post_shove_optimizations(EffortFlags::LIMIT_CORNER_COUNT);
+
+        // :916, :917. A via head takes [`ShovePolicy::SHOVE`] alone,
+        // where a line head takes `DONT_LOCK_ENDPOINTS` with it.
+        shove.clear_heads();
+        shove.add_head_via(handle, at, ShovePolicy::SHOVE);
+
+        // :919
+        let status = shove.run(world, context);
+
+        // :924 to :936. The test is on `HeadsModified()` alone and not
+        // on the status, which is safe both ways: a failed run puts the
+        // head via back where it found it and reports the handle as
+        // modified anyway (`pcbnew/router/pns_shove.cpp:2587`), so this
+        // re-reads the same position, and a successful one hands back
+        // where the via really went. Either way the walkaround fallback
+        // below starts from the handle the shove last confirmed, which
+        // is why `dragShove` tracks the via and the other two routines
+        // do not.
+        if shove.heads_modified(None)
+          && let Some(moved) = shove.head_via(0)
+        {
+          self.dragged_via = Some(moved);
+        }
+
+        // :939
+        let shove_node = shove.current_node();
+        let last = world.branch(shove_node);
+
+        self.last_node = Some(last);
+        // :941
+        self.clear_dragged_items();
+
+        // :944, :945
+        self.drag_status = if status == ShoveStatus::Ok {
+          true
+        } else {
+          self.dragged_via.is_some_and(|handle| {
+            self.drag_via_walkaround(world, context, handle, last, at)
+          })
+        };
       }
     }
 
@@ -1234,8 +1332,307 @@ impl Dragger {
 
     // :616 to :618
     world.add_line(last, &mut post_opt, false);
-    self.dragged_items.clear();
+    self.clear_dragged_items();
     self.dragged_items.push(post_opt);
+  }
+
+  // -----------------------------------------------------------------
+  // The via drag
+  // -----------------------------------------------------------------
+
+  /// Move a via to the cursor and take its fanout with it, reporting
+  /// whatever that runs into.
+  ///
+  /// Port of `dragViaMarkObstacles` (`:452`). No forces and no
+  /// walkaround: every line attached at the via has its near corner
+  /// dragged to the cursor and the via itself is replaced by a copy at
+  /// the cursor.
+  ///
+  /// KiCad returns true unconditionally once past the empty fanout guard
+  /// (`:458`), and its one caller in this mode discards the answer
+  /// anyway (`:438`); the collision test that follows the call is where a
+  /// via drag's status comes from.
+  ///
+  /// # `node` is only read from
+  ///
+  /// The fanout is looked up in `node` and every mutation goes to
+  /// [`Dragger::last_node`] (`:473`, `:474`, `:483`, `:484`), which note
+  /// 06 erratum E13 records: both call sites pass `m_lastNode` for
+  /// `aNode`, so the parameter is redundant. It is kept, because keeping
+  /// it is what makes the two nodes visible at the call site.
+  fn drag_via_mark_obstacles(
+    &mut self,
+    world: &mut World,
+    handle: ViaHandle,
+    node: NodeId,
+    at: Vec2,
+  ) -> bool {
+    // :454
+    self.clear_dragged_items();
+
+    // :456
+    let fanout = find_via_fanout_by_handle(world, node, handle);
+
+    // :458
+    if fanout.is_empty() {
+      return true;
+    }
+
+    let Some(last) = self.last_node else {
+      return true;
+    };
+
+    for item in fanout {
+      match item {
+        ViaFanoutItem::Line(line) => {
+          // :462, :463
+          let line = *line;
+          let mut original = line.clone();
+          let mut dragged = line;
+          // :468. `CLine().Find( aHandle.pos )` answers `-1` for a line
+          // that does not pass through the handle and KiCad feeds that
+          // straight to `DragCorner`; `findViaFanoutByHandle` has just
+          // reversed every line so that the via is point 0, so only a
+          // stale handle could miss and such a line is skipped here.
+          let Some(corner) = original.shape().find(handle.pos, 0) else {
+            continue;
+          };
+
+          dragged.drag_corner(
+            at,
+            corner,
+            self.free_angle_mode,
+            Direction45::default(),
+          );
+          // :469
+          dragged.clear_links();
+
+          // :471
+          self.dragged_items.push(dragged.clone());
+
+          // :473, :474. The removal uses `original`, which kept its
+          // links.
+          world.remove_line(last, &mut original);
+          world.add_line(last, &mut dragged, false);
+        }
+        ViaFanoutItem::Via(via) => {
+          // :478, :480
+          let Some(moved) = cloned_via_at(world, via, at) else {
+            continue;
+          };
+
+          // :483, :484
+          world.remove(last, via);
+
+          let id = world.add_via(last, moved);
+
+          // :481. KiCad adds the raw pointer to the set before the node
+          // takes ownership of it; an arena id only exists after the
+          // addition, so the push moves down here. Same item either way.
+          self.dragged_vias.push(id);
+        }
+      }
+    }
+
+    true
+  }
+
+  /// Push a via out of what it collides with, along the drag's own lead.
+  ///
+  /// Port of `propagateViaForces` (`:62`), which is
+  /// [`via_pushout_force`] with two arguments filled in: the direction is
+  /// the **negated** trail lead vector (`:67`), so a via the barycentric
+  /// force cannot free is pushed back the way the cursor came, and the
+  /// budget is
+  /// [`crate::settings::RoutingSettings::via_force_prop_iteration_limit`]
+  /// (`:69`).
+  ///
+  /// `via` is a copy that is not in any node yet; on success it is moved
+  /// by the force (`:73`).
+  ///
+  /// KiCad's signature takes a `std::set<VIA*>&` and reads only
+  /// `*vias.begin()`, and its one call site builds a set of exactly one
+  /// (`:513` to `:515`). Note 06 erratum E10: that is dead generality,
+  /// and iterating a set of pointers is address ordered, which
+  /// `DESIGN.md` section 8 forbids. It is one via here.
+  fn propagate_via_forces(
+    &self,
+    world: &World,
+    context: &AlgoContext<'_>,
+    node: NodeId,
+    via: &mut Item,
+  ) -> bool {
+    // :67
+    let lead = -self.mouse_trail.trail_lead_vector();
+    // :69
+    let limit = context.settings.via_force_prop_iteration_limit;
+
+    // :71
+    let Some(force) =
+      via_pushout_force(world, context, node, via, lead, Kind::ANY, limit)
+    else {
+      // :77
+      return false;
+    };
+
+    // :73
+    move_via_by(via, force);
+
+    true
+  }
+
+  /// Move a via to the cursor, push it clear of what is there, and bend
+  /// its fanout around whatever the new geometry runs into.
+  ///
+  /// Port of `dragViaWalkaround` (`:492`), which is two passes over the
+  /// fanout: the via first, because every line has to be dragged to where
+  /// the via really ended up, and then the lines.
+  ///
+  /// # Three things transcribed rather than repaired
+  ///
+  /// - **The via is removed from the drag node before the force
+  ///   propagation and only put back if it succeeds** (`:517`, `:525`),
+  ///   so the `false` at `:530` leaves a node without the via that is
+  ///   being dragged. Note 06 erratum E11. Nothing sees it, because
+  ///   [`Dragger::drag`]'s restore branch re-branches from the parent and
+  ///   throws this node away.
+  /// - **[`Dragger::optimize_and_update_dragged_line`] clears the dragged
+  ///   set** (`:617`), so the first fanout line that needs a walkaround
+  ///   wipes out the via added at `:511` and every earlier line. Note 06
+  ///   erratum E5: `Traces()` then under-reports and
+  ///   `ROUTER::markViolations` stops skipping the dragged via, marking
+  ///   it as colliding with itself. The note proposes adding rather than
+  ///   replacing; that is a behaviour change with no fixture behind it,
+  ///   so this reproduces KiCad and `tests/dragger.rs` pins the result.
+  /// - **The optimizer is anchored on the cursor, not on where the via
+  ///   ended up** (`:553` against `:541`). When the force propagation
+  ///   moved the via, the cursor is not on the line at all, so
+  ///   [`best_anchor_for_point`] silently substitutes the nearest good
+  ///   vertex. Note 06 erratum E6.
+  ///
+  /// `LINE walkLine( *l )` at `:539` is a dead initialization, because
+  /// `tryWalkaround` assigns over it first thing (`:695`); there is no
+  /// counterpart here.
+  fn drag_via_walkaround(
+    &mut self,
+    world: &mut World,
+    context: &AlgoContext<'_>,
+    handle: ViaHandle,
+    node: NodeId,
+    at: Vec2,
+  ) -> bool {
+    // :494
+    self.clear_dragged_items();
+
+    // :496
+    let fanout = find_via_fanout_by_handle(world, node, handle);
+
+    // :498
+    if fanout.is_empty() {
+      return true;
+    }
+
+    let Some(last) = self.last_node else {
+      return false;
+    };
+    let mut via_prop_ok = false;
+    let mut via_target_pos = at;
+
+    // :504
+    for item in &fanout {
+      let ViaFanoutItem::Via(via) = item else {
+        continue;
+      };
+      // :508, :510
+      let Some(mut dragged_via) = cloned_via_at(world, *via, at) else {
+        continue;
+      };
+
+      // :517
+      world.remove(last, *via);
+
+      // :519
+      if self.propagate_via_forces(world, context, last, &mut dragged_via) {
+        // :523
+        via_target_pos = via_position(&dragged_via).unwrap_or(at);
+        via_prop_ok = true;
+
+        // :525
+        let id = world.add_via(last, dragged_via);
+
+        // :511, see `Dragger::drag_via_mark_obstacles` for why the push
+        // is here rather than before the force propagation.
+        self.dragged_vias.push(id);
+      }
+    }
+
+    // :530
+    if !via_prop_ok {
+      return false;
+    }
+
+    // :533
+    for item in fanout {
+      let ViaFanoutItem::Line(line) = item else {
+        continue;
+      };
+      let line = *line;
+      let mut original = line.clone();
+      let mut dragged = line;
+      let Some(corner) = original.shape().find(handle.pos, 0) else {
+        continue;
+      };
+
+      // :541. The line goes to where the via really is, not to the
+      // cursor.
+      dragged.drag_corner(
+        via_target_pos,
+        corner,
+        self.free_angle_mode,
+        Direction45::default(),
+      );
+      // :543
+      dragged.clear_links();
+
+      // :545. Against the root, as everywhere else in this file.
+      if line_collides(world, context, self.world_node, &dragged) {
+        // :547 to :550
+        let Some(mut walked) = try_walkaround(world, context, last, &dragged)
+        else {
+          return false;
+        };
+
+        // :552
+        world.remove_line(last, &mut original);
+        // :553, erratum E6: the anchor is `at`, not `via_target_pos`.
+        self.optimize_and_update_dragged_line(
+          world,
+          context,
+          &mut walked,
+          &original,
+          at,
+        );
+      } else {
+        // :557 to :560
+        self.dragged_items.push(dragged.clone());
+
+        world.remove_line(last, &mut original);
+        world.add_line(last, &mut dragged, false);
+      }
+    }
+
+    true
+  }
+
+  /// Empty the set [`Dragger::traces`] and [`Dragger::traces_vias`]
+  /// answer from.
+  ///
+  /// Every `m_draggedItems.Clear()` in the file (`:312`, `:412`, `:454`,
+  /// `:494`, `:617`, `:941`, `:1042`). The two vectors are one `ITEM_SET`
+  /// in KiCad and are never cleared apart.
+  fn clear_dragged_items(&mut self) {
+    self.dragged_items.clear();
+    self.dragged_vias.clear();
   }
 
   /// How far a dragged corner may snap onto the line's own neighbours.
@@ -1401,6 +1798,134 @@ fn try_walkaround(
   // :699 to :704
   (result.status(WalkPolicy::Shortest) == WalkaroundStatus::Done)
     .then(|| result.into_line(WalkPolicy::Shortest))
+}
+
+// ---------------------------------------------------------------------
+// The via fanout
+// ---------------------------------------------------------------------
+
+/// One thing attached at the joint a via sits on.
+///
+/// The members of the `ITEM_SET` `findViaFanoutByHandle` answers with
+/// (`:267`), which holds assembled `LINE`s by value and at most one
+/// `VIA` by pointer. A [`Line`] is not an [`crate::item::Item`] here, so
+/// the two cases are an enum rather than one heterogeneous set.
+#[derive(Debug)]
+enum ViaFanoutItem {
+  /// A trivially connected line, reversed so that it **starts** at the
+  /// via (`:286`). Boxed because a [`Line`] is forty times the size of
+  /// an [`ItemId`] and the fanout of a via is mostly lines.
+  Line(Box<Line>),
+  /// The via itself, as it stands in the node the fanout was read from.
+  Via(ItemId),
+}
+
+/// Everything attached at a via's joint.
+///
+/// Port of `findViaFanoutByHandle` (`:267`). The handle names a position,
+/// a layer range and a net rather than an item, because a shove replaces
+/// a via wholesale and an id would go stale.
+///
+/// # Every line starts at the via
+///
+/// `if( segIndex != 0 ) l.Reverse()` (`:286`) is the invariant both
+/// callers depend on: it is what lets them say
+/// `origLine.CLine().Find( aHandle.pos )` and get a corner index that
+/// [`Line::drag_corner`] can use. The condition is on the **seed
+/// segment's** index within the assembled line and not on where the via
+/// is, which is the same thing only because the seed is linked to this
+/// joint; it is transcribed rather than reasoned about.
+///
+/// # One via
+///
+/// The `foundVia` guard (`:291`) means a stacked pair at one joint
+/// contributes a single via. KiCad walks the joint's link vector, which
+/// is insertion ordered there and here, so which one that is is
+/// deterministic on both sides.
+fn find_via_fanout_by_handle(
+  world: &World,
+  node: NodeId,
+  handle: ViaHandle,
+) -> Vec<ViaFanoutItem> {
+  // :271
+  let Some(reference) =
+    world.find_joint(node, handle.pos, handle.layers.start(), handle.net)
+  else {
+    // :273
+    return Vec::new();
+  };
+  let Some(joint) = world.joint(reference) else {
+    return Vec::new();
+  };
+  let mut fanout = Vec::new();
+  let mut found_via = false;
+
+  // :278
+  for link in joint.links() {
+    let Some(item) = world.item(*link) else {
+      continue;
+    };
+
+    if item.of_kind(Kind::SEGMENT | Kind::ARC) {
+      let mut index = 0;
+      // :284
+      let mut line =
+        world.assemble_line(node, *link, Some(&mut index), false, false, true);
+
+      // :286
+      if index != 0 {
+        line.reverse();
+      }
+
+      // :288
+      fanout.push(ViaFanoutItem::Line(Box::new(line)));
+    } else if item.of_kind(Kind::VIA) && !found_via {
+      // :293, :294
+      fanout.push(ViaFanoutItem::Via(*link));
+      found_via = true;
+    }
+  }
+
+  fanout
+}
+
+/// A copy of a stored via, moved to a point and ready to be added.
+///
+/// The `Clone( *via ); nvia->SetPos( aP )` pair of `:478` and `:480`, and
+/// again of `:508` and `:510`. KiCad's via copy constructor gives the
+/// copy a **fresh** hole rather than aliasing the original's
+/// (`pcbnew/router/pns_via.h:126`), and so must this: a hole is a
+/// separate arena item, and letting the copy keep the original's handle
+/// would re home that hole into whatever node the copy lands in, so
+/// dropping the node would take the original's drill with it.
+/// [`World::add_via`] drills the replacement.
+///
+/// [`None`] for a handle the node no longer knows, and for one that does
+/// not name a via.
+fn cloned_via_at(world: &World, via: ItemId, at: Vec2) -> Option<Item> {
+  let stored = world.item(via)?;
+
+  if !matches!(stored.body(), ItemBody::Via(_)) {
+    return None;
+  }
+
+  let mut moved = stored.clone();
+
+  moved.set_hole(None);
+  move_via_to(&mut moved, at);
+
+  Some(moved)
+}
+
+/// Where a via item sits.
+///
+/// The `draggedVia->Pos()` of `:523`, read off an item that is not in a
+/// node yet, so [`World::find_via_by_handle`] cannot answer it.
+fn via_position(item: &Item) -> Option<Vec2> {
+  match item.body() {
+    ItemBody::Via(body) => Some(body.pos()),
+    _ => None,
+  }
 }
 
 // ---------------------------------------------------------------------

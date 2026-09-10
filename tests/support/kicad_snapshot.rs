@@ -23,7 +23,7 @@
 //! | rule area | skipped, counted in [`HostMap::skipped_keepouts`] |
 //! | filled zone | never synced, as in KiCad (`:1894`) |
 //!
-//! # Three places this deviates, and why
+//! # Two places this deviates, and why
 //!
 //! 1. **A uniform pad becomes one solid, not one per copper layer.**
 //!    `syncPad`'s per layer lambda runs under
@@ -35,17 +35,21 @@
 //!    would stop connecting the two sides of the board for
 //!    [`pnsrouter::topology`]. The hole rides on that one solid, which
 //!    also removes the "which layer carries the hole" question.
-//! 2. **A rounded rectangle pad becomes its sharp rectangle.** KiCad
-//!    polygonises it with `ERROR_OUTSIDE` (`:1733`); the sharp rectangle
-//!    is a superset of that polygon, so the obstacle is never smaller
-//!    than KiCad's and the router keeps at least as far away. This is
-//!    the same approximation `Shape::rounded_rect` already documents for
-//!    the crate's own outline builder.
-//! 3. **A custom pad becomes the convex hull of its primitives.** KiCad
+//! 2. **A custom pad becomes the convex hull of its primitives.** KiCad
 //!    takes outline 0 of the effective polygon (`:1735`); a convex hull
 //!    of the anchor rectangle and every primitive point is a conservative
 //!    superset of that outline and is what [`SimplePolygon`], which
 //!    assumes convexity, can hold.
+//!
+//! A **rounded rectangle** pad used to be the third of these, mapped to
+//! its sharp rectangle. It is not an approximation any more:
+//! [`rounded_rectangle_shape`] builds the same `ERROR_OUTSIDE` polygon
+//! KiCad's polygon branch does (`:1733`), because the difference is
+//! visible to the router and not only to the eye. A `SHAPE_RECT` gets an
+//! octagonal hull with no chamfer (`pcbnew/router/pns_utils.cpp:488`)
+//! where a `SHAPE_SIMPLE` gets `ConvexHull` (`:300`), whose diagonals are
+//! pushed in until they touch the outline, and the corpus case
+//! `drag-acute-fallback` walks around exactly such a pad.
 //!
 //! An oval pad is **not** approximated: KiCad builds exactly one
 //! `SHAPE_SEGMENT` for it (`pcbnew/pad.cpp:1436`), so the capsule below
@@ -70,8 +74,11 @@
 //! `NETINFO_ITEM` and the router compares handles; an index cannot be
 //! separate from itself, so the orphan gets an index of its own.
 
+use std::f64::consts::FRAC_1_SQRT_2;
+
 use pnsrouter::geometry::hull::monotone_chain_hull;
 use pnsrouter::geometry::line_chain::LineChain;
+use pnsrouter::geometry::math::{kiround, kiround_i64};
 use pnsrouter::geometry::seg::Seg;
 use pnsrouter::geometry::shape::Shape;
 use pnsrouter::geometry::vec2::Vec2;
@@ -110,6 +117,32 @@ pub const CLEARANCE_MARGIN_NANOMETRES: i32 = 100_000;
 /// and the router is pushed away from the true edge rather than towards
 /// it.
 pub const ARC_SAGITTA_NANOMETRES: i64 = 10_000;
+
+/// The slack KiCad subtracts from every positive clearance, in
+/// nanometres.
+///
+/// `ADVANCED_CFG::m_DRCEpsilon` defaults to `0.0005` mm
+/// (`common/advanced_config.cpp:251`, whose comment calls 0.5 um "small
+/// enough not to materially violate any constraints"),
+/// `BOARD_DESIGN_SETTINGS::GetDRCEpsilon` converts it to internal units
+/// (`pcbnew/board_design_settings.cpp:2067`) and
+/// `PNS_PCBNEW_RULE_RESOLVER` reads it once in its constructor
+/// (`pcbnew/router/pns_kicad_iface.cpp:338`). No board in the corpus
+/// overrides it, and it is an advanced configuration key rather than a
+/// board property, so it is a constant here rather than something read
+/// out of the `.kicad_pro`.
+pub const DRC_EPSILON_NANOMETRES: i32 = 500;
+
+/// The largest deviation a polygonised arc may leave behind, in
+/// nanometres.
+///
+/// `BOARD_DESIGN_SETTINGS::m_MaxError`, whose default is `ARC_HIGH_DEF`,
+/// itself `0.005` mm (`pcbnew/board_design_settings.cpp:217`,
+/// `include/base_units.h:137`). It is what
+/// [`rounded_rectangle_outline`] hands `GetArcToSegmentCount`. Only
+/// `walk-with-teardrops` even writes `max_error` into its project file
+/// and it writes the default, so this is a constant too.
+pub const MAX_ERROR_NANOMETRES: i32 = 5_000;
 
 // ---------------------------------------------------------------------
 // The host map
@@ -733,10 +766,17 @@ impl RuleResolver for KicadRules {
     Some(result)
   }
 
-  /// Zero, which is what note 05 section 7.5 asks a host without a DRC
-  /// epsilon to answer.
+  /// KiCad's DRC epsilon, [`DRC_EPSILON_NANOMETRES`].
+  ///
+  /// `PNS_PCBNEW_RULE_RESOLVER`'s constructor takes it from the board
+  /// (`pcbnew/router/pns_kicad_iface.cpp:338`) and subtracts it from
+  /// every positive clearance the ladder answers with (`:972`), which is
+  /// the subtraction above. Note 05 section 7.5 says a host **without**
+  /// the notion, LibrePCB among them, leaves
+  /// [`RuleResolver::clearance_epsilon`] at its zero default; this
+  /// resolver emulates KiCad, which has one.
   fn clearance_epsilon(&self) -> i32 {
-    0
+    DRC_EPSILON_NANOMETRES
   }
 
   /// Whether the `.kicad_dru` holds a conditional physical rule.
@@ -1215,12 +1255,15 @@ fn pad_shape(pad: &KicadPad) -> Option<Shape> {
       ))
       .filter(nonzero)
     }
-    // A rounded rectangle keeps its sharp corners here, and a trapezoid
-    // loses its taper because the reader does not carry the delta; both
-    // are supersets of the true copper.
-    PadShape::Rectangle
-    | PadShape::RoundedRectangle { .. }
-    | PadShape::Trapezoid => Some(rectangle_shape(pad)).filter(nonzero),
+    // `pcbnew/pad.cpp:1487`, a single `SHAPE_RECT` or `SHAPE_SIMPLE`. A
+    // trapezoid loses its taper because the reader does not carry the
+    // delta, which leaves a superset of the true copper.
+    PadShape::Rectangle | PadShape::Trapezoid => {
+      Some(rectangle_shape(pad)).filter(nonzero)
+    }
+    PadShape::RoundedRectangle { ratio } => {
+      Some(rounded_rectangle_shape(pad, *ratio)).filter(nonzero)
+    }
     PadShape::Custom { primitives } => custom_shape(pad, primitives),
   }
 }
@@ -1307,6 +1350,305 @@ fn is_axis_aligned(corners: &[Vec2]) -> bool {
       && corners[1].y == corners[2].y
       && corners[2].x == corners[3].x
       && corners[3].y == corners[0].y)
+}
+
+// ---------------------------------------------------------------------
+// The rounded rectangle pad
+// ---------------------------------------------------------------------
+
+/// The copper of a rounded rectangle pad.
+///
+/// A roundrect is the one pad shape whose effective shape is a
+/// **compound** of five pieces, the body plus one capsule per side
+/// (`pcbnew/pad.cpp:1516` to `:1521`), so
+/// `shape->GetIndexableSubshapeCount() == 1` fails and `syncPad` takes
+/// its polygon branch instead: `GetEffectivePolygon( aLayer,
+/// ERROR_OUTSIDE )`, outline 0, wrapped in a `SHAPE_SIMPLE`
+/// (`pcbnew/router/pns_kicad_iface.cpp:1733`). That matters to the
+/// router and not only to the picture, because a `SHAPE_SIMPLE` gets
+/// `ConvexHull` (`pcbnew/router/pns_utils.cpp:300`), whose four diagonals
+/// are pushed inwards until they touch the outline, where a `SHAPE_RECT`
+/// gets an octagon with no chamfer at all (`:488`).
+///
+/// Two shapes short circuit before the polygon, both reproduced here:
+///
+/// - a **zero radius** roundrect is stored as a plain rectangle, because
+///   `PADSTACK`'s assignment rewrites the shape when the ratio is zero
+///   (`pcbnew/padstack.cpp:124`);
+/// - a roundrect whose straight part has all but vanished is built as a
+///   single circle of the corner radius (`pcbnew/pad.cpp:1461` to
+///   `:1470`), and one circle is one indexable subshape, so `syncPad`
+///   keeps the circle.
+fn rounded_rectangle_shape(pad: &KicadPad, ratio: f64) -> Shape {
+  // `PADSTACK::RoundRectRadius`, `pcbnew/padstack.cpp:952`.
+  let radius = kiround_i64((pad.size.x.min(pad.size.y) as f64) * ratio);
+
+  // `pcbnew/padstack.cpp:124`.
+  if radius <= 0 {
+    return rectangle_shape(pad);
+  }
+
+  // `pcbnew/pad.cpp:1464`, `min_len` of 0.0001 mm.
+  const MINIMUM_STRAIGHT_LENGTH_NANOMETRES: i64 = 100;
+
+  let straight = Point {
+    x: pad.size.x / 2 - radius,
+    y: pad.size.y / 2 - radius,
+  };
+
+  if straight.x < MINIMUM_STRAIGHT_LENGTH_NANOMETRES
+    && straight.y < MINIMUM_STRAIGHT_LENGTH_NANOMETRES
+  {
+    return Shape::circle(to_vec2(pad.at), clamp_i32(radius));
+  }
+
+  Shape::simple(LineChain::from_points(
+    rounded_rectangle_outline(pad, clamp_i32(radius)),
+    true,
+  ))
+}
+
+/// The outline `GetEffectivePolygon( layer, ERROR_OUTSIDE )` builds for a
+/// rounded rectangle pad.
+///
+/// `PAD::TransformShapeToPolygon`'s roundrect arm
+/// (`pcbnew/pad.cpp:3040`) calls
+/// `TransformRoundChamferedRectToPolygon`
+/// (`libs/kimath/src/convert_basic_shapes_to_polygon.cpp:455`) with no
+/// clearance, no chamfer and `ERROR_OUTSIDE`, and that hands four corners
+/// of equal radius to `CornerListToPolygon` (`:242`). This is that path
+/// with the branches a pad's four **right angled** corners can never take
+/// removed: no inflation, so `aInflate` is zero throughout; no chamfer,
+/// so the corner list stays four long; and both `incoming` and `outgoing`
+/// axis aligned at every corner, so the `endAngle = ANGLE_90,
+/// tanAngle2 = 1.0` short circuit at `:266` is the only case, which makes
+/// `arcTransitionDistance` the radius itself.
+///
+/// # Why the arc comes out looking trimmed
+///
+/// `ERROR_OUTSIDE` pushes the polygon outside the true circle by
+/// `radiusExtend` (`:319`, `:320`) so that the approximation never
+/// understates the copper. That would leave an "ear" sticking out past
+/// each straight side, so the loop at `:329` walks the arc from the side
+/// inwards and takes the **first** vertex that is within the sharp
+/// rectangle, joining it to the side with the chord's intersection point
+/// (`:346`). The mirror of that intersection across the corner's diagonal
+/// closes the arc at the other end (`:348`).
+///
+/// The outline is built about the origin, then rotated and moved
+/// (`:513` to `:517`), which is the order the pad's own orientation has
+/// to be applied in.
+fn rounded_rectangle_outline(pad: &KicadPad, radius: i32) -> Vec<Vec2> {
+  let half = Vec2::new(clamp_i32(pad.size.x / 2), clamp_i32(pad.size.y / 2));
+  // `:477` to `:480`, in that order, which is what makes every turn a
+  // left turn in KiCad's y down frame.
+  let corners = [
+    Vec2::new(-half.x, -half.y),
+    Vec2::new(half.x, -half.y),
+    Vec2::new(half.x, half.y),
+    Vec2::new(-half.x, half.y),
+  ];
+
+  // `:300`. Sixteen segments per full turn is the floor, so a pad corner
+  // never gets fewer than four vertices' worth of arc.
+  let segments = arc_to_segment_count(radius, MAX_ERROR_NANOMETRES, 360.0)
+    .max(MINIMUM_SEGMENTS_PER_TURN);
+  let angle_delta = 360.0 / f64::from(segments);
+  // `:319`, `:320`. `GetCircleToPolyCorrection` is the identity outside
+  // a `DISABLE_ARC_RADIUS_CORRECTION` scope
+  // (`libs/kimath/src/geometry/geometry_utils.cpp:102`), and nothing on
+  // this path opens one.
+  let radius_extend = circle_to_end_segment_delta_radius(radius, segments);
+  let mut outline: Vec<Vec2> = Vec::new();
+  // `:247`
+  let mut incoming = corners[0] - corners[3];
+
+  for index in 0..corners.len() {
+    let corner = corners[index];
+    let outgoing = corners[(index + 1) % corners.len()] - corner;
+    // `:266`, the axis aligned short circuit: a right angle to sweep and
+    // a transition distance of exactly the radius.
+    let mut end_angle = 90.0_f64;
+    let plain_start = corner - incoming.resize(radius);
+    let centre = plain_start + incoming.perpendicular().resize(radius);
+    // `:321`
+    let start = plain_start + incoming.perpendicular().resize(-radius_extend);
+    let start_origin = start - centre;
+    // `:325`. KiCad's comment calls it short and to be treated as an
+    // infinite line, which is what `Seg::intersect_lines` does.
+    let straight_side = Seg::new(corner - incoming, corner);
+    // `:327`, the answer when no arc vertex lands inside the outline.
+    let mut end = corner;
+    let mut previous = start;
+    // `:305` to `:311`: the last segment of the sweep is made the same
+    // size as the first, and the first vertex sits half a segment in.
+    let mut last_segment = end_angle;
+
+    while last_segment > angle_delta {
+      last_segment -= angle_delta;
+    }
+
+    let mut angle = if last_segment == 0.0 {
+      angle_delta
+    } else {
+      (angle_delta + last_segment) / 2.0
+    };
+
+    // `:329`
+    while angle < end_angle {
+      let point = rotate_about_origin(start_origin, -angle) + centre;
+
+      angle += angle_delta;
+
+      // `:339`
+      if straight_side.side(point) > 0 {
+        // `:341`. KiCad asserts the solution exists; the chord runs from
+        // outside the side to inside it, so it always does.
+        if let Some(crossing) =
+          straight_side.intersect_lines(&Seg::new(previous, point))
+        {
+          append_outline_point(&mut outline, crossing);
+          // `:348`
+          end = Seg::new(corner, centre).reflect_point(crossing);
+        }
+
+        append_outline_point(&mut outline, point);
+
+        break;
+      }
+
+      // `:352`, skipping the last vertex as well as the first.
+      end_angle -= angle_delta;
+      previous = point;
+    }
+
+    // `:356`
+    while angle < end_angle {
+      append_outline_point(
+        &mut outline,
+        rotate_about_origin(start_origin, -angle) + centre,
+      );
+
+      angle += angle_delta;
+    }
+
+    // `:363`
+    append_outline_point(&mut outline, end);
+
+    incoming = outgoing;
+  }
+
+  // `:513` to `:516`
+  outline
+    .into_iter()
+    .map(|point| rotate_about_origin(point, pad.rotation_degrees))
+    .map(|point| {
+      Vec2::new(
+        clamp_i32(i64::from(point.x) + pad.at.x),
+        clamp_i32(i64::from(point.y) + pad.at.y),
+      )
+    })
+    .collect()
+}
+
+/// The floor `CornerListToPolygon` puts under the segment count.
+///
+/// `libs/kimath/src/convert_basic_shapes_to_polygon.cpp:300`, whose
+/// comment is "Ensure 16+ segments per 360deg".
+const MINIMUM_SEGMENTS_PER_TURN: i32 = 16;
+
+/// Append a point unless it repeats the previous one.
+///
+/// `SHAPE_LINE_CHAIN::Append`
+/// (`libs/kimath/include/geometry/shape_line_chain.h:534`) drops a point
+/// equal to the chain's last unless duplication is asked for, and nothing
+/// on this path asks.
+fn append_outline_point(outline: &mut Vec<Vec2>, point: Vec2) {
+  if outline.last() != Some(&point) {
+    outline.push(point);
+  }
+}
+
+/// How many segments an arc of that many degrees is approximated by.
+///
+/// Port of `GetArcToSegmentCount`
+/// (`libs/kimath/src/geometry/geometry_utils.cpp:38`). The clamp to
+/// `360 / 8` is KiCad's `MIN_SEGCOUNT_FOR_CIRCLE`, which only bites for
+/// radii small enough that the error bound allows a coarser step than 45
+/// degrees.
+fn arc_to_segment_count(radius: i32, max_error: i32, degrees: f64) -> i32 {
+  let radius = f64::from(radius.max(1));
+  let max_error = f64::from(max_error.max(1));
+  let relative_error = max_error / radius;
+  let increment =
+    (180.0 / std::f64::consts::PI * (1.0 - relative_error).acos() * 2.0)
+      .min(360.0 / 8.0);
+
+  kiround(degrees.abs() / increment).max(2)
+}
+
+/// How far outside the true circle the ends of an approximating segment
+/// sit.
+///
+/// Port of `CircleToEndSegmentDeltaRadius`
+/// (`libs/kimath/src/geometry/geometry_utils.cpp:63`): the radius is that
+/// of the circle tangent to the middle of each segment, so the circle
+/// through the segment **ends** is larger by this much.
+fn circle_to_end_segment_delta_radius(radius: i32, segments: i32) -> i32 {
+  let segments = f64::from(segments.max(3));
+  let alpha = std::f64::consts::PI / segments;
+
+  kiround((f64::from(radius) * (1.0 - 1.0 / alpha.cos())).abs())
+}
+
+/// Rotate a point about the origin, KiCad's way.
+///
+/// Port of `RotatePoint( int*, int*, const EDA_ANGLE& )`
+/// (`libs/kimath/src/trigo.cpp:225`) together with `EDA_ANGLE::Sin` and
+/// `Cos` (`libs/kimath/include/geometry/eda_angle.h:178`, `:197`). The
+/// exact quarter turns and the exact eighth turns are spelled out rather
+/// than left to the library, because that is where KiCad's answer is
+/// exact and a `sin` call's would only be nearly so; the polygon of a
+/// sixteen segment corner passes through 45 and 315 degrees, so the
+/// difference is reachable.
+fn rotate_about_origin(point: Vec2, degrees: f64) -> Vec2 {
+  let angle = degrees.rem_euclid(360.0);
+
+  if angle == 0.0 {
+    return point;
+  }
+
+  if angle == 90.0 {
+    return Vec2::new(point.y, -point.x);
+  }
+
+  if angle == 180.0 {
+    return Vec2::new(-point.x, -point.y);
+  }
+
+  if angle == 270.0 {
+    return Vec2::new(-point.y, point.x);
+  }
+
+  let sine = if angle == 45.0 || angle == 135.0 {
+    FRAC_1_SQRT_2
+  } else if angle == 225.0 || angle == 315.0 {
+    -FRAC_1_SQRT_2
+  } else {
+    angle.to_radians().sin()
+  };
+  let cosine = if angle == 45.0 || angle == 315.0 {
+    FRAC_1_SQRT_2
+  } else if angle == 135.0 || angle == 225.0 {
+    -FRAC_1_SQRT_2
+  } else {
+    angle.to_radians().cos()
+  };
+
+  Vec2::new(
+    kiround(f64::from(point.y) * sine + f64::from(point.x) * cosine),
+    kiround(f64::from(point.y) * cosine - f64::from(point.x) * sine),
+  )
 }
 
 /// The copper of a custom pad, as the convex hull of everything it is
@@ -1751,5 +2093,114 @@ mod tests {
         "{point:?} is not on the circle"
       );
     }
+  }
+
+  /// A pad the way `drag-acute-fallback` walks around one.
+  ///
+  /// Pad 2 of `C1` on `boards/drag-walk-optimize.kicad_pcb`: a
+  /// `0.9 x 0.95` roundrect with `roundrect_rratio 0.25`, centred at
+  /// `(146.225, 105.5)`.
+  fn the_acute_fallback_pad() -> KicadPad {
+    KicadPad {
+      footprint_uuid: String::new(),
+      footprint_reference: "C1".to_string(),
+      number: "2".to_string(),
+      kind: PadKind::SurfaceMount,
+      shape: PadShape::RoundedRectangle { ratio: 0.25 },
+      at: Point {
+        x: 146_225_000,
+        y: 105_500_000,
+      },
+      size: Point {
+        x: 900_000,
+        y: 950_000,
+      },
+      rotation_degrees: 0.0,
+      layer_names: vec!["F.Cu".to_string()],
+      copper_layers: vec![0],
+      net: Some(1),
+      drill: None,
+      uuid: String::new(),
+    }
+  }
+
+  /// The roundrect polygon has KiCad's five vertices per corner.
+  ///
+  /// `CornerListToPolygon`'s `ERROR_OUTSIDE` branch
+  /// (`libs/kimath/src/convert_basic_shapes_to_polygon.cpp:317`) emits,
+  /// per corner, the chord's crossing of the straight side, the three arc
+  /// vertices at 22.5, 45 and 67.5 degrees, and the mirror of the
+  /// crossing on the other side. Sixteen segments per full turn is the
+  /// floor here, because the error bound alone asks for fifteen.
+  #[test]
+  fn a_roundrect_pad_is_polygonised_the_way_kicad_polygonises_it() {
+    let pad = the_acute_fallback_pad();
+    let outline = rounded_rectangle_outline(&pad, 225_000);
+
+    assert_eq!(
+      arc_to_segment_count(225_000, MAX_ERROR_NANOMETRES, 360.0),
+      15
+    );
+    assert_eq!(circle_to_end_segment_delta_radius(225_000, 16), 4_408);
+    assert_eq!(outline.len(), 20);
+
+    // Every vertex is inside the sharp rectangle grown by the outward
+    // correction, and none is inside the rectangle shrunk by the radius.
+    for point in &outline {
+      assert!((point.x - 146_225_000).abs() <= 450_000 + 4_408);
+      assert!((point.y - 105_500_000).abs() <= 475_000 + 4_408);
+    }
+  }
+
+  /// The vertex `PNS::ConvexHull` measures its diagonals against.
+  ///
+  /// `MoveDiagonal` (`pcbnew/router/pns_utils.cpp:289`) slides each 45
+  /// degree line until the **nearest** outline vertex sits at exactly the
+  /// clearance, and for a rounded corner that is the arc vertex at 45
+  /// degrees, `radius + radiusExtend` from the corner's centre. It is
+  /// what cuts `drag-acute-fallback`'s detour column at 45 degrees where
+  /// a `Shape::Rect` would leave it square.
+  #[test]
+  fn the_roundrect_corner_vertex_the_hull_diagonal_touches() {
+    let pad = the_acute_fallback_pad();
+    let outline = rounded_rectangle_outline(&pad, 225_000);
+    let centre = Vec2::new(146_225_000 + 225_000, 105_500_000 + 250_000);
+    let corner = outline
+      .iter()
+      .copied()
+      .max_by_key(|point| i64::from(point.x) + i64::from(point.y))
+      .expect("the outline has vertices");
+    let offset = corner - centre;
+
+    // 229_408 is 225_000 + the 4_408 the outward correction adds, taken
+    // at 45 degrees.
+    assert_eq!(offset, Vec2::new(162_216, 162_216));
+    assert_eq!(corner, Vec2::new(146_612_216, 105_912_216));
+  }
+
+  /// A roundrect whose corners eat the whole pad is a circle, and a
+  /// roundrect with no radius is a rectangle.
+  ///
+  /// `pcbnew/pad.cpp:1461` to `:1470` for the circle, whose single
+  /// subshape then keeps `syncPad` out of the polygon branch, and
+  /// `pcbnew/padstack.cpp:124` for the rectangle.
+  #[test]
+  fn the_two_roundrects_that_are_not_polygons() {
+    let mut pad = the_acute_fallback_pad();
+
+    pad.shape = PadShape::RoundedRectangle { ratio: 0.0 };
+    pad.size = Point {
+      x: 900_000,
+      y: 900_000,
+    };
+
+    assert!(matches!(pad_shape(&pad), Some(Shape::Rect { .. })));
+
+    pad.shape = PadShape::RoundedRectangle { ratio: 0.5 };
+
+    assert_eq!(
+      pad_shape(&pad),
+      Some(Shape::circle(Vec2::new(146_225_000, 105_500_000), 450_000))
+    );
   }
 }
