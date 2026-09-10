@@ -11,8 +11,8 @@
 //!
 //! # What is implemented
 //!
-//! Steps 1 to 5 of that order, which is the mark obstacles path end to
-//! end plus the post drag optimizer the other two paths finish with:
+//! Steps 1 to 8 of that order, which is all three drag routines for a
+//! segment or a corner:
 //!
 //! - [`Dragger::start`] with the mode decision of `startDragSegment`
 //!   (`:118`) and the state half of `startDragVia` (`:257`);
@@ -21,29 +21,29 @@
 //! - `dragMarkObstacles` (`:381`) for the segment and corner cases,
 //!   which is [`Dragger::drag`] in [`RouterMode::MarkObstacles`], in free
 //!   angle mode, and after any first drag failure;
+//! - `dragWalkaround` (`:709`) and `tryWalkaround` (`:685`), the
+//!   [`RouterMode::Walkaround`] path;
+//! - `dragShove` (`:802`) for the segment and corner cases, the
+//!   [`RouterMode::Shove`] path, which drives the [`Shove`]
+//!   [`Dragger::start`] built through the head protocol alone;
+//! - `optimizeAndUpdateDraggedLine` (`:569`), `bestAnchorForPoint`
+//!   (`:639`) and `pointHasBadCorner` (`:622`), where both of those end;
 //! - [`Dragger::traces`], [`Dragger::current_node`],
 //!   [`Dragger::current_nets`], [`Dragger::force_mark_obstacles_mode`],
-//!   [`Dragger::fix_route_node`] and [`Dragger::fix_route`] as far as
-//!   mark obstacles needs them;
-//! - `optimizeAndUpdateDraggedLine` (`:569`), `bestAnchorForPoint`
-//!   (`:639`) and `pointHasBadCorner` (`:622`), which **no path in this
-//!   revision of the module reaches yet**; see below.
+//!   [`Dragger::fix_route_node`] and [`Dragger::fix_route`].
 //!
 //! # What is not implemented yet
 //!
-//! - `dragWalkaround` (`:709`) and `tryWalkaround` (`:685`), step 6.
-//!   `Dragger::drag_walkaround` is a stub that falls back to mark
-//!   obstacles.
-//! - `dragShove` (`:802`), step 8. `Dragger::drag_shove` is the same
-//!   kind of stub. The [`Shove`] itself is already constructed by
-//!   [`Dragger::start`], because that is where KiCad builds it (`:325`)
-//!   and the node tree depends on it.
 //! - Everything about the via drag except the handles `startDragVia`
 //!   stores: `findViaFanoutByHandle` (`:267`), `dragViaMarkObstacles`
-//!   (`:452`), `dragViaWalkaround` (`:492`) and `propagateViaForces`
-//!   (`:62`), step 9.
+//!   (`:452`), `dragViaWalkaround` (`:492`), `propagateViaForces`
+//!   (`:62`) and `dragShove`'s `DM_VIA` case (`:908`), step 9. The three
+//!   drag routines all have a [`DragMode::Via`] arm and all three of them
+//!   move nothing; the two that can fail report failure there, so
+//!   [`Dragger::drag`] latches the mark obstacles fallback on the first
+//!   move of a via drag.
 //!
-//! # Why the post drag optimizer has no caller here
+//! # Where a drag ends
 //!
 //! Note 06 section 2.14 opens with "`optimizeAndUpdateDraggedLine` is
 //! where every successful drag ends, in all three modes". That is wrong
@@ -52,15 +52,6 @@
 //! (`dragShove`). `dragMarkObstacles` (`:381` to `:449`) never optimizes,
 //! which the note itself says two sections later and which is what makes
 //! a mark obstacles drag follow the cursor exactly.
-//!
-//! So the three routines below are built now, because every later step's
-//! geometry ends in them, and they stay unreachable until step 6 wires
-//! `dragWalkaround` up. The `#[expect(dead_code)]` on
-//! `Dragger::optimize_and_update_dragged_line` says exactly that, and the
-//! expectation itself becomes a warning the day the first caller lands,
-//! so it cannot be forgotten. Only the two anchor helpers have unit
-//! tests; the routine itself lands untested, because a test would make it
-//! live in the test build alone and turn that expectation into noise.
 //!
 //! # What is not ported at all
 //!
@@ -112,7 +103,8 @@ use crate::mouse_trail::MouseTrailTracer;
 use crate::node::{NodeId, World};
 use crate::optimizer::{EffortFlags, Optimizer};
 use crate::settings::RouterMode;
-use crate::shove::{Shove, ViaHandle};
+use crate::shove::{Shove, ShovePolicy, ShoveStatus, ViaHandle};
+use crate::walkaround::{WalkPolicy, Walkaround, WalkaroundStatus};
 
 // ---------------------------------------------------------------------
 // The mode
@@ -157,8 +149,32 @@ pub enum DragMode {
 /// like a slip. Note 06 section 8.5 lists it under "do not fix it",
 /// because a KiCad regression golden can see it, which is why
 /// [`Dragger::snap_threshold`] takes the divisor rather than hard coding
-/// one. Step 8 passes `2` here.
+/// one; see [`SHOVE_SNAP_DIVISOR`].
 const MARK_OBSTACLES_SNAP_DIVISOR: i32 = 4;
+
+/// The divisor `dragShove` applies instead.
+///
+/// `width / 2` at `:818`, under the same
+/// `//TODO: Make threshold configurable` comment as the other two sites.
+/// See [`MARK_OBSTACLES_SNAP_DIVISOR`] for why the difference is kept.
+const SHOVE_SNAP_DIVISOR: i32 = 2;
+
+// ---------------------------------------------------------------------
+// The walkaround budget
+// ---------------------------------------------------------------------
+
+/// How far a walkaround drag may stray before it gives up.
+///
+/// `walkaround.SetLengthLimit( true, 30.0 )` (`:692`). The walk is
+/// abandoned once the routed length exceeds this many times the direct
+/// length (`pcbnew/router/pns_walkaround.cpp:344`), so a single drag is
+/// allowed an enormous detour: this is **twenty times** the placer's
+/// [`crate::walkaround::DEFAULT_LENGTH_EXPANSION_FACTOR`] and ten times
+/// `MULTI_DRAGGER::tryWalkaround`'s 3.0
+/// (`pcbnew/router/pns_multi_dragger.cpp:391`). It is the number that
+/// lets `walk-with-teardrops` and `walk_drag_seg_against_board_edge`
+/// finish their walks at all.
+const DRAG_WALKAROUND_LENGTH_LIMIT_FACTOR: f64 = 30.0;
 
 // ---------------------------------------------------------------------
 // The dragger
@@ -617,9 +633,6 @@ impl Dragger {
   ///    the shove path ever updates, and never restores the via (note 06
   ///    erratum E4).
   ///
-  /// Until steps 6 and 8 land, `Dragger::drag_walkaround` and
-  /// `Dragger::drag_shove` fall back to mark obstacles, which always
-  /// succeeds, so points 2 to 4 cannot be observed yet.
   pub fn drag(
     &mut self,
     world: &mut World,
@@ -811,58 +824,305 @@ impl Dragger {
     context: &AlgoContext<'_>,
     node: NodeId,
   ) -> bool {
-    // `CheckColliding( const ITEM_SET& )` builds its own options with
-    // `m_limitCount = 1` (`pcbnew/router/pns_node.cpp:494`).
-    let options = CollisionSearchOptions {
-      limit_count: Some(1),
-      ..CollisionSearchOptions::default()
-    };
-
-    self.dragged_items.iter().any(|line| {
-      world
-        .check_colliding_line(node, line, context.resolver, &options)
-        .is_some()
-    })
+    self
+      .dragged_items
+      .iter()
+      .any(|line| line_collides(world, context, node, line))
   }
 
   /// Move the drag and bend it around what is in the way.
   ///
-  /// TODO(step 6): port `dragWalkaround` (`:709`) and `tryWalkaround`
-  /// (`:685`), whose length limit factor is **30.0** (`:692`), twenty
-  /// times the placer's. Note 06 section 10.2 step 6 has the detail; it
-  /// unlocks the `walk-with-teardrops` corpus case.
+  /// Port of `dragWalkaround` (`:709`). It drags the **original** line to
+  /// the new point exactly as the mark obstacles path does, then, only if
+  /// that shape runs into something, hands it to [`try_walkaround`] and
+  /// keeps the walked answer. Either way the result goes through
+  /// [`Dragger::optimize_and_update_dragged_line`], which is what makes a
+  /// walkaround drag come out tidier than a mark obstacles one.
   ///
-  /// Until then a walkaround drag is a mark obstacles drag, which is
-  /// exactly what `Drag`'s own fallback would produce for it on the first
-  /// failure (`:1029`).
+  /// Unlike `dragMarkObstacles` this can fail, and its failure is what
+  /// makes [`Dragger::drag`]'s first drag fallback and restore branch
+  /// reachable at all.
+  ///
+  /// # The threshold is `width / 4` here too
+  ///
+  /// `:727`, the same quarter as `dragMarkObstacles` and not the half
+  /// `dragShove` uses; see [`MARK_OBSTACLES_SNAP_DIVISOR`].
+  ///
+  /// # Two things not to tidy up
+  ///
+  /// `DragCorner( aP, idx )` at `:737` omits the free angle argument
+  /// where `dragMarkObstacles` passes `m_freeAngleMode` (`:407`). It
+  /// cannot matter: free angle mode is routed to `dragMarkObstacles`
+  /// before the mode switch is reached (`:1005`), so this routine never
+  /// runs with it set. The `false` below is that omission, spelled out.
+  ///
+  /// The collision probe at `:739` is against `m_world`, the **root**,
+  /// not against the branch this routine has just made. At that moment
+  /// the branch is a fresh copy of the pre drag node and still holds the
+  /// original line, so for a segment drag the two answer the same; note
+  /// 06 section 8.5 lists the difference under "do not fix it".
   fn drag_walkaround(
     &mut self,
     world: &mut World,
     context: &AlgoContext<'_>,
     at: Vec2,
   ) -> bool {
-    self.drag_mark_obstacles(world, context, at)
+    let mut ok = false;
+
+    // :714
+    if let Some(last) = self.last_node.take() {
+      world.drop_node(last);
+    }
+
+    // :720. KiCad dereferences `m_preDragNode` unchecked; see
+    // `Dragger::drag_mark_obstacles` for why it is always there.
+    let Some(pre_drag) = self.pre_drag_node else {
+      self.drag_status = false;
+
+      return false;
+    };
+    let last = world.branch(pre_drag);
+
+    self.last_node = Some(last);
+
+    match self.mode {
+      // :724
+      DragMode::Segment | DragMode::Corner => {
+        // :727
+        let threshold =
+          self.snap_threshold(context, MARK_OBSTACLES_SNAP_DIVISOR);
+        // :728 to :730
+        let mut original = self.dragged_line.clone();
+        let mut dragged = self.dragged_line.clone();
+
+        dragged.set_snap_threshold(threshold);
+
+        if self.mode == DragMode::Segment {
+          // :735
+          dragged.drag_segment(at, self.dragged_segment_index);
+        } else {
+          // :737
+          dragged.drag_corner(
+            at,
+            self.dragged_segment_index,
+            false,
+            Direction45::default(),
+          );
+        }
+
+        // :739
+        let mut walked =
+          if line_collides(world, context, self.world_node, &dragged) {
+            match try_walkaround(world, context, last, &dragged) {
+              Some(walked) => {
+                ok = true;
+
+                walked
+              }
+              // KiCad leaves `aWalk` assigned to `aOrig` on the way out of
+              // `tryWalkaround` (`:695`), which is what the point count
+              // test below then sees.
+              None => dragged,
+            }
+          } else {
+            // :745, :746
+            ok = true;
+
+            dragged
+          };
+
+        // :749
+        if walked.shape().point_count() < 2 {
+          ok = false;
+        }
+
+        if ok {
+          // :756. `NODE::Remove( LINE& )` clears the line's links on the
+          // way out, so `original` reaches the optimizer as geometry
+          // alone, which is all `changed_area` reads off it.
+          world.remove_line(last, &mut original);
+          // :757
+          self.optimize_and_update_dragged_line(
+            world,
+            context,
+            &mut walked,
+            &original,
+            at,
+          );
+        }
+      }
+      DragMode::Via => {
+        // :791, :792. TODO(step 9): `dragViaWalkaround( m_initialVia,
+        // m_lastNode, aP )`, `pcbnew/router/pns_dragger.cpp:492`. Until
+        // then a via walkaround drag fails, which is what KiCad answers
+        // when its force propagation cannot free the via, and
+        // `Dragger::drag` latches the mark obstacles fallback on the
+        // first one.
+        ok = false;
+      }
+    }
+
+    // :796
+    self.drag_status = ok;
+
+    ok
   }
 
   /// Move the drag and push what is in the way aside.
   ///
-  /// TODO(step 8): port `dragShove` (`:802`), which needs the
-  /// `preShoveNode->Remove( draggedPreShove )` ordering (`:830`),
-  /// `SHP_SHOVE | SHP_DONT_LOCK_ENDPOINTS` plus `SHP_REVERSED` for a
-  /// corner 0 drag (`:832`, `:837`), the `width / 2` snap threshold and
-  /// `Dragger::last_drag_solution` (`:858`). Note 06 section 4 confirms
-  /// [`Shove`] needs nothing new for it.
+  /// Port of `dragShove` (`:802`), the segment and corner cases. The
+  /// dragged line becomes a shove **head** and the engine does the rest;
+  /// note 06 section 4 confirms [`Shove`] needs nothing new for it.
   ///
-  /// Until then a shove drag is a mark obstacles drag. The [`Shove`] is
-  /// still built by [`Dragger::start`], because it owns a node in the
-  /// tree either way.
+  /// Four things decide the behaviour.
+  ///
+  /// 1. **The threshold is `width / 2`** (`:818`), not the quarter the
+  ///    other two paths use. See [`SHOVE_SNAP_DIVISOR`].
+  /// 2. **The removal at `:830` uses the links, not the geometry.**
+  ///    `draggedPreShove` has already been re-shaped by
+  ///    [`Line::drag_segment`], which does not touch the links, so
+  ///    [`World::remove_line`] takes the **original** segments out of the
+  ///    shove's node. `MULTI_DRAGGER` spells the same trick out in a
+  ///    comment (`pcbnew/router/pns_multi_dragger.cpp:731`); note 06
+  ///    section 8.5 lists it under "do not fix it".
+  /// 3. **[`ShovePolicy::REVERSED`] for a corner 0 drag** (`:836`). An
+  ///    open line has no orientation, and the shove's endpoint locking
+  ///    works from the far end, so dragging the line's **first** point
+  ///    has to say which end is pushing.
+  ///    [`ShovePolicy::DONT_LOCK_ENDPOINTS`] is set for every segment and
+  ///    corner drag, because both ends of a dragged line may legitimately
+  ///    move.
+  /// 4. **The branch is taken whether or not the run succeeded** (`:851`).
+  ///    On failure the shove has already rewound its own stack, so
+  ///    [`Shove::current_node`] is the pre run state and the branch is a
+  ///    clean copy of it.
+  ///
+  /// The optimizer's root line is [`Dragger::dragged_line`], the original
+  /// (`:857`), not the pre shove one.
+  ///
+  /// # `last_drag_solution` is written only here
+  ///
+  /// `:858`, and nowhere else outside the arc branch. Note 06 erratum E4:
+  /// [`Dragger::drag`]'s restore branch reads it after **any** failed non
+  /// first drag, so in walkaround mode it is still the original line from
+  /// `startDragSegment` (`:123`) and a failed walkaround drag snaps the
+  /// trace back to where it started rather than to the last good
+  /// position. That is transcribed rather than repaired: making the
+  /// walkaround path write it too would change what a failed drag looks
+  /// like, with no fixture asking for the change.
   fn drag_shove(
     &mut self,
     world: &mut World,
     context: &AlgoContext<'_>,
     at: Vec2,
   ) -> bool {
-    self.drag_mark_obstacles(world, context, at)
+    // :805
+    if let Some(last) = self.last_node.take() {
+      world.drop_node(last);
+    }
+
+    match self.mode {
+      // :813
+      DragMode::Segment | DragMode::Corner => {
+        // :818
+        let threshold = self.snap_threshold(context, SHOVE_SNAP_DIVISOR);
+        // :819, :820
+        let mut pre_shove = self.dragged_line.clone();
+
+        pre_shove.set_snap_threshold(threshold);
+
+        if self.mode == DragMode::Segment {
+          // :823
+          pre_shove.drag_segment(at, self.dragged_segment_index);
+        } else {
+          // :825
+          pre_shove.drag_corner(
+            at,
+            self.dragged_segment_index,
+            false,
+            Direction45::default(),
+          );
+        }
+
+        // :832, :836, :837
+        let mut policy = ShovePolicy::SHOVE | ShovePolicy::DONT_LOCK_ENDPOINTS;
+
+        if self.mode == DragMode::Corner && self.dragged_segment_index == 0 {
+          policy = policy | ShovePolicy::REVERSED;
+        }
+
+        // KiCad dereferences `m_shove` unchecked, and `Start` allocates
+        // it for exactly the state that reaches here (`:323`).
+        let Some(shove) = self.shove.as_mut() else {
+          self.drag_status = false;
+
+          return false;
+        };
+
+        // :827, :830
+        let pre_shove_node = shove.current_node();
+
+        world.remove_line(pre_shove_node, &mut pre_shove);
+
+        // :839 to :841
+        shove.clear_heads();
+        shove.add_head_line(pre_shove.clone(), policy);
+
+        let ok = shove.run(world, context) == ShoveStatus::Ok;
+        // :843
+        let mut post_shove = pre_shove;
+
+        // :847, :848
+        if ok
+          && shove.heads_modified(None)
+          && let Some(head) = shove.modified_head(0)
+        {
+          post_shove = head.clone();
+        }
+
+        // :851
+        let shove_node = shove.current_node();
+        let last = world.branch(shove_node);
+
+        self.last_node = Some(last);
+
+        if ok {
+          // :855, :856. Redundant with `:573` and `:574`, and
+          // transcribed anyway.
+          post_shove.clear_links();
+          post_shove.unmark(world, MarkerFlags::ALL);
+
+          // :857
+          let original = self.dragged_line.clone();
+
+          self.optimize_and_update_dragged_line(
+            world,
+            context,
+            &mut post_shove,
+            &original,
+            at,
+          );
+
+          // :858
+          self.last_drag_solution = post_shove;
+        }
+
+        // :861
+        self.drag_status = ok;
+      }
+      DragMode::Via => {
+        // :908. TODO(step 9): `DisablePostShoveOptimizations`,
+        // `AddHeads( m_draggedVia, aP, SHP_SHOVE )` and the
+        // `dragViaWalkaround` fallback,
+        // `pcbnew/router/pns_dragger.cpp:908` to `:948`. Until then a via
+        // shove drag fails and `Dragger::drag` latches the mark obstacles
+        // fallback on the first one, which moves nothing.
+        self.drag_status = false;
+      }
+    }
+
+    // :953
+    self.drag_status
   }
 
   /// Optimize the line a drag produced and put it in the drag node.
@@ -876,9 +1136,11 @@ impl Dragger {
   /// 1. The effort level is [`EffortFlags::MERGE_SEGMENTS`] plus
   ///    [`EffortFlags::MERGE_COLINEAR`] when
   ///    [`crate::settings::RoutingSettings::smooth_dragged_segments`] is
-  ///    set (`:580`). `REQUIRE_OBTUSE_ANGLES` (`:583`) has no counterpart
-  ///    in [`Optimizer`] yet; it is step 7 of note 06 section 10.2, and
-  ///    three of the seven corpus drag cases need it.
+  ///    set (`:580`), plus [`EffortFlags::REQUIRE_OBTUSE_ANGLES`] when
+  ///    [`crate::settings::RoutingSettings::restrict_angles`] is (`:583`).
+  ///    The second is the whole of what
+  ///    [`Optimizer::drag_fix_corners`] and [`crate::optimizer::Constraint::ObtuseOnly`]
+  ///    are for, and three of the seven corpus drag cases set it.
   /// 2. [`Optimizer::set_preserve_vertex`] turns
   ///    [`EffortFlags::PRESERVE_VERTEX`] on by itself, in KiCad as here,
   ///    which is why the effort level above never names it.
@@ -904,11 +1166,6 @@ impl Dragger {
   /// That repair belongs to step 9, where the via path is written and its
   /// only observable consequence, [`Dragger::traces`] under-reporting,
   /// can be tested; until then this is KiCad's line for line.
-  #[expect(
-    dead_code,
-    reason = "the walkaround and shove drags of steps 6 and 8 are its \
-              only callers; see the module documentation"
-  )]
   fn optimize_and_update_dragged_line(
     &mut self,
     world: &mut World,
@@ -936,11 +1193,10 @@ impl Dragger {
       effort |= EffortFlags::MERGE_COLINEAR;
     }
 
-    // :583. TODO(step 7): `Settings().GetRestrictAngles()` adds
-    // `OPTIMIZER::REQUIRE_OBTUSE_ANGLES`, which needs
-    // `Constraint::ObtuseOnly` and `Optimizer::drag_fix_corners`
-    // (`pcbnew/router/pns_optimizer.cpp:305`, `:738`, `:801`); the
-    // placeholder comment is already at `src/optimizer.rs`'s `:709`.
+    // :583
+    if context.settings.restrict_angles {
+      effort |= EffortFlags::REQUIRE_OBTUSE_ANGLES;
+    }
 
     optimizer.set_effort_level(effort);
 
@@ -1082,6 +1338,72 @@ impl Dragger {
 }
 
 // ---------------------------------------------------------------------
+// The walkaround
+// ---------------------------------------------------------------------
+
+/// Whether a line runs into anything in a node.
+///
+/// The `NODE::CheckColliding( const ITEM* )` overload
+/// (`pcbnew/router/pns_node.h:342`), which the dragger asks twice: of the
+/// root, about a freshly dragged line (`:739`, `:545`), and of the drag
+/// node, about everything the drag is moving (`:446`). KiCad's builds its
+/// own options with `m_limitCount = 1`
+/// (`pcbnew/router/pns_node.cpp:494`), since the answer is a yes or a no.
+fn line_collides(
+  world: &World,
+  context: &AlgoContext<'_>,
+  node: NodeId,
+  line: &Line,
+) -> bool {
+  let options = CollisionSearchOptions {
+    limit_count: Some(1),
+    ..CollisionSearchOptions::default()
+  };
+
+  world
+    .check_colliding_line(node, line, context.resolver, &options)
+    .is_some()
+}
+
+/// Walk one line around whatever is in its way, or fail.
+///
+/// Port of `tryWalkaround` (`:685`), four setters and one call.
+/// [`None`] is KiCad's false, where the caller keeps the unwalked line.
+///
+/// Only [`WalkPolicy::Shortest`] runs (`:693`), so there is no best of
+/// three to pick from, and the length limit is
+/// [`DRAG_WALKAROUND_LENGTH_LIMIT_FACTOR`] rather than the default
+/// (`:692`). `SetSolidsOnly( false )` (`:688`) lets the walk go around
+/// tracks as well as pads, and `SetIterationLimit` (`:691`) re-imposes
+/// the setting [`Walkaround::new`] has already installed, exactly as the
+/// shove's own call does.
+fn try_walkaround(
+  world: &mut World,
+  context: &AlgoContext<'_>,
+  node: NodeId,
+  original: &Line,
+) -> Option<Line> {
+  // :687
+  let mut walkaround = Walkaround::new(node, context.settings);
+
+  // :688
+  walkaround.set_solids_only(false);
+  // :691
+  walkaround.set_iteration_limit(context.settings.walkaround_iteration_limit);
+  // :692
+  walkaround.set_length_limit(true, DRAG_WALKAROUND_LENGTH_LIMIT_FACTOR);
+  // :693
+  walkaround.set_allowed_policies(&[WalkPolicy::Shortest]);
+
+  // :695, :697
+  let result = walkaround.route(world, context, original);
+
+  // :699 to :704
+  (result.status(WalkPolicy::Shortest) == WalkaroundStatus::Done)
+    .then(|| result.into_line(WalkPolicy::Shortest))
+}
+
+// ---------------------------------------------------------------------
 // The post drag anchor
 // ---------------------------------------------------------------------
 
@@ -1207,8 +1529,11 @@ mod tests {
       dragger.snap_threshold(&context, MARK_OBSTACLES_SNAP_DIVISOR),
       50_000
     );
-    // `:818`, the shove's `width / 2`, which step 8 will pass.
-    assert_eq!(dragger.snap_threshold(&context, 2), 100_000);
+    // `:818`, the shove's `width / 2`.
+    assert_eq!(
+      dragger.snap_threshold(&context, SHOVE_SNAP_DIVISOR),
+      100_000
+    );
   }
 
   #[test]

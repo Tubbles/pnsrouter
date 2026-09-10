@@ -78,10 +78,18 @@
 //! - **The diff pair path**, `mergeDpSegments`, `mergeDpStep`,
 //!   `coupledBypass` and `verifyDpBypass`, together with `Tighten` and
 //!   its helpers, which nothing calls.
-//! - **`dragFixCorners` / `dragFixCorner` and `OBTUSE_ONLY_CONSTRAINT`**,
-//!   selected by `REQUIRE_OBTUSE_ANGLES`. That flag is a dragger feature
-//!   and arrives with the dragger, so it has no [`EffortFlags`] constant
-//!   here.
+//!
+//! # The drag only pass
+//!
+//! [`EffortFlags::REQUIRE_OBTUSE_ANGLES`] selects two things at once,
+//! [`Constraint::ObtuseOnly`] and [`Optimizer::drag_fix_corners`], and
+//! only a drag ever asks for it: `DRAGGER::optimizeAndUpdateDraggedLine`
+//! under `GetRestrictAngles()` (`pcbnew/router/pns_dragger.cpp:583`) and
+//! `ROUTER_TOOL::OptimizeSelected` for the same reason. It is the one
+//! pass that runs **before** [`Optimizer::merge_full`]
+//! (`pcbnew/router/pns_optimizer.cpp:709`), because it rewrites the
+//! corner the drag anchored on and every later pass then works on the
+//! rewritten line.
 //!
 //! # No singleton
 //!
@@ -187,10 +195,6 @@ pub const MERGE_PASS_LIMIT: usize = 100_000;
 /// crate carries no runtime dependencies, see `DESIGN.md` section 10; it
 /// follows [`crate::item::Kind`].
 ///
-/// `REQUIRE_OBTUSE_ANGLES` (`0x400`) has no constant here: it selects
-/// `dragFixCorners` and `OBTUSE_ONLY_CONSTRAINT`, which are a dragger
-/// feature and are not ported yet. A host passing that bit through
-/// [`EffortFlags::from_bits`] keeps it and it is ignored.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, Default)]
 pub struct EffortFlags(u32);
 
@@ -283,6 +287,19 @@ impl EffortFlags {
   /// again for via drags with a comment calling that a hack
   /// (`pcbnew/router/pns_dragger.cpp:912`); neither changes an answer.
   pub const LIMIT_CORNER_COUNT: EffortFlags = EffortFlags(0x200);
+
+  /// Keep every corner obtuse or straight, and fix the one the drag
+  /// anchored on. Port of `REQUIRE_OBTUSE_ANGLES = 0x400`,
+  /// `pcbnew/router/pns_optimizer.h:110`, whose comment reads "Try to
+  /// prevent 90-degree or acute corners in a drag".
+  ///
+  /// It selects [`Constraint::ObtuseOnly`] (`:703`) and
+  /// [`Optimizer::drag_fix_corners`] (`:709`) together; there is no way
+  /// to ask for one and not the other. Its two callers in KiCad's tree
+  /// are both drags, and both gate it on `GetRestrictAngles()`
+  /// (`pcbnew/router/pns_dragger.cpp:583`), which
+  /// [`crate::settings::RoutingSettings::restrict_angles`] is.
+  pub const REQUIRE_OBTUSE_ANGLES: EffortFlags = EffortFlags(0x400);
 
   /// The raw bits, in KiCad's numbering.
   pub const fn bits(self) -> u32 {
@@ -514,6 +531,18 @@ pub enum Constraint {
   /// [`LineChain::point_inside`], because the two disagree on boundary
   /// cases.
   KeepTopology,
+  /// Every corner the replacement makes has to be obtuse or straight.
+  ///
+  /// Port of `OBTUSE_ONLY_CONSTRAINT`,
+  /// `pcbnew/router/pns_optimizer.h:350`, checked at
+  /// `pcbnew/router/pns_optimizer.cpp:305`. It looks at the corners
+  /// **inside** the replacement and at the two seams where it joins the
+  /// path on either side, and refuses the lot unless every one of them is
+  /// obtuse or straight.
+  ///
+  /// KiCad's constructor takes the node and never reads it, so there is
+  /// nothing to carry here.
+  ObtuseOnly,
 }
 
 impl Constraint {
@@ -538,8 +567,88 @@ impl Constraint {
         check_preserve_vertex(*vertex, candidate)
       }
       Constraint::KeepTopology => check_keep_topology(world, node, candidate),
+      Constraint::ObtuseOnly => check_obtuse_only(candidate),
     }
   }
+}
+
+/// The mask a corner has to fall in for [`Constraint::ObtuseOnly`].
+///
+/// The `ANG_OBTUSE | ANG_STRAIGHT` of `isAngleOk`
+/// (`pcbnew/router/pns_optimizer.cpp:316`). [`AngleType::RIGHT`] is
+/// **not** in it, and `DIRECTION_45( seg )` is built with the default
+/// `a90 = false`, so a 90 degree corner classifies as
+/// [`AngleType::RIGHT`] and is refused.
+const OBTUSE_OR_STRAIGHT: AngleType =
+  AngleType::OBTUSE.union(AngleType::STRAIGHT);
+
+/// Whether the corner between two segments is obtuse or straight.
+///
+/// Port of the `isAngleOk` lambda,
+/// `pcbnew/router/pns_optimizer.cpp:311` to `:317`.
+fn is_angle_ok(first: &Seg, second: &Seg) -> bool {
+  Direction45::from_seg(first, false)
+    .angle(Direction45::from_seg(second, false))
+    .intersects(OBTUSE_OR_STRAIGHT)
+}
+
+/// The body of [`Constraint::ObtuseOnly`].
+///
+/// Port of `OBTUSE_ONLY_CONSTRAINT::Check`,
+/// `pcbnew/router/pns_optimizer.cpp:305`.
+///
+/// The `vertex1 - 1 < path_segments` half of the first seam test has no
+/// counterpart in KiCad, which reads the segment unchecked. It cannot
+/// fire for a candidate [`Optimizer::merge_step`] builds, where `vertex1`
+/// is a segment index of the path, and it keeps a candidate a caller
+/// builds by hand from panicking on [`LineChain::segment`].
+fn check_obtuse_only(candidate: &Candidate<'_>) -> bool {
+  let Candidate {
+    vertex1,
+    vertex2,
+    current_path,
+    replacement,
+    ..
+  } = *candidate;
+
+  // :319. A replacement of no segments has no corner to judge.
+  let replacement_segments = replacement.segment_count();
+
+  if replacement_segments < 1 {
+    return true;
+  }
+
+  // :322. Every corner inside the replacement.
+  for index in 0..replacement_segments - 1 {
+    if !is_angle_ok(
+      &replacement.segment(index),
+      &replacement.segment(index + 1),
+    ) {
+      return false;
+    }
+  }
+
+  let path_segments = current_path.segment_count();
+  // :329, :330
+  let first = replacement.segment(0);
+  let last = replacement.segment(replacement_segments - 1);
+
+  // :333. The seam with what comes before the span.
+  if vertex1 > 0
+    && vertex1 - 1 < path_segments
+    && !is_angle_ok(&current_path.segment(vertex1 - 1), &first)
+  {
+    return false;
+  }
+
+  // :339. The seam with what comes after it.
+  if vertex2 < path_segments
+    && !is_angle_ok(&last, &current_path.segment(vertex2))
+  {
+    return false;
+  }
+
+  true
 }
 
 /// The body of [`Constraint::Area`].
@@ -1673,8 +1782,16 @@ impl Optimizer {
       self.constraints.push(Constraint::KeepTopology);
     }
 
-    // :709. `REQUIRE_OBTUSE_ANGLES` and `dragFixCorners` arrive with the
-    // dragger.
+    // :703
+    if self.effort.contains(EffortFlags::REQUIRE_OBTUSE_ANGLES) {
+      self.constraints.push(Constraint::ObtuseOnly);
+    }
+
+    // :709. The one pass that runs before `mergeFull`, so that everything
+    // after it works on the line with its bad corner already bypassed.
+    if self.effort.contains(EffortFlags::REQUIRE_OBTUSE_ANGLES) {
+      changed |= self.drag_fix_corners(world, context, result);
+    }
 
     // :713
     if self.effort.contains(EffortFlags::MERGE_SEGMENTS) {
@@ -1814,6 +1931,222 @@ impl Optimizer {
   // -----------------------------------------------------------------
   // The passes
   // -----------------------------------------------------------------
+
+  /// Replace one bad corner with the 45 degree bypass that encloses the
+  /// least area.
+  ///
+  /// Port of `OPTIMIZER::dragFixCorner`,
+  /// `pcbnew/router/pns_optimizer.cpp:738`. `vertex_index` names the
+  /// corner, which is bad when the two segments meeting there make an
+  /// angle of [`AngleType::RIGHT`], [`AngleType::ACUTE`] or
+  /// [`AngleType::HALF_FULL`]; anything else is left alone.
+  ///
+  /// The bypass runs from the far end of the segment before the corner to
+  /// the far end of the segment after it, in each of the two postures.
+  /// One that collides is dropped, and of the survivors the winner is the
+  /// one whose closed loop against the original corner has the smallest
+  /// area. That comparison is the only floating point in the pass, over
+  /// at most two candidates, so it cannot make the answer depend on
+  /// anything but the geometry.
+  ///
+  /// The corner mode is **not** consulted: `DIRECTION_45()` is default
+  /// constructed at `:767`, so the bypass is always mitered at 45
+  /// degrees, where [`Optimizer::merge_step`] passes the setting through
+  /// (`:883`).
+  ///
+  /// The arc guard of `:745` has no counterpart until arcs land.
+  pub fn drag_fix_corner(
+    &self,
+    world: &World,
+    context: &AlgoContext<'_>,
+    line: &mut Line,
+    vertex_index: usize,
+  ) -> bool {
+    // :742
+    if vertex_index == 0 || vertex_index + 1 >= line.shape().point_count() {
+      return false;
+    }
+
+    // :748, :749
+    let before = line.shape().segment(vertex_index - 1);
+    let after = line.shape().segment(vertex_index);
+    let corner = line.shape().point(vertex_index);
+
+    // :751, :753
+    let angle = Direction45::from_seg(&before, false)
+      .angle(Direction45::from_seg(&after, false));
+
+    if angle != AngleType::RIGHT
+      && angle != AngleType::ACUTE
+      && angle != AngleType::HALF_FULL
+    {
+      return false;
+    }
+
+    // :756 to :760. A corner outside the restricted area is not this
+    // drag's business.
+    if self.effort.contains(EffortFlags::RESTRICT_AREA)
+      && let Some(area) = self.restrict_area
+      && !area.contains_point(Vec2L::from(corner))
+    {
+      return false;
+    }
+
+    let mut best_bypass: Option<LineChain> = None;
+    let mut best_area = f64::MAX;
+
+    // :765. Posture 0 is straight leg first, posture 1 diagonal first,
+    // the same way round as in `merge_step`.
+    for posture in 0..POSTURE_COUNT {
+      let bypass = LineChain::from_points(
+        Direction45::default().build_initial_trace(
+          before.a,
+          after.b,
+          posture == 1,
+          CornerMode::Mitered45,
+        ),
+        false,
+      );
+
+      // :769
+      if bypass.segment_count() < 1 {
+        continue;
+      }
+
+      // :772
+      if self.check_colliding_path(world, context, line, &bypass) {
+        continue;
+      }
+
+      // :775 to :783. The closed loop between the corner and the bypass,
+      // whose area says how much the bypass cuts off.
+      let mut enclosed = LineChain::new();
+
+      enclosed.append(before.a);
+      enclosed.append(corner);
+      enclosed.append(after.b);
+
+      for index in (0..bypass.point_count()).rev() {
+        enclosed.append(bypass.point(index));
+      }
+
+      enclosed.set_closed(true);
+
+      // :785
+      let area = enclosed.area(true);
+
+      if area < best_area {
+        best_area = area;
+        best_bypass = Some(bypass);
+      }
+    }
+
+    // :792
+    let Some(best_bypass) = best_bypass else {
+      return false;
+    };
+
+    // :795, :796. `s1.Index()` is `vertex_index - 1` and `s2.Index()` is
+    // `vertex_index`, and `Replace` takes point indices.
+    let path = line.chain_mut();
+
+    path.replace_with_chain(vertex_index - 1, vertex_index, &best_bypass);
+    path.simplify2(true);
+
+    true
+  }
+
+  /// Fix the corner the drag anchored on, and its neighbours.
+  ///
+  /// Port of `OPTIMIZER::dragFixCorners`,
+  /// `pcbnew/router/pns_optimizer.cpp:801`, the pass
+  /// [`EffortFlags::REQUIRE_OBTUSE_ANGLES`] selects. The anchor is the
+  /// preserved vertex when there is one and the line's last point
+  /// otherwise (`:807`), which is the point the drag pinned; the pass
+  /// only ever touches the corner there.
+  ///
+  /// When the anchor sits in the middle of a straight run the corner on
+  /// **either** side of it is fixed, because a straight anchor is not
+  /// itself a corner and the drag's bad corner is then one vertex away
+  /// (`:830` to `:839`). The re-`Find` between the two calls is not
+  /// redundant: the first fix rewrites the chain, so the anchor's index
+  /// moves.
+  ///
+  /// The internal `REQUIRE_OBTUSE_ANGLES` test at `:803` duplicates the
+  /// call site's guard at `:709` and is transcribed rather than dropped,
+  /// so that a caller reaching the pass directly answers as KiCad does.
+  ///
+  /// The arc guard of `:814` has no counterpart until arcs land.
+  pub fn drag_fix_corners(
+    &self,
+    world: &World,
+    context: &AlgoContext<'_>,
+    line: &mut Line,
+  ) -> bool {
+    // :803
+    if !self.effort.contains(EffortFlags::REQUIRE_OBTUSE_ANGLES) {
+      return false;
+    }
+
+    // :807. KiCad reads `CLastPoint()` unchecked, which is out of range
+    // for an empty chain; there is nothing to anchor on then.
+    let anchor = if self.effort.contains(EffortFlags::PRESERVE_VERTEX) {
+      self.preserved_vertex
+    } else {
+      match line.shape().last_point() {
+        Some(point) => point,
+        None => return false,
+      }
+    };
+
+    // :809, :811. An anchor that is not a vertex, or is the first one,
+    // has no corner before it to fix.
+    let Some(anchor_index) = line.shape().find(anchor, 0) else {
+      return false;
+    };
+
+    if anchor_index == 0 {
+      return false;
+    }
+
+    // :819. The anchor is the last point, so the only corner it has is
+    // the one before it. KiCad re-tests `anchorIdx > 0` at `:821`, which
+    // `:811` has already decided.
+    if anchor_index + 1 >= line.shape().point_count() {
+      return self.drag_fix_corner(world, context, line, anchor_index - 1);
+    }
+
+    // :827
+    let before = line.shape().segment(anchor_index - 1);
+    let after = line.shape().segment(anchor_index);
+    let angle = Direction45::from_seg(&before, false)
+      .angle(Direction45::from_seg(&after, false));
+
+    // :830
+    if angle != AngleType::STRAIGHT {
+      // :842
+      return self.drag_fix_corner(world, context, line, anchor_index);
+    }
+
+    // :832
+    let mut changed =
+      self.drag_fix_corner(world, context, line, anchor_index - 1);
+
+    // :834, :835. The fix above moved the anchor, so its index is looked
+    // up again.
+    line.chain_mut().split(anchor);
+
+    let Some(anchor_index) = line.shape().find(anchor, 0) else {
+      return changed;
+    };
+
+    // :837, :838
+    if anchor_index > 0 && anchor_index + 1 < line.shape().point_count() {
+      changed |= self.drag_fix_corner(world, context, line, anchor_index + 1);
+    }
+
+    changed
+  }
 
   /// Replace spans of the line with two segment bypasses, coarse to
   /// fine.
@@ -2816,6 +3149,159 @@ mod tests {
 
     // A point the replacement also passes through is fine.
     assert!(check_preserve_vertex(Vec2::new(0, 0), &candidate));
+  }
+
+  /// A bypass whose own two segments meet at an acute corner is refused,
+  /// and the obtuse bypass over the same span is taken.
+  ///
+  /// The path is a straight run along x, so the two seams at `:333` and
+  /// `:339` are not what decides either answer; only the corner inside
+  /// the replacement is.
+  #[test]
+  fn the_obtuse_only_constraint_judges_the_corner_inside_a_replacement() {
+    let path = LineChain::from_slice(
+      &[
+        Vec2::new(0, 0),
+        Vec2::new(1000, 0),
+        Vec2::new(2000, 0),
+        Vec2::new(3000, 0),
+      ],
+      false,
+    );
+    let origin = Line::new();
+
+    // Out along a 45 degree diagonal and straight back: the two legs meet
+    // at 45 degrees, which is `ANG_ACUTE`.
+    let acute = LineChain::from_slice(
+      &[
+        Vec2::new(1000, 0),
+        Vec2::new(1500, -500),
+        Vec2::new(2000, 0),
+      ],
+      false,
+    );
+
+    assert!(!check_obtuse_only(&Candidate {
+      vertex1: 1,
+      vertex2: 2,
+      origin_line: &origin,
+      current_path: &path,
+      replacement: &acute,
+    }));
+
+    // The same span bridged by a straight leg and a 45 degree one, which
+    // meet at 135 degrees: `ANG_OBTUSE`.
+    let obtuse = LineChain::from_slice(
+      &[
+        Vec2::new(1000, 0),
+        Vec2::new(1500, 0),
+        Vec2::new(2000, -500),
+      ],
+      false,
+    );
+
+    assert!(check_obtuse_only(&Candidate {
+      vertex1: 1,
+      vertex2: 2,
+      origin_line: &origin,
+      current_path: &path,
+      replacement: &obtuse,
+    }));
+  }
+
+  /// The two seams where a replacement joins the path are judged as well,
+  /// and a right angle is refused there.
+  ///
+  /// The replacement is a single segment, so the loop at `:322` runs zero
+  /// times and only `:333` and `:339` can answer.
+  #[test]
+  fn the_obtuse_only_constraint_judges_both_seams() {
+    let origin = Line::new();
+    // A path that turns through a right angle at (1000, 0).
+    let path = LineChain::from_slice(
+      &[Vec2::new(0, 0), Vec2::new(1000, 0), Vec2::new(1000, 1000)],
+      false,
+    );
+    // Replacing the second segment by itself leaves that right angle as
+    // the seam at `aVertex1 - 1`.
+    let same = LineChain::from_slice(
+      &[Vec2::new(1000, 0), Vec2::new(1000, 1000)],
+      false,
+    );
+
+    assert!(!check_obtuse_only(&Candidate {
+      vertex1: 1,
+      vertex2: 2,
+      origin_line: &origin,
+      current_path: &path,
+      replacement: &same,
+    }));
+
+    // The mirror image: the seam at `aVertex2` is the right angle.
+    assert!(!check_obtuse_only(&Candidate {
+      vertex1: 0,
+      vertex2: 1,
+      origin_line: &origin,
+      current_path: &path,
+      replacement: &LineChain::from_slice(
+        &[Vec2::new(0, 0), Vec2::new(1000, 0)],
+        false,
+      ),
+    }));
+
+    // A span at the very start of the path has no seam before it, and a
+    // span running to the very end has none after it, so a lone segment
+    // covering the whole path is always allowed.
+    let straight =
+      LineChain::from_slice(&[Vec2::new(0, 0), Vec2::new(2000, 0)], false);
+
+    assert!(check_obtuse_only(&Candidate {
+      vertex1: 0,
+      vertex2: 2,
+      origin_line: &origin,
+      current_path: &straight,
+      replacement: &straight,
+    }));
+  }
+
+  /// An empty replacement is allowed, which is `:319`.
+  #[test]
+  fn the_obtuse_only_constraint_allows_an_empty_replacement() {
+    let origin = Line::new();
+    let path = LineChain::from_slice(
+      &[Vec2::new(0, 0), Vec2::new(1000, 0), Vec2::new(1000, 1000)],
+      false,
+    );
+    let empty = LineChain::new();
+
+    assert!(check_obtuse_only(&Candidate {
+      vertex1: 1,
+      vertex2: 2,
+      origin_line: &origin,
+      current_path: &path,
+      replacement: &empty,
+    }));
+  }
+
+  /// The flag reaches the constraint list through
+  /// [`Optimizer::optimize`]'s assembly at `:703`.
+  #[test]
+  fn require_obtuse_angles_adds_the_obtuse_only_constraint() {
+    let world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let root = world.root();
+    let resolver = FixedClearance::uniform(100);
+    let settings = RoutingSettings::default();
+    let context = AlgoContext::new(&resolver, &settings);
+    let mut optimizer = Optimizer::new(root);
+
+    optimizer.set_effort_level(EffortFlags::REQUIRE_OBTUSE_ANGLES);
+
+    let line = Line::new();
+    let mut result = Line::new();
+
+    optimizer.optimize(&world, &context, &line, &mut result, None);
+
+    assert_eq!(optimizer.constraints(), &[Constraint::ObtuseOnly]);
   }
 
   #[test]

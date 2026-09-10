@@ -13,10 +13,10 @@
 //! 1. **The session terminates and does not panic**, and nothing it left
 //!    behind violates the rules it ran under. Asserted for every case
 //!    whose events this crate can replay. The two halves are separate
-//!    assertions, because the drag cases reach the first and not yet the
-//!    second; see below.
+//!    assertions, because the drag cases reached the first before they
+//!    reached the second; every case reaches both now.
 //! 2. **The counts of added and removed items equal the golden stored in
-//!    the log.** All four routing cases reach it, and two of the seven
+//!    the log.** All four routing cases reach it, and five of the seven
 //!    drag cases. Should one stop, the convention is to `#[ignore]` its
 //!    tier 2 test with the measured and the expected numbers in the
 //!    reason string, so `cargo test -- --ignored` still shows the
@@ -59,18 +59,37 @@
 //! `support::kicad_replay::unresolved_uuids` checks, and a case matched
 //! to the wrong board would fail it.
 //!
-//! # Why the drag cases stop short of collision freedom
+//! # Where the two drag cases that still miss their golden diverge
 //!
-//! Seven of the eleven cases open with `EVT_START_DRAG`. All seven replay
-//! now, but only through the mark obstacles drag: `DRAGGER::dragWalkaround`
-//! and `dragShove` are steps 6 and 8 of note 06 section 10.2 and
-//! `src/dragger.rs` falls back to `dragMarkObstacles` for both. Mark
-//! obstacles is the routine that follows the cursor exactly and only
-//! **reports** what it runs into (`pcbnew/router/pns_dragger.cpp:443`), so
-//! six of the seven end with the dragged trace lying across something,
-//! which is the answer KiCad gives in that mode too. Their tier 1
-//! collision test is therefore `#[ignore]`d with the measured count in the
-//! reason, and their "replays" test runs.
+//! Seven of the eleven cases open with `EVT_START_DRAG`. All seven replay,
+//! all seven leave nothing colliding, and five of the seven match their
+//! golden. The two that do not diverge in the **snapshot the harness
+//! builds**, not in the drag:
+//!
+//! - `drag-acute-fallback` detours around pad 2 of `C1`, a rounded
+//!   rectangle. `support::kicad_snapshot` maps every rectangular pad,
+//!   rounded or not, to a
+//!   [`pnsrouter::geometry::shape::Shape::Rect`] and drops the corner
+//!   radius, and `BuildHullForPrimitiveShape` gives an `SH_RECT` an
+//!   octagonal hull with **no** chamfer
+//!   (`pcbnew/router/pns_utils.cpp:488`). KiCad's own pad sync sees a
+//!   roundrect as a compound of five shapes, so it falls to the polygon
+//!   branch (`pcbnew/router/pns_kicad_iface.cpp:1733`) and gets
+//!   `ConvexHull` (`pcbnew/router/pns_utils.cpp:300`), whose diagonals are
+//!   pushed in until they touch the outline. The crate's detour therefore
+//!   hugs a square corner where KiCad's cuts it at 45 degrees, and comes
+//!   out one segment shorter.
+//! - `walk-with-teardrops` has one pair of parallel tracks at exactly the
+//!   0.2 mm net class clearance. `support::kicad_snapshot`'s
+//!   `RuleResolver::clearance_epsilon` answers zero, where KiCad's rule
+//!   resolver answers the board's DRC epsilon
+//!   (`pcbnew/router/pns_kicad_iface.cpp:338`, subtracted at `:972`), so
+//!   the pair collides here and does not there. The whole drag then goes
+//!   through a walkaround it should never have needed, and that walk
+//!   circles the board.
+//!
+//! Neither is a drag defect and neither is loosened here; both are
+//! recorded in `SUGGESTIONS.md`.
 //!
 //! `EVT_START_MULTIDRAG` is still refused, and no case in the corpus
 //! emits one.
@@ -370,11 +389,11 @@ fn simple_shove_1_matches_the_golden() {
 // The seven drag cases
 // ---------------------------------------------------------------------
 
-// Three tests per case. The "replays" test always runs; the collision
-// test and the tier 2 test are `#[ignore]`d, with the measured numbers in
-// their reason strings, wherever the mark obstacles drag does not reach
-// them yet. Every one of the seven is a mid segment or via drag: not one
-// corpus case is a corner drag (note 06 section 10.1).
+// Three tests per case. All three run wherever the drag reaches them;
+// where a golden does not agree yet the tier 2 test is `#[ignore]`d with
+// the measured numbers in its reason string. Every one of the seven is a
+// mid segment or via drag: not one corpus case is a corner drag (note 06
+// section 10.1).
 
 /// The longest log in the corpus, 858 events of one drag, in walkaround
 /// mode with `restrict_angles`.
@@ -388,16 +407,15 @@ fn drag_acute_fallback_replays() {
 
 /// Tier 1's collision half for the case above.
 #[test]
-#[ignore = "the walkaround drag is step 6: 1 colliding segment in the live \
-            session, 0 committed"]
 fn drag_acute_fallback_leaves_nothing_colliding() {
   assert_collision_free(&replay_case(&load("drag-acute-fallback")));
 }
 
-/// Tier 2 for the case above.
+/// Tier 2 for the case above, which the roundrect pad hull keeps one
+/// segment short; see the module documentation.
 #[test]
-#[ignore = "measured added 7 versus golden 11, measured removed 6 versus \
-            golden 6"]
+#[ignore = "the roundrect pad hull has no 45 degree chamfer here: measured \
+            added 10 versus golden 11, measured removed 6 versus golden 6"]
 fn drag_acute_fallback_matches_the_golden() {
   assert_tier_two(&replay_case(&load("drag-acute-fallback")));
 }
@@ -413,16 +431,13 @@ fn drag_walk_optimize_a_replays() {
 
 /// Tier 1's collision half for the case above.
 #[test]
-#[ignore = "the walkaround drag is step 6: 1 colliding segment in the live \
-            session, 0 committed"]
 fn drag_walk_optimize_a_leaves_nothing_colliding() {
   assert_collision_free(&replay_case(&load("drag-walk-optimize-a")));
 }
 
-/// Tier 2 for the case above.
+/// Tier 2 for the case above, the first golden `REQUIRE_OBTUSE_ANGLES`
+/// unlocked.
 #[test]
-#[ignore = "measured added 7 versus golden 9, measured removed 6 versus \
-            golden 6"]
 fn drag_walk_optimize_a_matches_the_golden() {
   assert_tier_two(&replay_case(&load("drag-walk-optimize-a")));
 }
@@ -438,16 +453,13 @@ fn drag_walk_optimize_fix_corners_replays() {
 
 /// Tier 1's collision half for the case above.
 #[test]
-#[ignore = "the walkaround drag is step 6: 2 colliding segments in the live \
-            session, 0 committed"]
 fn drag_walk_optimize_fix_corners_leaves_nothing_colliding() {
   assert_collision_free(&replay_case(&load("drag-walk-optimize-fix-corners")));
 }
 
-/// Tier 2 for the case above.
+/// Tier 2 for the case above, and the one that names
+/// `OPTIMIZER::dragFixCorners` in its own title.
 #[test]
-#[ignore = "measured added 3 versus golden 9, measured removed 3 versus \
-            golden 3"]
 fn drag_walk_optimize_fix_corners_matches_the_golden() {
   assert_tier_two(&replay_case(&load("drag-walk-optimize-fix-corners")));
 }
@@ -466,8 +478,8 @@ fn issue23449_shove_lone_via_drag_crash_replays_without_a_violation() {
 /// The log holds one `EVT_START_DRAG` on a lone via and 102 moves, and
 /// KiCad answered with nothing added and nothing removed, so the case is
 /// a pure crash regression (note 05 section 6.9). This crate answers with
-/// nothing too, and for a second reason: `dragViaMarkObstacles` is step 9
-/// of note 06 section 10.2, so a via drag currently starts, reports
+/// nothing too, and for a second reason: the via drag is step 9 of note
+/// 06 section 10.2, so a via drag currently starts, reports
 /// [`pnsrouter::dragger::DragMode::Via`] and moves nothing. The test is
 /// kept un-ignored because it is a real regression guard against a panic
 /// and against the drag suddenly reporting geometry, and note 06 asks for
@@ -490,20 +502,18 @@ fn simple_drag_shove_singlelayer_replays() {
 
 /// Tier 1's collision half for the case above.
 #[test]
-#[ignore = "the shove drag is step 8: 1 colliding segment in the live \
-            session, 0 committed"]
 fn simple_drag_shove_singlelayer_leaves_nothing_colliding() {
   assert_collision_free(&replay_case(&load("simple-drag-shove-singlelayer")));
 }
 
-/// Tier 2 for the case above.
+/// Tier 2 for the case above, by far the largest golden in the corpus.
 ///
-/// The golden is 134 added and 139 removed across ten nets, all of it the
-/// shove cascade the drag head pushes; the mark obstacles fallback moves
-/// one trace and touches nothing else, which is the whole of the gap.
+/// 134 added and 139 removed across ten nets, all of it the shove cascade
+/// the drag head pushes, so it is the real test of `dragShove`: the
+/// dragged line goes in as one head under
+/// `SHP_SHOVE | SHP_DONT_LOCK_ENDPOINTS` and everything else in the
+/// answer is what the shove engine did with it.
 #[test]
-#[ignore = "measured added 18 versus golden 134, measured removed 18 versus \
-            golden 139"]
 fn simple_drag_shove_singlelayer_matches_the_golden() {
   assert_tier_two(&replay_case(&load("simple-drag-shove-singlelayer")));
 }
@@ -520,17 +530,16 @@ fn walk_with_teardrops_replays() {
 
 /// Tier 1's collision half for the case above.
 #[test]
-#[ignore = "the walkaround drag is step 6: 3 colliding segments in the live \
-            session, 0 committed"]
 fn walk_with_teardrops_leaves_nothing_colliding() {
   assert_collision_free(&replay_case(&load("walk-with-teardrops")));
 }
 
-/// Tier 2 for the case above, the only walkaround drag case that does not
-/// set `restrict_angles` and therefore the honest first golden for step 6.
+/// Tier 2 for the case above, which the zero clearance epsilon sends
+/// round the board; see the module documentation.
 #[test]
-#[ignore = "measured added 19 versus golden 17, measured removed 19 versus \
-            golden 19"]
+#[ignore = "a pair of tracks at exactly the net class clearance collides \
+            under a zero clearance epsilon: measured added 15 versus \
+            golden 17, measured removed 19 versus golden 19"]
 fn walk_with_teardrops_matches_the_golden() {
   assert_tier_two(&replay_case(&load("walk-with-teardrops")));
 }
@@ -546,21 +555,20 @@ fn walk_drag_seg_against_board_edge_replays() {
 
 /// Tier 1's collision half for the case above.
 #[test]
-#[ignore = "the shove drag is step 8: 2 colliding segments in the live \
-            session, 0 committed"]
 fn walk_drag_seg_against_board_edge_leaves_nothing_colliding() {
   assert_collision_free(&replay_case(&load(
     "walk_drag_seg_against_board_edge",
   )));
 }
 
-/// Tier 2 for the case above, which agrees with the golden today.
+/// Tier 2 for the case above, which agrees with the golden vertex for
+/// vertex.
 ///
-/// The drag is one 73 mm segment of a 1 mm track moved sideways, so both
-/// the golden and the mark obstacles fallback report the three segments
-/// of the assembled line out and three back in. The counts agreeing is
-/// therefore not the geometry agreeing, and step 8 may well move them;
-/// the test is here so that a change says so.
+/// The drag is one 73 mm segment of a 1 mm track moved sideways into the
+/// board outline. The counts agreed before the shove drag landed as well,
+/// because three segments went out and three came back either way; the
+/// geometry did not, and it does now. Tier 3 is not asserted anywhere in
+/// this file, so that agreement is recorded here rather than checked.
 #[test]
 fn walk_drag_seg_against_board_edge_matches_the_golden() {
   assert_tier_two(&replay_case(&load("walk_drag_seg_against_board_edge")));
