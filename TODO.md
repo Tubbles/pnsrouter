@@ -26,12 +26,11 @@ Deferred during milestone 2 (world model):
 - Line versus line collisions (`pns_item.cpp:133`) are not supported since lines are never stored; the shove (`pns_shove.cpp:318`, `:481`) and optimizer (`pns_optimizer.cpp:1356`) call sites must decompose one side into segments when they are ported. The multi dragger's (`pns_multi_dragger.cpp:321`) is done, through `World::collide_lines`, which decomposes the obstacle side.
 - `check_colliding_items` (`src/node.rs`) takes items only, not lines, for the same reason.
 - The via self collision heuristic was retired (log entry of 2026-09-08). Two distinct stored vias at one position with equal padstack, net and drill now collide hole to hole; revert `consider_hole_to_hole` in `src/collide.rs` if a shove fixture disagrees.
-- The 90 degree corner mode hull simplification in `NearestObstacle` (`pns_node.cpp:330`) needs the routing settings and lands with the walkaround.
 
 Deferred during milestone 3 (walkaround router):
 
 - The preview via has no hole item, so `via_pushout_force` resolves copper clearances only (`pns_via.cpp:126` gives KiCad's via a hole). Add a synthetic hole to the preview via when hole to copper rules matter for via placement.
-- `Sizes::via_layer_range` and `Sizes::layer_top`/`layer_bottom` need the board's copper layer count for through vias; the crate carries none. Give `Sizes` or the world a layer count when the facade is designed.
+- `Sizes::via_layer_range` lets the registered layer pair decide the span of every via type where KiCad gives a through via the whole board (documented deviation in `src/settings.rs`). `WorldSnapshot` carries `copper_layer_count` since the facade, so `Sizes` could consult it; a host that wants KiCad's rule registers the outermost pair for now.
 - The dead pad orientation and last segment postures of `LINE_PLACER::Start` (`pns_line_placer.cpp:1408`, `:1415`) are not computed; wiring them into `SetDefaultDirections` is a routing change that needs a fixture.
 - `LINE_PLACER::AbortPlacement` (`pns_line_placer.cpp:2150`) has no caller and is not ported.
 - The via pushout keeps KiCad's discarded `force.Resize( threshold )` (`pns_via.cpp:207`); capping the step is a behaviour change to decide with a shove fixture.
@@ -70,13 +69,13 @@ Deferred during LibrePCB step 7 (2026-09-09):
 
 Deferred during LibrePCB step 8 (2026-09-09):
 
-- Raise the Slint contract additions with upstream before any PR: `EditorTool.route-trace`, `RouterMode`, two `TabAction` values, two `Board2dTabData` properties, one helper. They are additive but `types.slint` is shared with every tab.
+- Raise the Slint contract additions with upstream before any PR: `EditorTool.route-trace`, `RouterMode`, `RouterTuningMode`, eight `TabAction` values (`tool-route-trace`, `record-routing-sessions`, `router-flip-posture`, `router-via-toggle`, the spacing and amplitude steps) and the thirteen `tool-router-*`, `tool-diff-pair-*` and `tool-tuning-*` properties on `Board2dTabData` (42 added lines in `types.slint` against master). They are additive but `types.slint` is shared with every tab.
 
 Deferred during the latency measurement (2026-09-09):
 
 - Shove mode is not interactive on a large board: median 56 ms per `move_to` and 80 of 96 moves over the 16 ms frame budget on a 20 000 segment board (`doc/performance.md`). The cost is the shove cascade, not the index, and no local fix changes it. The options are the iteration budget, an early bail out when the cascade is not converging, or KiCad's thread pool.
 - `Line::walkaround` (`src/line.rs:1840`) allocates one `Vec` per graph vertex for a neighbour list of at most three entries, about 3% of `move_to`. An inline list would remove it, but it needs a hand rolled type (no new dependencies) and a proof that no vertex can exceed three neighbours.
-- `RoutingSettings::shove_iteration_limit` stays at KiCad's 250. On both measured boards a limit of 50 gave the same route with a sixth of the worst case move time. Revisit with fixtures from real boards before moving the default, and consider exposing it to LibrePCB.
+- `RoutingSettings::shove_iteration_limit` stays at KiCad's 250. On both measured boards a limit of 50 gave the same route with a sixth of the worst case move time. Revisit with fixtures from real boards before moving the default. LibrePCB exposes it as the workspace setting `pnsShoveIterationLimit`.
 - `World::invalidate_caches` (`src/node.rs:3222`) scans both caches once per removed item where KiCad batches (`pns_kicad_iface.cpp:792`). Measured at zero benefit when removed entirely, so it is left alone. Revisit only if a profile on a real board disagrees.
 - `Router::new` is 62 ms for a 20 573 item board, which is the cost a host pays for every full re-sync. That is the incremental sync item already listed under LibrePCB step 6.
 
