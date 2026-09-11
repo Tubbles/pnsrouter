@@ -104,3 +104,9 @@ Deferred during the LibrePCB keepout zones and the milestone 9 to 11 hosts (2026
 - Zones on device footprints are not synced: their layer flags go through the device transform and a host id for one needs a reference `BI_Zone*` cannot carry.
 - The LibrePCB multi drag gesture is wired (press one of several selected traces) but unreachable by hand, because `BoardEditorState_Select::exit` clears the board selection when the select tool is left (`boardeditorstate_select.cpp:173`). The fix is one decision in that `exit`, and it is LibrePCB's, not the crate's.
 - Differential pairs and length tuning have no LibrePCB UI (on hold with the pair identification); the crate's entries are `start_routing_diff_pair`, `start_tuning`, `start_tuning_diff_pair`, `start_tuning_skew`.
+
+Deferred during the LibrePCB tuning UI (2026-09-11):
+
+- `MeanderSettings::new` can refuse a request (zero step, round corners), which is not a `StartError`, so the LibrePCB FFI invents its own refusal value; a `StartError::MeanderSettings(..)` variant would remove that seam.
+- `spacing_step` is floored by the tuned trace's width plus clearance and nothing exposes the floor, so a host cannot tell a swallowed decrease from an applied one.
+- `amplitude_step` and `spacing_step` produce no frame; the host has to follow each with a `move_to`. Returning the frame would drop that friction from three host layers.
