@@ -14,8 +14,6 @@ Deferred during milestone 1 (geometry foundation), each with the place it surfac
 - `LineChain::nearest_point` lost KiCad's `aAllowInternalShapePoints` flag because its body is inert without arcs (`shape_line_chain.cpp:2425`). Restore it with the arc vectors; `pns_shove.cpp:359` passes `true` and `pns_helpers.cpp:98` passes `false`.
 - Rounded rectangle outline is not polygonised (`src/geometry/shape.rs`, `rect_outline`); the sharp outline is a conservative superset. The router never builds a rounded rect (`pns_utils.cpp:356` leaves the radius at zero). Port `ROUNDRECT::TransformToPolygon` only if a host ever supplies one.
 - `Shape::Compound` bounding box passes the clearance down where KiCad drops it (`shape_compound.cpp:78`); if a fixture ever depends on KiCad's under grown box, revisit.
-- `LineChain::PointAlong` (`shape_line_chain.cpp:2671`) landed with multi drag on 2026-09-10 as `LineChain::point_along`; its one caller is still `clipToOtherLine` (`pns_multi_dragger.cpp:313`).
-- `VECTOR2D` needs no port: the meander turtle only turns by 90 degrees so its direction stays integer, and the only genuine doubles are three compile time constants (note 08 section 8). Closed 2026-09-10.
 - `EDA_ANGLE` is used by `SOLID` orientation (`pns_solid.h`) and, in the dragger, only inside `startDragArc` (arcs, on hold); `Seg::angle_degrees` returns bare `f64` degrees. Decide on an angle newtype when the item model needs solid orientation (note 06 section 9 corrects the earlier claim that the dragger needs it).
 - `RotatePoint` from `trigo.h` (note 01 section 1.4) is not used by either dragger (note 06 section 9); find its remaining callers when the item model needs rotation.
 - The polygon union in `SOLID::Hull` and `HOLE::Hull` (`pns_solid.cpp:55`, `pns_hole.cpp:84`) is replaced by a convex hull of the per primitive hulls per DESIGN.md section 3. Measure against a KiCad fixture with a complex pad once fixtures exist; a tighter union may matter for dense pad rows.
@@ -24,7 +22,6 @@ Deferred during milestone 1 (geometry foundation), each with the place it surfac
 Deferred during milestone 2 (world model):
 
 - `INDEX::SetDeferred` / `BuildSpatialIndex`, KiCad's bulk load for the initial board sync (`pns_index.cpp:55`, `pns_node.cpp:1257`), is not ported. Measure the root index build on a large board before adding a second insertion path.
-- The parallel obstacle scan of `NODE::NearestObstacle` (`pns_node.cpp:437`) is ported as of milestone 8 and defaults to off: the profile said the threads cost more than they save. See `doc/work/008-parallel-obstacle-query.md`.
 - `NODE::FixupVirtualVias` (`pns_node.cpp:1282`) is not ported; note 02 records two errata in it (a dead `n_seg >= 3` branch, a `locked_seg` that leaks across joints). Decide with the shove work item.
 - Line versus line collisions (`pns_item.cpp:133`) are not supported since lines are never stored; the shove (`pns_shove.cpp:318`, `:481`) and optimizer (`pns_optimizer.cpp:1356`) call sites must decompose one side into segments when they are ported. The multi dragger's (`pns_multi_dragger.cpp:321`) is done, through `World::collide_lines`, which decomposes the obstacle side.
 - `check_colliding_items` (`src/node.rs`) takes items only, not lines, for the same reason.
@@ -33,7 +30,6 @@ Deferred during milestone 2 (world model):
 
 Deferred during milestone 3 (walkaround router):
 
-- `update_leading_ratline` (`src/placer/line_placer.rs`) is a stub: it needs `TOPOLOGY::LeadingRatLine` / `NearestUnconnectedItem` (`pns_topology.cpp`), which land with the session facade.
 - The preview via has no hole item, so `via_pushout_force` resolves copper clearances only (`pns_via.cpp:126` gives KiCad's via a hole). Add a synthetic hole to the preview via when hole to copper rules matter for via placement.
 - `Sizes::via_layer_range` and `Sizes::layer_top`/`layer_bottom` need the board's copper layer count for through vias; the crate carries none. Give `Sizes` or the world a layer count when the facade is designed.
 - The dead pad orientation and last segment postures of `LINE_PLACER::Start` (`pns_line_placer.cpp:1408`, `:1415`) are not computed; wiring them into `SetDefaultDirections` is a routing change that needs a fixture.
@@ -44,7 +40,6 @@ Deferred during milestone 4 (shove):
 
 - The via anti snap loop in `src/shove.rs` is bounded at 1000 iterations and returns `Incomplete`; KiCad's is unbounded. Revisit if a fixture needs more.
 - `World::collide_lines` (`src/node.rs`) does not decompose a via on the obstacle side; every shove call site keeps the via carrying line on the head side. Needed only if a future caller collides two via ended lines.
-- `ShoveDraggingVia` is declared and never defined in KiCad. Decided in milestone 9 (2026-09-10): it does not exist here either. `dragShove`'s `DM_VIA` case leaves the call commented out (`pns_dragger.cpp:919`) and drives the via through `AddHeads( VIA_HANDLE, pos, policy )` and `Run` like any other head, which is what `Dragger::drag_shove` does.
 - `reduceSpringback` keeps its bottom frame (`pns_shove.cpp:926`), so the first move's shove is sticky within a session; reproduced, worth a look with a real board fixture.
 - Arcs throughout the shove are marked `TODO(arcs)`.
 
@@ -58,7 +53,6 @@ Deferred during LibrePCB step 4 (2026-09-09):
 - `Router::undo_last_segment` right after `fix_route` answers `None` because the fix clears the head; faithful to KiCad, whose host always moves in between, but a host friendly facade could answer the fixed tail's last point instead. Documented in `BoardPnsRouter::getPreview()` for now.
 - Expose `Router::assign_host_ids` over the FFI before step 5: without it a second route in the same session does not recognise the board objects the first commit became.
 - Add `clang-format` to `dev/Containerfile` so LibrePCB C++ can be formatted in the container; step 4's files were formatted by hand.
-- `dev/librepcb-in-container.sh cargo clippy --lib` on rust-core skips the `ffi` module; document `--features ffi` wherever the check is listed.
 
 Deferred during LibrePCB step 6 (2026-09-09):
 
@@ -103,7 +97,6 @@ Deferred during the LibrePCB keepout zones and the milestone 9 to 11 hosts (2026
 - Zones reach the preview as collision items only; `BoardPnsPreviewStyle::SemiSolid` is still never emitted, and drawing the zone's triangles semi solid while routing is now possible.
 - Zones on device footprints are not synced: their layer flags go through the device transform and a host id for one needs a reference `BI_Zone*` cannot carry.
 - The LibrePCB multi drag gesture is wired (press one of several selected traces) but unreachable by hand, because `BoardEditorState_Select::exit` clears the board selection when the select tool is left (`boardeditorstate_select.cpp:173`). The fix is one decision in that `exit`, and it is LibrePCB's, not the crate's.
-- Differential pairs and length tuning have no LibrePCB UI (on hold with the pair identification); the crate's entries are `start_routing_diff_pair`, `start_tuning`, `start_tuning_diff_pair`, `start_tuning_skew`.
 
 Deferred during the LibrePCB tuning UI (2026-09-11):
 
