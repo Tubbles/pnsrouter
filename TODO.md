@@ -67,7 +67,6 @@ Deferred during LibrePCB step 5 (2026-09-09):
 
 Deferred during LibrePCB step 6 (2026-09-09):
 
-- The shortcuts reference sheet (`utils/shortcutsreferencegenerator.cpp`) is one full page; a second page or a tighter layout is needed before any router command (tool shortcut, via toggle, undo segment, mode cycle, posture flip) can be registered in `EditorCommandSet`.
 - `BoardPnsRouter::getCommit()` returns a reference the session owns while `stopRouting()` returns by value; the tool copies before rebuilding the session. Make both by value or document the trap.
 - Add `BoardPnsCommit::isEmpty()`.
 - `BoardPnsRouter::undoLastSegment()` returns the leg's start for cursor warping, which `BoardEditorFsmAdapter` cannot do; either add a cursor warp to the adapter or drop the return value.
@@ -86,7 +85,6 @@ Deferred during LibrePCB step 8 (2026-09-09):
 
 - Raise the Slint contract additions with upstream before any PR: `EditorTool.route-trace`, `RouterMode`, two `TabAction` values, two `Board2dTabData` properties, one helper. They are additive but `types.slint` is shared with every tab.
 - Corner mode could move into `BoardPnsRouter::Settings` so a rebuilt session starts where the user left it without the state re-toggling it.
-- Step 9 manual test on the laptop: all three modes on a two layer and a four layer board, DRC before and after, plus the twelve step scripts from steps 6 to 8 in this session's transcript (right click was replaced by the tool button and Shift+W in step 8).
 
 Deferred during the latency measurement (2026-09-09):
 
@@ -103,7 +101,6 @@ Deferred during the session recording work (2026-09-09):
 Deferred during the M7 close (2026-09-09):
 
 - cargo-fuzz targets for `SessionRecording::from_text` and for random shape pairs through `collide` (no panic, symmetric answer) need a nightly toolchain; run them as a CI job on nightly rather than in the container, which pins 1.92.0 and has a read only rustup directory.
-- 0.1.0 is the user's to publish; the runbook is in `doc/work/007-hardening-and-release.md`.
 
 Requested by the user (2026-09-10):
 
