@@ -47,4 +47,6 @@ The LibrePCB side checks, all from this repository (the build directory is alrea
     dev/librepcb-in-container.sh sh -c 'cd build && ninja -j16 librepcb_unittests'
     dev/librepcb-in-container.sh sh -c 'xvfb-run -a ./build/tests/unittests/librepcb-unittests --gtest_filter="BoardPns*"'
 
+The fork carries feature branches that stay separate until upstreamed: `pns-router` (this crate's integration), `fix-selection-rect-performance` (an upstream regression fix), and later `diff-pairs`, `compare-trace-lengths` and `pns-router-pairs`. The branch `integration` is upstream master plus every feature branch merged, for the user to test everything at once. It is disposable: when a feature branch changes, recreate it from master (`git worktree add tmp/integration -b integration <master sha>` after deleting the old branch locally and on the fork with `git push origin --delete integration`, never a force push), merge each feature branch, push, remove the worktree. Small additions can also be merged into the existing branch.
+
 Plain `--lib` does not compile the `ffi` module and `--all-targets` fails on pre-existing test lints in rust-core, so `--lib --features ffi` is the clippy check that matters. `clang-format` is not in the image yet.
