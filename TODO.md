@@ -102,6 +102,5 @@ Deferred during the LibrePCB keepout zones and the milestone 9 to 11 hosts (2026
 
 - Zones reach the preview as collision items only; `BoardPnsPreviewStyle::SemiSolid` is still never emitted, and drawing the zone's triangles semi solid while routing is now possible.
 - Zones on device footprints are not synced: their layer flags go through the device transform and a host id for one needs a reference `BI_Zone*` cannot carry.
-- `CommitDiff::moved_solids` (a component drag) is not applied by `CmdBoardApplyPnsCommit`, so the host refuses a pad drag; applying it means moving the device instance in the same undo group (note section 4.8).
-- Multi drag has no LibrePCB gesture: the router tool passes one host id. A selection driven drag from the select tool would give the crate several.
+- The LibrePCB multi drag gesture is wired (press one of several selected traces) but unreachable by hand, because `BoardEditorState_Select::exit` clears the board selection when the select tool is left (`boardeditorstate_select.cpp:173`). The fix is one decision in that `exit`, and it is LibrePCB's, not the crate's.
 - Differential pairs and length tuning have no LibrePCB UI (on hold with the pair identification); the crate's entries are `start_routing_diff_pair`, `start_tuning`, `start_tuning_diff_pair`, `start_tuning_skew`.
