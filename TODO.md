@@ -60,15 +60,8 @@ Deferred during LibrePCB step 4 (2026-09-09):
 - Add `clang-format` to `dev/Containerfile` so LibrePCB C++ can be formatted in the container; step 4's files were formatted by hand.
 - `dev/librepcb-in-container.sh cargo clippy --lib` on rust-core skips the `ffi` module; document `--features ffi` wherever the check is listed.
 
-Deferred during LibrePCB step 5 (2026-09-09):
-
-- `BoardPnsHostRef` and `BoardPnsNewItem::net` hold const pointers because the snapshot is built from a `const Board&`, while every editor command takes non const references, so `CmdBoardApplyPnsCommit` casts in three places. Either build the snapshot from `Board&` or keep the casts and say why in the header.
-- `BoardPnsNewItem` is one struct carrying both a segment's and a via's fields; a `std::variant` would make the invalid states unrepresentable.
-
 Deferred during LibrePCB step 6 (2026-09-09):
 
-- `BoardPnsRouter::getCommit()` returns a reference the session owns while `stopRouting()` returns by value; the tool copies before rebuilding the session. Make both by value or document the trap.
-- Add `BoardPnsCommit::isEmpty()`.
 - `BoardPnsRouter::undoLastSegment()` returns the leg's start for cursor warping, which `BoardEditorFsmAdapter` cannot do; either add a cursor warp to the adapter or drop the return value.
 - The whole board is re-snapshotted after every commit; measure on a large board in step 9 and consider `assign_host_ids` plus an incremental sync.
 
@@ -84,7 +77,6 @@ Deferred during LibrePCB step 7 (2026-09-09):
 Deferred during LibrePCB step 8 (2026-09-09):
 
 - Raise the Slint contract additions with upstream before any PR: `EditorTool.route-trace`, `RouterMode`, two `TabAction` values, two `Board2dTabData` properties, one helper. They are additive but `types.slint` is shared with every tab.
-- Corner mode could move into `BoardPnsRouter::Settings` so a rebuilt session starts where the user left it without the state re-toggling it.
 
 Deferred during the latency measurement (2026-09-09):
 
@@ -108,7 +100,6 @@ Requested by the user (2026-09-10):
 
 Deferred during the LibrePCB keepout zones and the milestone 9 to 11 hosts (2026-09-10):
 
-- `RoutingSettings::allow_drc_violations` (KiCad's "Allow DRC violations") is not on `PnsRouterSettings` or `BoardPnsRouter::Settings`, so mark obstacles mode can never commit a colliding route from LibrePCB; one field on each.
 - Zones reach the preview as collision items only; `BoardPnsPreviewStyle::SemiSolid` is still never emitted, and drawing the zone's triangles semi solid while routing is now possible.
 - Zones on device footprints are not synced: their layer flags go through the device transform and a host id for one needs a reference `BI_Zone*` cannot carry.
 - `CommitDiff::moved_solids` (a component drag) is not applied by `CmdBoardApplyPnsCommit`, so the host refuses a pad drag; applying it means moving the device instance in the same undo group (note section 4.8).
