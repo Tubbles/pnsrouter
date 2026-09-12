@@ -2061,7 +2061,7 @@ fn circle_nearest_point(center: Vec2, radius: i32, point: Vec2) -> Vec2 {
 /// `sqrt(1/2)` rather than through the rescaling. `rescale` for `double`
 /// is the generic template (`libs/kimath/include/math/util.h:135`), a
 /// plain `numerator * value / denominator`.
-fn resize_f64(x: f64, y: f64, new_length: f64) -> (f64, f64) {
+pub(crate) fn resize_f64(x: f64, y: f64, new_length: f64) -> (f64, f64) {
   if x == 0.0 && y == 0.0 {
     return (0.0, 0.0);
   }
@@ -2107,7 +2107,7 @@ fn kiround_f64_pair(point: (f64, f64)) -> Vec2 {
 /// and truncate towards zero. Note it truncates where
 /// [`kiround_f64_pair`] rounds; `ConstructFromStartEndAngle` takes this
 /// path and the three point centre takes the other.
-fn truncate_f64_pair(point: (f64, f64)) -> Vec2 {
+pub(crate) fn truncate_f64_pair(point: (f64, f64)) -> Vec2 {
   Vec2::new(truncate_f64_to_i32(point.0), truncate_f64_to_i32(point.1))
 }
 

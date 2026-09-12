@@ -1001,14 +1001,11 @@ impl DiffPair {
 /// direction, so the posture argument decides and the corner mode is the
 /// mitered 45 default.
 fn build_trace(from: Vec2, to: Vec2, prefer_diagonal: bool) -> LineChain {
-  LineChain::from_points(
-    Direction45::default().build_initial_trace(
-      from,
-      to,
-      prefer_diagonal,
-      CornerMode::Mitered45,
-    ),
-    false,
+  Direction45::default().build_initial_trace(
+    from,
+    to,
+    prefer_diagonal,
+    CornerMode::Mitered45,
   )
 }
 

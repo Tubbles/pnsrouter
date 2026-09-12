@@ -3646,9 +3646,8 @@ pub fn simplified_hull(
   hull: Rc<LineChain>,
   corner_mode: CornerMode,
 ) -> Rc<LineChain> {
-  // :326. KiCad tests `MITERED_90 || ROUNDED_90`; this crate has no
-  // rounded modes yet, see `CornerMode`.
-  if corner_mode != CornerMode::Mitered90 {
+  // :326, `MITERED_90 || ROUNDED_90`.
+  if !corner_mode.is_90_degree() {
     return hull;
   }
 

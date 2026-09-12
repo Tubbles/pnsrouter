@@ -2699,17 +2699,21 @@ impl Router {
   ///
   /// Port of `ROUTER::ToggleCornerMode`
   /// (`pcbnew/router/pns_router.cpp:1069`), which writes the new mode
-  /// back into the settings object. KiCad's cycle is
+  /// back into the settings object. The cycle is KiCad's,
   /// `MITERED_45 -> ROUNDED_45 -> MITERED_90 -> ROUNDED_90 ->
-  /// MITERED_45`; the two rounded modes need an arc body
-  /// (`DESIGN.md` section 3), so this crate has the two mitered ones and
-  /// the cycle is between them.
+  /// MITERED_45` (`:1075` to `:1078`).
+  ///
+  /// A host that cannot store an arc track has to keep the user off this
+  /// cycle, or refuse the two rounded modes where it applies the
+  /// settings; see [`CornerMode::is_rounded`].
   pub fn toggle_corner_mode(&mut self) {
     self.record(SessionEvent::ToggleCornerMode);
 
     self.settings.corner_mode = match self.settings.corner_mode {
-      CornerMode::Mitered45 => CornerMode::Mitered90,
-      CornerMode::Mitered90 => CornerMode::Mitered45,
+      CornerMode::Mitered45 => CornerMode::Rounded45,
+      CornerMode::Rounded45 => CornerMode::Mitered90,
+      CornerMode::Mitered90 => CornerMode::Rounded90,
+      CornerMode::Rounded90 => CornerMode::Mitered45,
     };
   }
 

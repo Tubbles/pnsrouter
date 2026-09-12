@@ -436,14 +436,11 @@ impl MouseTrailTracer {
     // (`libs/kimath/include/geometry/direction45.h:236`). The posture
     // solver therefore always reasons in 45 degree corners, whatever the
     // routing settings say.
-    let mut straight = LineChain::from_points(
-      Direction45::default().build_initial_trace(
-        first,
-        at,
-        false,
-        CornerMode::Mitered45,
-      ),
+    let mut straight = Direction45::default().build_initial_trace(
+      first,
+      at,
       false,
+      CornerMode::Mitered45,
     );
 
     // :117. The straight candidate is closed before the trail is
@@ -460,14 +457,11 @@ impl MouseTrailTracer {
     let area_straight = straight.area(true);
 
     // :125
-    let mut diagonal = LineChain::from_points(
-      Direction45::default().build_initial_trace(
-        first,
-        at,
-        true,
-        CornerMode::Mitered45,
-      ),
-      false,
+    let mut diagonal = Direction45::default().build_initial_trace(
+      first,
+      at,
+      true,
+      CornerMode::Mitered45,
     );
 
     // :126. KiCad appends first and closes afterwards here, the opposite

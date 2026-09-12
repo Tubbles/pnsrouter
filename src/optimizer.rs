@@ -1742,10 +1742,23 @@ impl Optimizer {
   ///
   /// # Arcs
   ///
-  /// KiCad skips four of the six passes when the line contains an arc
-  /// (`:660`, `:713`, `:717`, `:724`, `:728`). There is no arc type in
-  /// this crate yet (`DESIGN.md` section 3), so the guard is documented
-  /// rather than written; it comes back with the arcs.
+  /// Four of the six passes are skipped outright when the line holds an
+  /// arc (`:660`, `:713`, `:717`, `:724`, `:728`), each with a
+  /// `// TODO: Fix for arcs` comment in KiCad: [`Optimizer::merge_full`],
+  /// [`Optimizer::merge_obtuse`], [`Optimizer::run_smart_pads`] and
+  /// [`Optimizer::fanout_cleanup`]. What still runs on a line with arcs
+  /// is [`Optimizer::merge_colinear`], which carries its own arc guards,
+  /// and [`Optimizer::drag_fix_corners`], which is reached through
+  /// `REQUIRE_OBTUSE_ANGLES` and is not gated (`:703` to `:710`).
+  ///
+  /// The gate reads the **input** line's arc count, once, before any
+  /// pass runs (`:660`), so a pass that introduces an arc does not close
+  /// the gate behind itself. That is reachable rather than theoretical:
+  /// [`Optimizer::merge_step`] passes the corner mode through to
+  /// `BuildInitialTrace` (`:883`), so in a rounded mode `mergeFull` can
+  /// put an arc into a line that had none, and the passes after it still
+  /// run on it. Reproduced, the alternative being to re-read the count
+  /// between passes, which KiCad does not.
   pub fn optimize(
     &mut self,
     world: &World,
@@ -1760,6 +1773,9 @@ impl Optimizer {
     // :657
     *result = line.clone();
     result.clear_links();
+
+    // :660
+    let has_arcs = line.shape().arc_count() > 0;
 
     // See the deviation on `clear_constraints`.
     self.clear_constraints();
@@ -1805,12 +1821,12 @@ impl Optimizer {
     }
 
     // :713
-    if self.effort.contains(EffortFlags::MERGE_SEGMENTS) {
+    if !has_arcs && self.effort.contains(EffortFlags::MERGE_SEGMENTS) {
       changed |= self.merge_full(world, context, result);
     }
 
     // :717
-    if self.effort.contains(EffortFlags::MERGE_OBTUSE) {
+    if !has_arcs && self.effort.contains(EffortFlags::MERGE_OBTUSE) {
       changed |= self.merge_obtuse(world, context, result);
     }
 
@@ -1822,12 +1838,12 @@ impl Optimizer {
     // :724. This one reports "changed" for any line of three points or
     // more, whether or not it moved anything; see
     // `Optimizer::run_smart_pads`.
-    if self.effort.contains(EffortFlags::SMART_PADS) {
+    if !has_arcs && self.effort.contains(EffortFlags::SMART_PADS) {
       changed |= self.run_smart_pads(world, context, result);
     }
 
     // :728
-    if self.effort.contains(EffortFlags::FANOUT_CLEANUP) {
+    if !has_arcs && self.effort.contains(EffortFlags::FANOUT_CLEANUP) {
       changed |= self.fanout_cleanup(world, context, result);
     }
 
@@ -1965,7 +1981,12 @@ impl Optimizer {
   /// degrees, where [`Optimizer::merge_step`] passes the setting through
   /// (`:883`).
   ///
-  /// The arc guard of `:745` has no counterpart until arcs land.
+  /// The arc guard of `:745`, `:746` is live: this pass is reached
+  /// through `REQUIRE_OBTUSE_ANGLES`, which
+  /// [`Optimizer::optimize`]'s arc gate does not cover (`:703` to
+  /// `:710`), so it can be handed a line holding an arc. A corner either
+  /// of whose segments belongs to an arc is left alone, the bypass being
+  /// a pair of straight legs that would cut the curve off.
   pub fn drag_fix_corner(
     &self,
     world: &World,
@@ -1975,6 +1996,13 @@ impl Optimizer {
   ) -> bool {
     // :742
     if vertex_index == 0 || vertex_index + 1 >= line.shape().point_count() {
+      return false;
+    }
+
+    // :745, :746
+    if line.shape().is_arc_segment(vertex_index - 1)
+      || line.shape().is_arc_segment(vertex_index)
+    {
       return false;
     }
 
@@ -2009,14 +2037,11 @@ impl Optimizer {
     // :765. Posture 0 is straight leg first, posture 1 diagonal first,
     // the same way round as in `merge_step`.
     for posture in 0..POSTURE_COUNT {
-      let bypass = LineChain::from_points(
-        Direction45::default().build_initial_trace(
-          before.a,
-          after.b,
-          posture == 1,
-          CornerMode::Mitered45,
-        ),
-        false,
+      let bypass = Direction45::default().build_initial_trace(
+        before.a,
+        after.b,
+        posture == 1,
+        CornerMode::Mitered45,
       );
 
       // :769
@@ -2087,7 +2112,10 @@ impl Optimizer {
   /// call site's guard at `:709` and is transcribed rather than dropped,
   /// so that a caller reaching the pass directly answers as KiCad does.
   ///
-  /// The arc guard of `:814` has no counterpart until arcs land.
+  /// The arc guard of `:814`, `:815` is live for the reason given on
+  /// [`Optimizer::drag_fix_corner`], and it bails the **whole** pass
+  /// rather than one corner: the anchor is the only corner this pass
+  /// ever looks at.
   pub fn drag_fix_corners(
     &self,
     world: &World,
@@ -2117,6 +2145,13 @@ impl Optimizer {
     };
 
     if anchor_index == 0 {
+      return false;
+    }
+
+    // :814, :815
+    if line.shape().is_arc_segment(anchor_index - 1)
+      || line.shape().is_arc_segment(anchor_index)
+    {
       return false;
     }
 
@@ -2278,6 +2313,25 @@ impl Optimizer {
   /// appears in [`Optimizer::merge_obtuse`] at `:565`, where the `break`
   /// that follows it leaves the loop that reads it.
   ///
+  /// # The arc guard is live, and erratum E28 is wrong about it
+  ///
+  /// `:867` to `:872` skips a candidate pair either of whose segments
+  /// lies on an arc. Note 09 erratum E28 calls that unreachable, on the
+  /// grounds that `mergeFull` is the only caller and `Optimize` gates
+  /// `mergeFull` on `!hasArcs`. The gate reads `aLine`; the guard reads
+  /// `aCurrentPath`, the working copy this routine splices into. In a
+  /// rounded corner mode the bypass at `:883` carries an arc, `:896`
+  /// splices it in, and `mergeFull`'s loop calls back in with a path
+  /// that now holds one. The guard is what keeps the next splice from
+  /// starting or ending inside it. Removing it breaks this port's chain
+  /// invariants within a few hundred random rounded routes; see
+  /// `merge_step_meets_an_arc_it_spliced_itself_erratum_e28`.
+  ///
+  /// An arc **wholly** inside the span is not guarded against and does
+  /// not need to be: [`LineChain::remove_range`] dissolves every arc the
+  /// range covers. Only a boundary landing inside one is a problem, and
+  /// that is exactly what the two tests refuse.
+  ///
   /// # The index the replacement uses
   ///
   /// The constraints are checked over the point range
@@ -2309,7 +2363,15 @@ impl Optimizer {
 
     // :865
     for start in 0..segment_count.saturating_sub(step) {
-      // :868. The arc guard has no counterpart until arcs land.
+      // :867 to :872. Erratum E28 calls this guard unreachable; it is
+      // not, see the doc comment above and
+      // `merge_step_meets_an_arc_it_spliced_itself_erratum_e28`.
+      if current_path.is_arc_segment(start)
+        || current_path.is_arc_segment(start + step)
+      {
+        continue;
+      }
+
       let first = current_path.segment(start);
       let second = current_path.segment(start + step);
       let mut candidates: [Option<LineChain>; POSTURE_COUNT] = [None, None];
@@ -2318,14 +2380,11 @@ impl Optimizer {
       // :881. Posture 0 is straight leg first, posture 1 diagonal first.
       for posture in 0..POSTURE_COUNT {
         // :883
-        let bypass = LineChain::from_points(
-          Direction45::default().build_initial_trace(
-            first.a,
-            second.b,
-            posture == 1,
-            corner_mode,
-          ),
-          false,
+        let bypass = Direction45::default().build_initial_trace(
+          first.a,
+          second.b,
+          posture == 1,
+          corner_mode,
         );
 
         // :888
@@ -2514,12 +2573,26 @@ impl Optimizer {
   /// The loop bound is re-evaluated every iteration and the index is
   /// **not** rewound after a removal, so a removal that creates a new
   /// collinear pair behind the cursor is missed; a second
-  /// [`Optimizer::optimize`] call catches it. And a zero length segment
-  /// is skipped rather than removed (`:639`), which in KiCad is an
-  /// artefact of abutting arcs.
+  /// [`Optimizer::optimize`] call catches it.
   ///
-  /// The `!line.IsPtOnArc( segIdx + 1 )` guard at `:642` is always true
-  /// without arcs and is not written out.
+  /// # The two arc guards
+  ///
+  /// This is one of the two passes that still runs on a line holding an
+  /// arc, so both of KiCad's guards are live.
+  ///
+  /// A zero length segment is skipped rather than removed (`:638`,
+  /// `:639`), with the comment "Skip zero-length segs caused by abutting
+  /// arcs": two arcs that meet leave a chord of length zero between the
+  /// first one's last approximation point and the second one's first,
+  /// and `Collinear` of a zero length segment is meaningless.
+  ///
+  /// The join point is only removed when `!line.IsPtOnArc( segIdx + 1 )`
+  /// (`:642`). `IsPtOnArc` is the right predicate here, unlike at the
+  /// three sites erratum E11 is about: what has to be true is that the
+  /// **point** carries no arc reference, because
+  /// [`LineChain::remove`] would otherwise take a vertex out of an arc's
+  /// approximation and leave the arc describing a curve the points no
+  /// longer follow.
   pub fn merge_colinear(&self, line: &mut Line) -> bool {
     let chain = line.chain_mut();
     let segments_before = chain.segment_count();
@@ -2530,11 +2603,15 @@ impl Optimizer {
       let first = chain.segment(index);
       let second = chain.segment(index + 1);
 
-      // :639
-      if first.squared_length() != 0
-        && second.squared_length() != 0
-        && first.collinear(&second)
-      {
+      // :638
+      if first.squared_length() == 0 || second.squared_length() == 0 {
+        index += 1;
+
+        continue;
+      }
+
+      // :641
+      if first.collinear(&second) && !chain.is_pt_on_arc(index + 1) {
         // :644
         chain.remove(index + 1);
       }
@@ -2770,14 +2847,11 @@ impl Optimizer {
       // :1454
       if first_direction.is_obtuse(second_direction) {
         // :1456
-        let bypass = LineChain::from_points(
-          Direction45::default().build_initial_trace(
-            first.a,
-            second.b,
-            first_direction.is_diagonal(),
-            CornerMode::Mitered45,
-          ),
-          false,
+        let bypass = Direction45::default().build_initial_trace(
+          first.a,
+          second.b,
+          first_direction.is_diagonal(),
+          CornerMode::Mitered45,
         );
 
         // :1462, :1463
@@ -2919,14 +2993,11 @@ impl Optimizer {
         }
 
         // :1392, :1393
-        let bypass = LineChain::from_points(
-          direction.build_initial_trace(
-            coupled.point(start),
-            coupled.point(end),
-            direction.is_diagonal(),
-            CornerMode::Mitered45,
-          ),
-          false,
+        let bypass = direction.build_initial_trace(
+          coupled.point(start),
+          coupled.point(end),
+          direction.is_diagonal(),
+          CornerMode::Mitered45,
         );
 
         // :1396
@@ -3195,14 +3266,11 @@ impl Optimizer {
 
         for posture in 0..POSTURE_COUNT {
           // :1150. Note the inverted posture flag, see the doc comment.
-          let connection = LineChain::from_points(
-            Direction45::default().build_initial_trace(
-              exit,
-              path.point(vertex),
-              posture == 0,
-              CornerMode::Mitered45,
-            ),
-            false,
+          let connection = Direction45::default().build_initial_trace(
+            exit,
+            path.point(vertex),
+            posture == 0,
+            CornerMode::Mitered45,
           );
 
           // :1155
@@ -3465,14 +3533,11 @@ impl Optimizer {
     // the same way round as in `merge_step` and the other way round from
     // `smart_pads_single`.
     for posture in 0..POSTURE_COUNT {
-      let candidate = LineChain::from_points(
-        Direction45::default().build_initial_trace(
-          start_point,
-          end_point,
-          posture == 1,
-          corner_mode,
-        ),
-        false,
+      let candidate = Direction45::default().build_initial_trace(
+        start_point,
+        end_point,
+        posture == 1,
+        corner_mode,
       );
       let replacement = Line::with_chain(line, candidate);
 
@@ -3556,6 +3621,7 @@ pub fn find_coupled_vertices(
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::geometry::arc::ShapeArc;
   use crate::item::{LayerRange, Segment, Via, ViaType};
   use crate::rules::FixedClearance;
   use crate::settings::RoutingSettings;
@@ -4735,5 +4801,276 @@ mod tests {
       )
       .is_empty()
     );
+  }
+
+  // ---------------------------------------------------------------
+  // Arcs
+  // ---------------------------------------------------------------
+
+  /// A line whose chain is straight, arc, straight, at a scale where the
+  /// arc survives the chain's own approximation.
+  fn line_with_an_arc() -> Line {
+    let mut chain = LineChain::new();
+
+    chain.append(Vec2::new(-2_000_000, 0));
+    chain.append_arc(
+      &ShapeArc::from_start_end_center(
+        Vec2::new(0, 0),
+        Vec2::new(1_000_000, 1_000_000),
+        Vec2::new(0, 1_000_000),
+        false,
+        0,
+      ),
+      LineChain::ARC_POLYGONIZATION_MAX_ERROR,
+    );
+    chain.append(Vec2::new(1_000_000, 3_000_000));
+
+    let mut line = Line::new();
+
+    line.set_width(100_000);
+    line.set_shape(chain);
+    line
+  }
+
+  /// `Optimize` skips four of its six passes when the line holds an arc
+  /// (`pcbnew/router/pns_optimizer.cpp:660`, `:713`, `:717`, `:724`,
+  /// `:728`), each with a `// TODO: Fix for arcs` comment.
+  ///
+  /// What the test can see from outside is that the four gated passes
+  /// leave the line alone and the two ungated ones still run. The
+  /// straight run at the start is deliberately collinear, so
+  /// `mergeColinear` has something to do and its answer proves the gate
+  /// is not simply switching the whole optimizer off.
+  #[test]
+  fn optimize_skips_four_passes_when_the_line_holds_an_arc() {
+    let world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let root = world.root();
+    let rules = FixedClearance::uniform(1000);
+    let settings = RoutingSettings::default();
+    let context = AlgoContext::new(&rules, &settings);
+    let mut line = line_with_an_arc();
+
+    // A collinear vertex in the straight run before the arc.
+    line.chain_mut().insert(1, Vec2::new(-1_000_000, 0));
+
+    let arcs_before = line.shape().arc_count();
+    let mut optimizer = Optimizer::new(root);
+    let mut result = Line::new();
+
+    optimizer.set_effort_level(
+      EffortFlags::MERGE_SEGMENTS
+        | EffortFlags::MERGE_OBTUSE
+        | EffortFlags::MERGE_COLINEAR
+        | EffortFlags::SMART_PADS
+        | EffortFlags::FANOUT_CLEANUP,
+    );
+
+    assert!(optimizer.optimize(&world, &context, &line, &mut result, None));
+    assert_eq!(
+      result.shape().arc_count(),
+      arcs_before,
+      "the arc is still there"
+    );
+    assert_eq!(
+      result.point_count(),
+      line.point_count() - 1,
+      "only the collinear vertex went"
+    );
+
+    // With the arc gone the same effort level does reach `mergeFull`,
+    // which is what the gate is keeping away from the arc.
+    let mut straightened = result.clone();
+
+    straightened.chain_mut().clear_arcs();
+
+    let mut merged = Line::new();
+
+    optimizer.optimize(&world, &context, &straightened, &mut merged, None);
+
+    assert!(
+      merged.point_count() < straightened.point_count(),
+      "an arc free line of the same points is merged"
+    );
+  }
+
+  /// `mergeColinear` is one of the two passes that still runs on a line
+  /// with arcs, so both of its arc guards are live
+  /// (`pcbnew/router/pns_optimizer.cpp:638`, `:642`).
+  ///
+  /// The `IsPtOnArc` guard at `:642`: a vertex an arc claims must not be
+  /// removed, however collinear its neighbours look, because the arc
+  /// would then describe a curve the remaining points no longer follow.
+  /// The case is built rather than hoped for: a plain segment is
+  /// appended along the arc's own last chord, so the join at the arc's
+  /// end point is exactly collinear and nothing but the guard stops the
+  /// removal.
+  #[test]
+  fn merge_colinear_keeps_every_vertex_an_arc_claims() {
+    let world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let root = world.root();
+    let optimizer = Optimizer::new(root);
+    let mut chain = LineChain::new();
+
+    chain.append_arc(
+      &ShapeArc::from_start_end_center(
+        Vec2::new(0, 0),
+        Vec2::new(1_000_000, 1_000_000),
+        Vec2::new(0, 1_000_000),
+        false,
+        0,
+      ),
+      LineChain::ARC_POLYGONIZATION_MAX_ERROR,
+    );
+
+    let last = chain.point_count() - 1;
+    let along = chain.point(last) - chain.point(last - 1);
+
+    chain.append(chain.point(last) + along);
+
+    let join = last;
+
+    assert!(chain.is_pt_on_arc(join), "the join is the arc's end point");
+    assert!(
+      chain.segment(join - 1).collinear(&chain.segment(join)),
+      "and its two segments are exactly collinear"
+    );
+
+    let mut line = Line::new();
+
+    line.set_shape(chain.clone());
+
+    let before = line.shape().points().to_vec();
+
+    assert!(!optimizer.merge_colinear(&mut line));
+    assert_eq!(line.shape().points(), before.as_slice());
+    assert_eq!(line.shape().arc_count(), 1);
+
+    // The same points with the arc's tag dropped do lose the join, which
+    // is what the guard is holding back.
+    let mut untagged = Line::new();
+
+    chain.clear_arcs();
+    untagged.set_shape(chain);
+
+    assert!(optimizer.merge_colinear(&mut untagged));
+    assert_eq!(untagged.shape().point_count(), before.len() - 1);
+  }
+
+  /// The zero length skip at `pcbnew/router/pns_optimizer.cpp:638`,
+  /// `:639`, whose comment names abutting arcs as the source. A chord of
+  /// no length has no direction, so `Collinear` says yes to whatever it
+  /// is asked about, and without the skip the join would be removed on
+  /// that non answer.
+  #[test]
+  fn merge_colinear_skips_a_zero_length_segment() {
+    let world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let root = world.root();
+    let optimizer = Optimizer::new(root);
+    let mut chain = LineChain::new();
+
+    chain.append(Vec2::new(0, 0));
+    chain.append(Vec2::new(100, 0));
+    chain.append_allow_duplicate(Vec2::new(100, 0));
+    chain.append(Vec2::new(200, 0));
+
+    let mut line = Line::new();
+
+    line.set_shape(chain);
+
+    assert_eq!(line.shape().segment_count(), 3);
+    assert!(
+      !optimizer.merge_colinear(&mut line),
+      "every pair touches the zero length segment"
+    );
+    assert_eq!(line.shape().point_count(), 4);
+  }
+
+  /// Erratum E28 is wrong: `mergeStep`'s arc guard
+  /// (`pcbnew/router/pns_optimizer.cpp:867` to `:872`) is reachable, and
+  /// in a rounded corner mode it is reached routinely.
+  ///
+  /// Note 09's argument is that `mergeStep` is called only from
+  /// `mergeFull` (`:612`) and that `Optimize` gates `mergeFull` on
+  /// `!hasArcs` (`:713`). Both halves are true and the conclusion does
+  /// not follow, because the guard tests `aCurrentPath`, the working
+  /// copy, and not `aLine`. `mergeStep` splices a bypass from
+  /// `BuildInitialTrace( ..., cornerMode )` into that copy (`:883`,
+  /// `:896`), and in `ROUNDED_45` or `ROUNDED_90` the bypass carries an
+  /// arc. `mergeFull` then calls `mergeStep` again on the spliced path,
+  /// and the guard is what stops the next splice from cutting through
+  /// the arc it just made.
+  ///
+  /// It is not cosmetic. With the guard removed this port's own chain
+  /// invariants fail within a few hundred random rounded routes, because
+  /// `Replace` over a range that starts or ends inside an arc leaves a
+  /// vertex pointing at an arc it no longer belongs to. Ported verbatim.
+  #[test]
+  fn merge_step_meets_an_arc_it_spliced_itself_erratum_e28() {
+    let world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let root = world.root();
+    let rules = FixedClearance::uniform(1000);
+    let settings = RoutingSettings {
+      corner_mode: CornerMode::Rounded45,
+      ..RoutingSettings::default()
+    };
+    let context = AlgoContext::new(&rules, &settings);
+
+    // An arc free line, so `Optimize`'s `hasArcs` gate is open.
+    let mut line = Line::new();
+
+    line.set_width(100_000);
+    line.set_shape(LineChain::from_slice(
+      &[
+        Vec2::new(0, 0),
+        Vec2::new(500_000, 0),
+        Vec2::new(2_000_000, 1_500_000),
+        Vec2::new(1_500_000, 500_000),
+      ],
+      false,
+    ));
+
+    assert_eq!(line.shape().arc_count(), 0);
+
+    let mut optimizer = Optimizer::new(root);
+    let mut result = Line::new();
+
+    optimizer.set_effort_level(EffortFlags::MERGE_SEGMENTS);
+
+    // The answer is `segments_after < segments_before` and an arc's
+    // approximation is many segments, so a successful rounded merge
+    // reports false; see `Optimizer::merge_full`.
+    optimizer.optimize(&world, &context, &line, &mut result, None);
+
+    // `mergeStep` put an arc into a path that had none, which is the
+    // state erratum E28 says cannot arise.
+    assert_eq!(result.shape().arc_count(), 1);
+
+    let spliced = result.shape().clone();
+    let arc = spliced.arc(0).expect("the count says there is one");
+
+    assert!(
+      (0..spliced.segment_count()).any(|index| spliced.is_arc_segment(index)),
+      "and the guard's own test is true somewhere along it"
+    );
+
+    // Every span the loop would try, on the spliced path. The chain
+    // invariants run on each mutation, so a splice that cut the arc in
+    // half would be caught here; what is asserted on top is that the arc
+    // is either untouched or gone whole, never rewritten.
+    for step in 1..spliced.segment_count().saturating_sub(1) {
+      let mut path = spliced.clone();
+
+      optimizer.merge_step(&world, &context, &result, &mut path, step);
+
+      match path.arc_count() {
+        0 => {}
+        1 => assert_eq!(
+          path.arc(0).expect("the count says there is one"),
+          arc,
+          "step {step} rewrote the arc"
+        ),
+        other => panic!("step {step} left {other} arcs"),
+      }
+    }
   }
 }

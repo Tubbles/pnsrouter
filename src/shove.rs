@@ -140,7 +140,7 @@ use std::collections::BTreeMap;
 use crate::algo_base::AlgoContext;
 use crate::collide::{CollisionSearchOptions, LineHead, collide_line_items};
 use crate::geometry::box2::Box2;
-use crate::geometry::direction45::{CornerMode, Direction45};
+use crate::geometry::direction45::Direction45;
 use crate::geometry::line_chain::{LineChain, PointInsideTracker};
 use crate::geometry::shape::Shape;
 use crate::geometry::vec2::Vec2;
@@ -4569,11 +4569,11 @@ impl Shove {
       optimizer.set_restrict_area(area, false);
     }
 
-    // :2079. KiCad also allows `ROUNDED_45`, which this crate's
-    // `CornerMode` does not have; the pass builds 45 degree connections
-    // whatever the mode, which is why the 90 degree modes are excluded.
+    // :2079. Both 45 degree modes, the pass building 45 degree
+    // connections whatever the mode, which is why the 90 degree ones are
+    // excluded.
     if context.settings.smart_pads
-      && context.settings.corner_mode == CornerMode::Mitered45
+      && context.settings.corner_mode.is_45_degree()
     {
       flags |= EffortFlags::SMART_PADS;
     }

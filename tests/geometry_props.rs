@@ -99,8 +99,8 @@ fn chain_45(limit: i32) -> impl Strategy<Value = LineChain> {
           CornerMode::Mitered45,
         );
 
-        for vertex in leg {
-          result.append(vertex);
+        for vertex in leg.points() {
+          result.append(*vertex);
         }
       }
 
@@ -786,8 +786,13 @@ proptest! {
     } else {
       CornerMode::Mitered45
     };
+    // The two mitered modes carry nothing but points, so the vertex list
+    // is the whole answer; `build_initial_trace_table` in
+    // `src/geometry/direction45.rs` is where the rounded modes are pinned.
     let trace = Direction45::default()
-      .build_initial_trace(from, to, start_diagonal, mode);
+      .build_initial_trace(from, to, start_diagonal, mode)
+      .points()
+      .to_vec();
 
     prop_assert!(!trace.is_empty());
     prop_assert!(trace.len() <= 3);

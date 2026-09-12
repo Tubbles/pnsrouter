@@ -352,6 +352,11 @@ diagLength = sqrt( 2*diag2 - 2*diag2*cos( 3*pi/4 ) )                    :131
 arcRadius  = KiROUND( diagLength / ( 2 * cos( 67.5 deg ) ) )            :132
 ```
 
+The cosines here are `std::cos` on a `double`, not `EDA_ANGLE::Cos`: `std::cos( 3 * M_PI_4 )` is one ulp above the exact `-1/sqrt(2)` the angle table answers, so the two are not interchangeable and the port uses KiCad's expression (slice 6, 2026-09-12).
+
+```
+```
+
 Four sub-cases on `startDiagonal` and `sign( tangentLength )`:
 
 | case | arc endpoints | angle | result chain | line |
@@ -390,6 +395,8 @@ The `w == h` early return at `:259` is the only path out of `BuildInitialTrace` 
 ### 3.3 `DIRECTION_45( const SHAPE_ARC&, bool a90 )`
 
 `direction45.h:116` to `:122`: takes `aArc.GetP1() - aArc.GetP0()`, negates y, and classifies. So the direction of an arc is the direction of its **chord**, not of either tangent. For a 45 degree arc that is the bisector of the two tangents and lands on a diagonal octant when the tangents are axis aligned and vice versa. This is what the placer reads at `pns_line_placer.cpp:200`, `:207`, `:232`, `:355`, `:365`, `:380`.
+
+One consequence for slice 7, which reads this to pick postures (`pns_line_placer.cpp:200` and friends): the chord of a 45 degree fillet is the tangent bisector, which sits on a 22.5 degree octant boundary, so `DIRECTION_45` of such an arc answers whichever octant the rounding lands on. For the port's own table row it answers east by a hundredth of a degree (slice 6, 2026-09-12).
 
 ### 3.4 Who selects the mode
 
@@ -1013,9 +1020,9 @@ Neither `Simplify` (`shape_line_chain.cpp:2782`) nor `Simplify2` (`:2906`) nor `
 
 `pcbnew/router/pns_shove.cpp:1793` to `:1808` versus `:1751` to `:1791`. The arc case omits `unwindLineStack`, omits `patchTadpoleVia`, omits the "current line ends with a colliding via" handling, and passes `revLine.Rank() - 1` where the segment case passes `revLine.Rank() + 1`. The sign is the anti ping pong rank convention (note 04 section 1.4): `+ 1` on a reverse collision, `- 1` on a forward one. The `//TODO(snh): Handle Arc shove separate from track` at `:1795` suggests the branch was never finished. How the branch is reached at all is a second question: `shoveIteration`'s obstacle search iterates `{ SOLID_T, VIA_T, SEGMENT_T, HOLE_T }` and sets the search kind mask to one of them per pass (`:1650`), so `ARC_T` is never asked for, and the arc cases can only be entered through an obstacle the filter let through under another kind. Slice 7 has to establish which before rewriting them (found in slice 5, 2026-09-12).
 
-### E28. `mergeStep`'s arc guard is unreachable
+### E28. `mergeStep`'s arc guard looks unreachable and is not
 
-`pcbnew/router/pns_optimizer.cpp:867` to `:872`. `mergeStep` is called only from `mergeFull` (`:612`), and `Optimize` gates `mergeFull` on `!hasArcs` (`:713`). A line with arcs never reaches it.
+`pcbnew/router/pns_optimizer.cpp:867` to `:872`. `mergeStep` is called only from `mergeFull` (`:612`), and `Optimize` gates `mergeFull` on `!hasArcs` (`:713`), so the first reading of this note called the guard dead. It is not: the gate reads `aLine`, the guard reads `aCurrentPath`, the working copy `mergeStep` splices its own bypasses into. In a rounded corner mode the bypass `BuildInitialTrace` returns at `:883` carries an arc, `Replace` at `:896` splices it in, and `mergeFull`'s loop calls straight back with an arc bearing path. The guard is what keeps that path sound; without it the port's own chain invariants fail within a few hundred random rounded routes (slice 6, 2026-09-12, which ports the guard verbatim and pins it behind `merge_step_meets_an_arc_it_spliced_itself_erratum_e28`). An arc wholly inside the splice range needs no guard, since the range removal dissolves it, so KiCad's two ended test is exactly right. Not an erratum then, kept under its number so the correction is findable.
 
 ### E29. `MEANDER_PLACER::doMove`'s arc passthrough skips the shape after every arc
 

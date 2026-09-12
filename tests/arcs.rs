@@ -7,24 +7,32 @@
 //! claim is only worth something if it holds from outside the crate: a
 //! host builds the snapshot, the world stores the arc, a query finds it,
 //! a line assembly picks it up whole, a removal forgets it everywhere,
-//! and a recording of the same board reads back byte for byte. No
-//! algorithm above the world is involved yet; the placer and the shove
-//! meet arcs in slices 6 and 7.
+//! and a recording of the same board reads back byte for byte.
+//!
+//! The second half is the slice 6 exit test: the placer in a rounded
+//! corner mode routes past an obstacle, the preview it hands the host
+//! carries an arc, and the commit is pinned as it stands until slice 7
+//! teaches `fix_route` to emit one.
 
 #![forbid(unsafe_code)]
 
+use pnsrouter::algo_base::AlgoContext;
 use pnsrouter::collide::CollisionSearchOptions;
 use pnsrouter::eventlog::SessionRecording;
 use pnsrouter::geometry::arc::ShapeArc;
 use pnsrouter::geometry::direction45::CornerMode;
 use pnsrouter::geometry::line_chain::LineChain;
 use pnsrouter::geometry::seg::Seg;
+use pnsrouter::geometry::shape::Shape;
 use pnsrouter::geometry::vec2::Vec2;
-use pnsrouter::item::{HostId, ItemBody, ItemId, Kind, LayerRange, NetId};
+use pnsrouter::item::{
+  HostId, ItemBody, ItemId, Kind, LayerRange, NetId, Solid,
+};
 use pnsrouter::line::Line;
 use pnsrouter::node::World;
+use pnsrouter::placer::line_placer::LinePlacer;
 use pnsrouter::rules::FixedClearance;
-use pnsrouter::settings::{RoutingSettings, Sizes};
+use pnsrouter::settings::{RouterMode, RoutingSettings, Sizes};
 use pnsrouter::snapshot::{WorldGeometry, WorldItem, WorldSnapshot};
 
 /// The clearance the scenario queries at, in nanometres.
@@ -300,4 +308,238 @@ fn a_recording_of_an_arc_board_round_trips_through_its_text_form() {
       .all_items_in_net(replayed.root(), SIGNAL, Kind::ARC)
       .len()
   );
+}
+
+// =====================================================================
+// Slice 6: the placer produces arcs
+// =====================================================================
+//
+// A second fixture, three pads in a row with the middle one on another
+// net, routed in the two rounded corner modes. It is the slice 6 exit
+// test of `doc/work/012-arcs.md`: `build_initial_trace` is the only
+// producer of arcs in the router, and this is where its output has to
+// survive the walkaround, the optimizer and the commit.
+
+/// The clearance the rounded scenarios route to.
+const ROUTE_CLEARANCE: i32 = 100_000;
+
+/// The width of the routed track.
+const ROUTE_WIDTH: i32 = 200_000;
+
+/// The copper radius of every pad of the rounded scenarios.
+const PAD_RADIUS: i32 = 400_000;
+
+/// The net the routed track is on.
+const ROUTE_NET: Option<NetId> = Some(NetId(11));
+
+/// The net of the pad in the way, so that it is never exempt.
+const IN_THE_WAY_NET: Option<NetId> = Some(NetId(12));
+
+/// Where the routed track starts.
+const ROUTE_START: Vec2 = Vec2::new(0, 0);
+
+/// The pad the route has to get past.
+const IN_THE_WAY: Vec2 = Vec2::new(2_000_000, 500_000);
+
+/// Where the routed track ends. Neither axis aligned nor diagonal from
+/// [`ROUTE_START`], so `build_initial_trace` has a corner to round.
+const ROUTE_TARGET: Vec2 = Vec2::new(4_000_000, 2_000_000);
+
+/// How far a track's centreline has to stay from a pad's centre.
+const KEEP_OUT: i32 = PAD_RADIUS + ROUTE_CLEARANCE + ROUTE_WIDTH / 2;
+
+/// The three pad board, with the start and target handles.
+fn rounded_board() -> (World, ItemId, ItemId) {
+  let mut world = World::new(World::DEFAULT_MAX_CLEARANCE);
+  let root = world.root();
+  let add_pad = |world: &mut World, at: Vec2, net| {
+    let body = ItemBody::Solid(Solid::new(Shape::circle(at, PAD_RADIUS), at));
+    let mut item = world.make_item(body);
+
+    item.set_layers_and_flash_all(LayerRange::single(0));
+    item.set_net(net);
+
+    world.add_solid(root, item, None)
+  };
+
+  let start_pad = add_pad(&mut world, ROUTE_START, ROUTE_NET);
+
+  add_pad(&mut world, IN_THE_WAY, IN_THE_WAY_NET);
+
+  let target_pad = add_pad(&mut world, ROUTE_TARGET, ROUTE_NET);
+
+  (world, start_pad, target_pad)
+}
+
+/// Walkaround settings in one corner mode.
+fn rounded_settings(corner_mode: CornerMode) -> RoutingSettings {
+  RoutingSettings {
+    mode: RouterMode::Walkaround,
+    corner_mode,
+    ..RoutingSettings::default()
+  }
+}
+
+/// The sizes the rounded scenarios place with.
+fn rounded_sizes() -> Sizes {
+  let mut sizes = Sizes {
+    track_width: ROUTE_WIDTH,
+    ..Sizes::default()
+  };
+
+  sizes.add_layer_pair(0, 1);
+  sizes
+}
+
+/// The squared distance from a point to the pad in the way.
+fn squared_distance_to_the_obstacle(point: Vec2) -> i64 {
+  let delta = point - IN_THE_WAY;
+
+  i64::from(delta.x) * i64::from(delta.x)
+    + i64::from(delta.y) * i64::from(delta.y)
+}
+
+/// Route the scenario in one corner mode and hand back the placer, the
+/// world and the preview trace.
+fn route_rounded(corner_mode: CornerMode) -> (World, LinePlacer, ItemId, Line) {
+  let (mut world, start_pad, target_pad) = rounded_board();
+  let rules = FixedClearance::uniform(ROUTE_CLEARANCE);
+  let settings = rounded_settings(corner_mode);
+  let context = AlgoContext::new(&rules, &settings);
+  let mut placer =
+    LinePlacer::new(&world, world.root(), &settings, rounded_sizes());
+
+  assert!(placer.start(&mut world, &context, ROUTE_START, Some(start_pad)));
+  assert!(placer.move_to(&mut world, &context, ROUTE_TARGET, None));
+
+  let trace = placer.trace().expect("a placement is running");
+
+  (world, placer, target_pad, trace)
+}
+
+#[test]
+fn a_rounded_walkaround_carries_an_arc_and_clears_the_obstacle() {
+  for corner_mode in [CornerMode::Rounded45, CornerMode::Rounded90] {
+    let (world, _placer, _target_pad, trace) = route_rounded(corner_mode);
+    let chain = trace.shape();
+
+    // The whole point of the slice: the preview the host draws holds a
+    // real arc, not a polyline that looks like one.
+    assert!(
+      chain.arc_count() >= 1,
+      "{corner_mode:?} produced no arc: {:?}",
+      chain.points()
+    );
+
+    // Every arc's endpoints are exact vertices of the chain, so a host
+    // that draws the arcs and a host that draws the polyline agree at
+    // the joins. `live_arcs` skips an arc no vertex refers to, which is
+    // what erratum E13 is about.
+    for (arc_index, arc) in chain.live_arcs() {
+      let start = (0..chain.point_count())
+        .find(|&vertex| {
+          chain.is_arc_start(vertex)
+            && chain.arc_index(vertex) == Some(arc_index)
+        })
+        .expect("a live arc has a first vertex");
+      let end = (start..chain.point_count())
+        .find(|&vertex| chain.is_arc_end(vertex))
+        .expect("an arc that starts has an end");
+
+      assert_eq!(chain.point(start), arc.start(), "{corner_mode:?}");
+      assert_eq!(chain.point(end), arc.end(), "{corner_mode:?}");
+      assert!(end > start + 1, "{corner_mode:?} arc of one chord");
+      assert_ne!(arc.start(), arc.end(), "{corner_mode:?}");
+      assert_ne!(arc.start(), arc.arc_mid(), "{corner_mode:?}");
+    }
+
+    // The route runs from the start pad to the cursor and stays out of
+    // the pad in the way, arc and all.
+    assert_eq!(chain.point(0), ROUTE_START, "{corner_mode:?}");
+    assert_eq!(chain.last_point(), Some(ROUTE_TARGET), "{corner_mode:?}");
+
+    for index in 0..chain.point_count() {
+      assert!(
+        squared_distance_to_the_obstacle(chain.point(index))
+          >= i64::from(KEEP_OUT) * i64::from(KEEP_OUT),
+        "{corner_mode:?} passes through the obstacle's keep out at {:?}",
+        chain.point(index)
+      );
+    }
+
+    let _ = world;
+  }
+}
+
+#[test]
+fn fix_route_commits_an_arc_as_its_chords_until_slice_7() {
+  // Interim behaviour, pinned so that slice 7's change shows up in this
+  // test's diff. `LINE_PLACER::FixRoute` walks the trace segment by
+  // index (`pcbnew/router/pns_line_placer.cpp:1669`), and slice 6 stops
+  // short of porting KiCad's arc emission loop, so an arc reaches the
+  // node as the straight chords of its own approximation, one `SEGMENT`
+  // each. Slice 7 replaces this with one `ARC` per arc and erratum E24
+  // fixed; when it does, the two assertions below flip.
+  for corner_mode in [CornerMode::Rounded45, CornerMode::Rounded90] {
+    let (mut world, mut placer, target_pad, trace) = route_rounded(corner_mode);
+    let rules = FixedClearance::uniform(ROUTE_CLEARANCE);
+    let settings = rounded_settings(corner_mode);
+    let context = AlgoContext::new(&rules, &settings);
+    let arcs_in_the_preview = trace.shape().arc_count();
+    let chords = trace.segment_count();
+    let shapes = trace.shape().shape_count();
+
+    assert!(arcs_in_the_preview >= 1, "{corner_mode:?}");
+    assert!(placer.fix_route(
+      &mut world,
+      &context,
+      ROUTE_TARGET,
+      Some(target_pad),
+      false
+    ));
+
+    let node = placer.last_node().expect("the fix wrote into a branch");
+    let committed_arcs = world.all_items_in_net(node, ROUTE_NET, Kind::ARC);
+    let committed_segments =
+      world.all_items_in_net(node, ROUTE_NET, Kind::SEGMENT);
+
+    // Interim: no arc reaches the node, and the approximation chords are
+    // there one by one instead. The count is not exactly the chord count
+    // because `simplifyNewLine` merges the collinear pairs it finds at
+    // the joints afterwards (`pcbnew/router/pns_line_placer.cpp:1894`).
+    assert!(
+      committed_arcs.is_empty(),
+      "{corner_mode:?} committed an arc, which is slice 7's job"
+    );
+    assert!(
+      committed_segments.len() > shapes,
+      "{corner_mode:?} committed {} segments for {shapes} shapes, so the \
+       arc did not reach the node whole",
+      committed_segments.len()
+    );
+    assert!(
+      committed_segments.len() <= chords,
+      "{corner_mode:?} committed more segments than the trace had chords"
+    );
+
+    // What must hold either way: the commit is clear.
+    for id in committed_segments {
+      let line = Line::from_segment(&world, node, id)
+        .expect("a stored segment assembles");
+
+      assert!(
+        world
+          .check_colliding_line(
+            node,
+            &line,
+            &rules,
+            &CollisionSearchOptions::default()
+          )
+          .is_none(),
+        "{corner_mode:?} committed a colliding segment from {:?} to {:?}",
+        line.point(0),
+        line.last_point()
+      );
+    }
+  }
 }

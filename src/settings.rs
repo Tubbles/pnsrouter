@@ -237,8 +237,10 @@ pub struct RoutingSettings {
   /// and in `NODE::NearestObstacle` (`pcbnew/router/pns_node.cpp:301`),
   /// the optimizer and the shove.
   ///
-  /// KiCad has four modes and this crate has two, because the rounded
-  /// ones need an arc type; see [`CornerMode`].
+  /// All four of KiCad's modes are accepted. A host whose file format
+  /// cannot store an arc track has to refuse the two rounded ones where
+  /// it applies its settings; see [`CornerMode::is_rounded`] and
+  /// `doc/work/012-arcs.md`.
   pub corner_mode: CornerMode,
   /// How many times the walkaround may bend a head before giving up.
   /// JSON key `walkaround_iteration_limit`, default 40 (`:45`).

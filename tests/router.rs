@@ -719,16 +719,24 @@ fn mark_obstacles_mode_reports_the_pad_the_head_runs_into() {
 }
 
 #[test]
-fn the_corner_mode_cycles_between_the_two_mitered_modes() {
+fn the_corner_mode_cycles_through_all_four_modes() {
   use pnsrouter::geometry::direction45::CornerMode;
 
   let mut router = router();
 
+  // `ROUTER::ToggleCornerMode`, `pcbnew/router/pns_router.cpp:1075` to
+  // `:1078`.
   assert_eq!(router.settings().corner_mode, CornerMode::Mitered45);
-  router.toggle_corner_mode();
-  assert_eq!(router.settings().corner_mode, CornerMode::Mitered90);
-  router.toggle_corner_mode();
-  assert_eq!(router.settings().corner_mode, CornerMode::Mitered45);
+
+  for expected in [
+    CornerMode::Rounded45,
+    CornerMode::Mitered90,
+    CornerMode::Rounded90,
+    CornerMode::Mitered45,
+  ] {
+    router.toggle_corner_mode();
+    assert_eq!(router.settings().corner_mode, expected);
+  }
 }
 
 #[test]

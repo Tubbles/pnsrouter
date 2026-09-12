@@ -1059,7 +1059,9 @@ fn settings_lines(out: &mut String, block: usize, settings: &RoutingSettings) {
   };
   let corner_mode = match settings.corner_mode {
     CornerMode::Mitered45 => "mitered-45",
+    CornerMode::Rounded45 => "rounded-45",
     CornerMode::Mitered90 => "mitered-90",
+    CornerMode::Rounded90 => "rounded-90",
   };
   let flags = [
     ("shove-vias", settings.shove_vias),
@@ -2128,7 +2130,9 @@ fn parse_settings_key(
     "corner-mode" => {
       settings.corner_mode = match tokens.word("a corner mode")? {
         "mitered-45" => CornerMode::Mitered45,
+        "rounded-45" => CornerMode::Rounded45,
         "mitered-90" => CornerMode::Mitered90,
+        "rounded-90" => CornerMode::Rounded90,
         other => {
           return Err(tokens.error(format!("`{other}` is not a corner mode")));
         }
@@ -3380,5 +3384,60 @@ mod tests {
 
     assert_eq!(error.line, 3);
     assert!(error.message.contains("unexpected"), "{error}");
+  }
+
+  /// All four corner modes survive the text form, and an arc free
+  /// recording is unchanged by the two that arrived with slice 6.
+  ///
+  /// The token is the mode's name with the dash KiCad's own settings
+  /// dialog uses, and the parse is its inverse. The default recording
+  /// still writes `mitered-45`, which is what every fixture under
+  /// `tests/fixtures/sessions/` was taken against.
+  #[test]
+  fn every_corner_mode_round_trips_through_the_recording() {
+    use crate::geometry::direction45::CornerMode;
+
+    let modes = [
+      (CornerMode::Mitered45, "mitered-45"),
+      (CornerMode::Rounded45, "rounded-45"),
+      (CornerMode::Mitered90, "mitered-90"),
+      (CornerMode::Rounded90, "rounded-90"),
+    ];
+
+    for (mode, name) in modes {
+      let recording = SessionRecording::new(
+        WorldSnapshot::new(2, 800_000),
+        RoutingSettings {
+          corner_mode: mode,
+          ..RoutingSettings::default()
+        },
+        Sizes::default(),
+      );
+      let text = recording.to_text();
+
+      assert!(
+        text
+          .lines()
+          .any(|line| line == format!("settings 0 corner-mode {name}")),
+        "{mode:?} is written as `{name}`:\n{text}"
+      );
+
+      let parsed =
+        SessionRecording::from_text(&text).expect("the recording reads back");
+
+      assert_eq!(parsed.settings.corner_mode, mode);
+      assert_eq!(parsed.to_text(), text);
+    }
+
+    // An unknown name is still refused rather than silently defaulted.
+    let broken = SessionRecording::new(
+      WorldSnapshot::new(2, 800_000),
+      RoutingSettings::default(),
+      Sizes::default(),
+    )
+    .to_text()
+    .replace("corner-mode mitered-45", "corner-mode filleted-45");
+
+    assert!(SessionRecording::from_text(&broken).is_err());
   }
 }

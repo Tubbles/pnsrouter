@@ -2028,14 +2028,11 @@ fn drag_corner_internal(
   preferred_ending_direction: Direction45,
 ) -> LineChain {
   let trace = |from: Vec2, diagonal: bool| {
-    LineChain::from_points(
-      Direction45::default().build_initial_trace(
-        from,
-        at,
-        diagonal,
-        CornerMode::Mitered45,
-      ),
-      false,
+    Direction45::default().build_initial_trace(
+      from,
+      at,
+      diagonal,
+      CornerMode::Mitered45,
     )
   };
 
@@ -2144,10 +2141,7 @@ fn trace_from(
   to: Vec2,
   diagonal: bool,
 ) -> LineChain {
-  LineChain::from_points(
-    direction.build_initial_trace(from, to, diagonal, CornerMode::Mitered45),
-    false,
-  )
+  direction.build_initial_trace(from, to, diagonal, CornerMode::Mitered45)
 }
 
 impl Line {

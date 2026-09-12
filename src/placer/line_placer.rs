@@ -614,14 +614,11 @@ impl Placing {
     for index in (0..self.tail.segment_count()).rev() {
       let segment = self.tail.segment(index);
       let direction = Direction45::from_seg(&segment, false);
-      let replacement = LineChain::from_points(
-        direction.build_initial_trace(
-          segment.a,
-          end,
-          false,
-          CornerMode::Mitered45,
-        ),
+      let replacement = direction.build_initial_trace(
+        segment.a,
+        end,
         false,
+        CornerMode::Mitered45,
       );
 
       // :286
@@ -928,23 +925,18 @@ impl Placing {
         chain = LineChain::from_slice(&[p_start, at], false);
       } else if self.tail.point_count() == 0 {
         // :2082
-        chain = LineChain::from_points(
-          guessed_direction.build_initial_trace(
-            p_start,
-            at,
-            false,
-            corner_mode,
-          ),
+        chain = guessed_direction.build_initial_trace(
+          p_start,
+          at,
           false,
+          corner_mode,
         );
       } else {
         // :2084
-        chain = LineChain::from_points(
+        chain =
           self
             .direction
-            .build_initial_trace(p_start, at, false, corner_mode),
-          false,
-        );
+            .build_initial_trace(p_start, at, false, corner_mode);
       }
 
       // :2087, collapse the two segment bend to one orthogonal segment.
@@ -1015,14 +1007,11 @@ impl Placing {
       };
 
       // :2127
-      let corrected = LineChain::from_points(
-        guessed_direction.build_initial_trace(
-          p_start,
-          at + force,
-          false,
-          corner_mode,
-        ),
+      let corrected = guessed_direction.build_initial_trace(
+        p_start,
+        at + force,
         false,
+        corner_mode,
       );
 
       // :2128. `LINE( aHead, line )` keeps the width, layers, net and
@@ -1599,7 +1588,7 @@ impl Placing {
 
       if let Some(hull) = hull {
         // :827
-        let nearest = if context.settings.corner_mode == CornerMode::Mitered90 {
+        let nearest = if context.settings.corner_mode.is_90_degree() {
           hull.bbox(0).map(|bbox| {
             let clamped =
               bbox.nearest_point(crate::geometry::vec2::Vec2L::from(at));
@@ -1687,10 +1676,10 @@ impl Placing {
       }
     };
 
-    // :762. KiCad tests `MITERED_45 || ROUNDED_45`; this crate has no
-    // rounded modes, so the 45 degree family is one variant.
+    // :762, `MITERED_45 || ROUNDED_45`. Smart pads is incompatible
+    // with the 90 degree modes for now, KiCad's comment at `:761` says.
     if context.settings.smart_pads
-      && context.settings.corner_mode == CornerMode::Mitered45
+      && context.settings.corner_mode.is_45_degree()
       && !self.posture.is_manually_forced()
     {
       effort |= EffortFlags::SMART_PADS;
@@ -3024,9 +3013,26 @@ impl LinePlacer {
   /// `Placing::chained` stays false so the layer may still change
   /// (`:1725`).
   ///
-  /// `TODO(arcs)`: the arc branches at `:1650` and `:1671`, together with
-  /// the "rollback is broken for arcs" override that forces `fix_all` on
-  /// (`:1652`).
+  /// # `TODO(arcs)`: the commit path is still chord by chord, slice 7
+  ///
+  /// From slice 6 on, a rounded corner mode gives the head a chain that
+  /// carries an arc. The emission loop below walks
+  /// [`LineChain::segment`] by index, so an arc reaches the node as the
+  /// straight chords of its own 1000 nanometre approximation, one
+  /// `SEGMENT` each, rather than as one `ARC`. The route is committed in
+  /// the right place and is clear; what is lost is that the board gets a
+  /// polyline where the user asked for a curve, and the arc cannot be
+  /// recognised again when the line is reassembled.
+  ///
+  /// Three more things wait for the same slice, all of them at
+  /// `pcbnew/router/pns_line_placer.cpp`: the "rollback doesn't work
+  /// properly if fix-all isn't enabled and we are placing arcs" override
+  /// that forces `fix_all` on (`:1650`, `:1651`), the arc aware direction
+  /// of `lastDirSeg` (`:1653`, `:1654`), and the emission loop itself
+  /// (`:1669` to `:1702`) with erratum E24 fixed. Slice 7 replaces all
+  /// four; `fix_route_commits_an_arc_as_its_chords_until_slice_7` in
+  /// `tests/arcs.rs` pins what happens until it does, so that the change
+  /// is visible in that test's diff.
   ///
   /// The collision gate runs against the shove's node in shove mode and
   /// against the placement branch otherwise (`:1589`), because in shove
@@ -3164,9 +3170,9 @@ impl LinePlacer {
       real_end = true;
     }
 
-    // :1650. There are no arcs yet, so the "rollback is broken for arcs"
-    // override that forces `fix_all` on cannot fire; it comes back with
-    // the arc body.
+    // :1650. `TODO(arcs)`: KiCad forces `fix_all` on as soon as the line
+    // holds an arc. Slice 7 writes that, together with the arc emission
+    // loop it belongs to; see the doc comment above.
 
     // :1654
     let direction_segment = if !fix_all && trace.segment_count() > 1 {
