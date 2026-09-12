@@ -283,7 +283,7 @@ fn added_length(diff: &CommitDiff) -> i64 {
     .iter()
     .filter_map(|item| match item.geometry {
       NewGeometry::Segment { seg, .. } => Some(i64::from(seg.length())),
-      NewGeometry::Via { .. } => None,
+      NewGeometry::Arc { .. } | NewGeometry::Via { .. } => None,
     })
     .sum()
 }
@@ -296,7 +296,7 @@ fn committed_segments(diff: &CommitDiff) -> Vec<Seg> {
     .chain(diff.updated.iter().map(|(_, item)| item))
     .filter_map(|item| match item.geometry {
       NewGeometry::Segment { seg, .. } => Some(seg),
-      NewGeometry::Via { .. } => None,
+      NewGeometry::Arc { .. } | NewGeometry::Via { .. } => None,
     })
     .collect()
 }

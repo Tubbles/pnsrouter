@@ -112,13 +112,13 @@
 //!   which is why [`Line::drag_segment`] takes no free angle flag.
 //! - `ClipToNearestObstacle` (`:679`). It has no caller anywhere in
 //!   `pcbnew/router`, only its definition and its declaration, so it is
-//!   left out even now that [`World::nearest_obstacle`] exists.
+//!   left out even now that [`World::nearest_obstacle`] exists. Its one
+//!   arc branch goes with it: when the segment nearest the collision
+//!   point is an arc segment the routine clears the whole line with the
+//!   comment "Don't clip at arcs, start again" (`:695` to `:699`), so
+//!   whoever gives the routine a caller has to bring that back too.
 //! - `FindSegment( const SEGMENT* )` (`:1668`), which has no caller in
 //!   the tree.
-//! - `restoreUntouchedArcs` (`:255`), the arc splice at the end of the
-//!   walkaround. It returns immediately when the input has no arcs
-//!   (`:257`), and this crate has no arcs, so [`Line::walkaround`] omits
-//!   the call rather than porting a routine that could not be exercised.
 //! - `Is45Degree` does not exist on `LINE`; the only such predicate is
 //!   the file local `IsSegment45Degree` in `pns_utils.cpp`, which
 //!   `src/geometry/hull.rs` already has.
@@ -535,6 +535,22 @@ impl Line {
   /// [`crate::node::World::assemble_line`].
   pub fn shape_count(&self) -> usize {
     self.chain.shape_count()
+  }
+
+  /// The number of arcs the line's chain stores.
+  ///
+  /// Port of `ArcCount`, `pcbnew/router/pns_line.h:146`, which forwards
+  /// to [`LineChain::arc_count`]. That is the **storage** count, so it
+  /// can exceed the number of arcs any vertex still refers to (erratum
+  /// E13); `LineChain::live_arcs` is the one that cannot. KiCad's two
+  /// readers both want the storage count:
+  /// `LINE_PLACER::FixRoute` (`pcbnew/router/pns_line_placer.cpp:1650`)
+  /// asks "could this commit have to emit an arc" and the optimizer's
+  /// `hasArcs` gate (`pcbnew/router/pns_optimizer.cpp:660`) asks "may I
+  /// reshape this line freely"; both have to answer yes for a chain
+  /// whose arc no vertex refers to any more.
+  pub fn arc_count(&self) -> usize {
+    self.chain.arc_count()
   }
 
   /// One vertex. Port of `CPoint`, `pcbnew/router/pns_line.h:150`.
@@ -1515,9 +1531,15 @@ impl Line {
   ///
   /// Port of `ClipVertexRange`, `pcbnew/router/pns_line.cpp:1469`. The
   /// chain is sliced and the link vector is rotated and truncated to the
-  /// matching sub range, walking shapes through `SHAPE_LINE_CHAIN::NextShape`
-  /// so that an arc counts once. Its documented precondition is that the
-  /// range came from joints, so it never cuts inside an arc (`:1471`).
+  /// matching sub range, walking shapes through
+  /// [`LineChain::next_shape`] so that a whole arc counts as one link.
+  /// Its documented precondition is that the range came from joints, so
+  /// it never cuts inside an arc (`:1471`).
+  ///
+  /// The walk is what makes link `n` the `n`th **shape** of the chain,
+  /// which is why `World::add_line` had to emit its items in chain order
+  /// rather than KiCad's arcs first order (erratum E22, slice 5 of
+  /// `doc/work/012-arcs.md`).
   ///
   /// Two details of the C++ are reproduced rather than tidied. The walk
   /// stops at `i >= aEnd - 1`, one shape short of the range's end, which
@@ -1539,10 +1561,12 @@ impl Line {
     let mut first_link = 0usize;
     let mut last_link = self.links.len().saturating_sub(1);
     let mut link_index = 0usize;
-    let mut index: isize = 0;
+    let mut index: Option<usize> = Some(0);
 
-    while index >= 0 && (index as usize) < point_count {
-      let point = index as usize;
+    while let Some(point) = index {
+      if point >= point_count {
+        break;
+      }
 
       if point <= start {
         first_link = link_index;
@@ -1557,7 +1581,7 @@ impl Line {
       }
 
       link_index += 1;
-      index = next_shape(point_count, point);
+      index = self.chain.next_shape(point);
     }
 
     self.chain = self
@@ -1958,28 +1982,6 @@ const fn are_neighbours(x: i32, y: i32, max: i32) -> bool {
   false
 }
 
-/// The point index the next shape of an open arcless chain starts at.
-///
-/// Port of `SHAPE_LINE_CHAIN::NextShape`,
-/// `libs/kimath/src/geometry/shape_line_chain.cpp:1302`, reduced to the
-/// case this crate can produce: with no arcs every shape is one segment,
-/// so the answer is the next point index, except that KiCad refuses to
-/// wrap (`:1313`) and answers `-1` one point before the end of an open
-/// chain (`:1318`). The `-1` is kept as the return value because
-/// [`Line::clip_vertex_range`] uses it as its loop's stop condition.
-const fn next_shape(point_count: usize, index: usize) -> isize {
-  if point_count == 0 || index + 1 >= point_count {
-    return -1;
-  }
-
-  // `aPointIndex == lastIndex - 1` on an open chain.
-  if index + 2 == point_count {
-    return -1;
-  }
-
-  (index + 1) as isize
-}
-
 /// The first vertex at a position.
 ///
 /// Port of the `findVertex` lambda, `pcbnew/router/pns_line.cpp:347`, a
@@ -2180,9 +2182,10 @@ impl Line {
   ///
   /// # Deviations
   ///
-  /// The arc splice `restoreUntouchedArcs( out, pnew )` (`:661`) is left
-  /// out: it returns immediately when the input has no arcs and this
-  /// crate has none.
+  /// The arc splice `restoreUntouchedArcs( out, pnew )` (`:661`) is
+  /// `restore_untouched_arcs` and is called. It is a no operation on a
+  /// path whose original carried no arc, which is every path in a
+  /// mitered session.
   ///
   /// The second of the three `ON_EDGE` neighbour tiers (`:578`) is dead
   /// code, in KiCad as here: it asks for a vertex that carries a hull
@@ -2346,7 +2349,20 @@ impl Line {
     let in_last = obstacle.point_inside(last_point, 0)
       && !obstacle.point_on_edge(last_point, 0);
 
-    self.walk_graph(&mut vertices, path_count, hull_count, in_last, last_point)
+    let mut out = self.walk_graph(
+      &mut vertices,
+      path_count,
+      hull_count,
+      in_last,
+      last_point,
+    )?;
+
+    // :661. The splice lives here rather than at the end of
+    // [`Line::walk_graph`] because it needs `pnew`, the split copy of the
+    // path, which is the setup half's local.
+    restore_untouched_arcs(&mut out, &pnew);
+
+    Some(out)
   }
 
   /// The graph search half of [`Line::walkaround`].
@@ -2540,16 +2556,111 @@ impl Line {
       out.append(vertices[current].pos);
     }
 
-    // :660. `restoreUntouchedArcs` would follow; see the deviation note.
+    // :660. The duplicates the walk emits at a vertex outside the hull
+    // have to go before the point runs can be matched against the
+    // original, which is what the comment at `:658` says.
     out.simplify2(false);
 
     Some(out)
   }
 }
 
+/// Glue the arcs of the original path back onto a walked polyline.
+///
+/// Port of `restoreUntouchedArcs`,
+/// `pcbnew/router/pns_line.cpp:255`, whose one caller is the tail of
+/// [`Line::walkaround`] (`:661`). The walkaround works on the polyline
+/// approximation and loses every arc reference on the way, so this finds
+/// the longest common prefix and the longest common suffix **by exact
+/// point equality** (`:265`, `:273`) and rebuilds the path as the
+/// original's prefix, the walked middle, and the original's suffix. An
+/// arc that lies wholly inside one of the two untouched runs comes back
+/// with it; an arc the walk cut into is gone, and its approximation
+/// stands in for it.
+///
+/// Two consequences of KiCad's shape, both inherited deliberately:
+///
+/// - The match is on points, so a walk that moved one vertex of an arc's
+///   approximation drops the whole arc.
+/// - The rebuild goes through [`LineChain::slice`], so a prefix or a
+///   suffix that ends inside an arc extends to that arc's far end, which
+///   is erratum E10.
+///
+/// A path with no arcs in the original is left exactly as it was
+/// (`:257`), which is why a mitered session cannot tell this routine is
+/// here.
+fn restore_untouched_arcs(path: &mut LineChain, original: &LineChain) {
+  // :257
+  if original.arc_count() == 0 {
+    return;
+  }
+
+  let original_count = original.point_count();
+  let path_count = path.point_count();
+
+  // :263
+  let mut head = 0;
+
+  while head < original_count
+    && head < path_count
+    && original.point(head) == path.point(head)
+  {
+    head += 1;
+  }
+
+  // :271. KiCad's `tail < origCount - head && tail < pathCount - head`,
+  // written so that neither difference can underflow: the loop above
+  // leaves `head` no larger than either count.
+  let mut tail = 0;
+
+  while tail + head < original_count
+    && tail + head < path_count
+    && original.point(original_count - 1 - tail)
+      == path.point(path_count - 1 - tail)
+  {
+    tail += 1;
+  }
+
+  // :279
+  if head == 0 && tail == 0 {
+    return;
+  }
+
+  let mut rebuilt = LineChain::new();
+
+  rebuilt.set_width(path.width());
+
+  // :284
+  if head > 0
+    && let Ok(prefix) = original.slice(0, head - 1)
+  {
+    rebuilt = prefix;
+    rebuilt.set_width(path.width());
+  }
+
+  // :287, `std::max( head - 1, 0 )` as the start.
+  if head + tail < path_count
+    && let Ok(middle) =
+      path.slice(head.saturating_sub(1), path_count - tail - 1)
+  {
+    rebuilt.append_chain(&middle);
+  }
+
+  // :290
+  if tail > 0
+    && let Ok(suffix) =
+      original.slice(original_count - tail, original_count - 1)
+  {
+    rebuilt.append_chain(&suffix);
+  }
+
+  *path = rebuilt;
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::geometry::arc::ShapeArc;
   use crate::geometry::hull::octagonal_hull;
   use crate::item::{ItemBody, LayerRange, Segment, Via, ViaType};
   use crate::node::World;
@@ -3500,6 +3611,116 @@ mod tests {
     let at = Vec2::new(2_000_000, -30_000);
 
     assert_eq!(line.snap_to_neighbour_segments(at, 1), at);
+  }
+
+  /// A quarter turn of radius 1 mm, clockwise about `start + (1 mm, 0)`.
+  fn quarter_arc(start: Vec2) -> ShapeArc {
+    ShapeArc::from_start_end_center(
+      start,
+      start + Vec2::new(1_000_000, 1_000_000),
+      start + Vec2::new(1_000_000, 0),
+      true,
+      WIDTH,
+    )
+  }
+
+  /// A chain of two straight legs, a quarter turn and two straight legs.
+  ///
+  /// Two legs on each side so that a walk can move a vertex on either
+  /// side of the arc without moving an endpoint of the chain, which a
+  /// walkaround never does.
+  fn straight_arc_straight() -> LineChain {
+    let arc = quarter_arc(Vec2::new(1_000_000, 0));
+    let mut chain = LineChain::new();
+
+    chain.append(Vec2::new(-1_000_000, 0));
+    chain.append(Vec2::new(0, 0));
+    chain.append_arc(&arc, LineChain::ARC_POLYGONIZATION_MAX_ERROR);
+    chain.append(arc.end() + Vec2::new(0, 1_000_000));
+    chain.append(arc.end() + Vec2::new(0, 2_000_000));
+    chain
+  }
+
+  #[test]
+  fn restore_untouched_arcs_brings_back_an_arc_the_walk_left_alone() {
+    let original = straight_arc_straight();
+    let arc = original.arc(0).expect("the fixture carries one arc");
+
+    // What a walkaround hands back: the same points with the arc
+    // references gone, plus a detour on the last straight leg, which is
+    // the only part the walk touched.
+    let mut walked = LineChain::from_slice(original.points(), false);
+    let last = walked.point_count() - 1;
+
+    walked.insert(last, walked.point(last) + Vec2::new(500_000, -250_000));
+
+    assert_eq!(walked.arc_count(), 0);
+
+    let mut path = walked.clone();
+
+    restore_untouched_arcs(&mut path, &original);
+
+    // The arc is back, with its three points untouched, and the detour
+    // survived.
+    assert_eq!(path.arc_count(), 1);
+
+    let restored = path.arc(0).expect("the arc came back");
+
+    assert_eq!(restored.start(), arc.start());
+    assert_eq!(restored.arc_mid(), arc.arc_mid());
+    assert_eq!(restored.end(), arc.end());
+    assert_eq!(path.last_point(), walked.last_point());
+    assert!(path.find(walked.point(last), 0).is_some());
+  }
+
+  #[test]
+  fn restore_untouched_arcs_drops_an_arc_the_walk_cut_into() {
+    let original = straight_arc_straight();
+
+    // The walk moved a vertex on each side of the arc, so the common
+    // prefix stops at the first of them and the common suffix at the
+    // second; the arc falls inside the walked middle, which is a plain
+    // polyline, and nothing splices it back. The match is on exact points
+    // (`:265`, `:273`), which is why a nanometre is enough.
+    let mut walked = LineChain::from_slice(original.points(), false);
+    let last = walked.point_count() - 1;
+
+    walked.set_point(1, walked.point(1) + Vec2::new(0, -1));
+    walked.set_point(last - 1, walked.point(last - 1) + Vec2::new(1, 0));
+
+    let mut path = walked.clone();
+
+    restore_untouched_arcs(&mut path, &original);
+
+    assert_eq!(path.arc_count(), 0, "a cut arc may not come back");
+    assert_eq!(path.points(), walked.points());
+  }
+
+  #[test]
+  fn restore_untouched_arcs_leaves_an_arc_free_path_exactly_as_it_was() {
+    // `:257`, the early return that makes every mitered session blind to
+    // this routine.
+    let original = LineChain::from_slice(
+      &[
+        Vec2::new(0, 0),
+        Vec2::new(100_000, 0),
+        Vec2::new(200_000, 100_000),
+      ],
+      false,
+    );
+    let walked = LineChain::from_slice(
+      &[
+        Vec2::new(0, 0),
+        Vec2::new(50_000, -50_000),
+        Vec2::new(200_000, 100_000),
+      ],
+      false,
+    );
+    let mut path = walked.clone();
+
+    restore_untouched_arcs(&mut path, &original);
+
+    assert_eq!(path, walked);
   }
 
   #[test]

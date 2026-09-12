@@ -32,12 +32,45 @@
 //!
 //! # What this revision covers
 //!
-//! Phases 1 to 4 of note 04 section 8.5: the hull walk, the line stack,
+//! Phases 1 to 5 of note 04 section 8.5: the hull walk, the line stack,
 //! the springback stack, the root line index, the optimizer queue, the
 //! main loop, solids through the walkaround escalation
 //! (`Shove::on_colliding_solid`) and vias in all three of their roles
-//! (pusher, pushee and head). Arcs are phase 5 and every arc site
-//! carries a `TODO(arcs)`.
+//! (pusher, pushee and head), plus the three arc paths of note 09
+//! section 5.2.
+//!
+//! # Arcs, and why the shove never meets one
+//!
+//! An arc track cannot be answered by `Shove::shove_iteration`'s obstacle
+//! search. The search runs one pass per kind over
+//! `OBSTACLE_SEARCH_ORDER`, which is KiCad's
+//! `{ SOLID_T, VIA_T, SEGMENT_T, HOLE_T }`
+//! (`pcbnew/router/pns_shove.cpp:1650`), and `ITEM::OfKind` is a bitwise
+//! `( aKindMask & m_kind ) != 0` (`pcbnew/router/pns_item.h:181`) over an
+//! enum where `SEGMENT_T` is 8 and `ARC_T` is 16 (`:107`, `:108`). The
+//! two bits do not overlap, so `NODE::NearestObstacle`'s visitor rejects
+//! every arc on the first line of its body (`pcbnew/router/pns_node.cpp:243`),
+//! and the only thing that can rewrite the obstacle afterwards,
+//! `fixupViaCollisions`, can only replace it with a **via** (`:1591`).
+//! `ARC_T` is therefore never asked for and the two arc arms of
+//! `shoveIteration` (`:1793`, `:1833`) are unreachable in KiCad.
+//!
+//! That is defined behaviour rather than a crash, so the milestone rule
+//! says reproduce it and `OBSTACLE_SEARCH_ORDER` stays as KiCad writes
+//! it. What happens to a route that overlaps an arc track in shove mode:
+//! the shove finds nothing, the head is left lying across the arc, and
+//! `LINE_PLACER::FixRoute`'s own collision gate lets it through, because
+//! in shove mode that gate blocks on solids alone
+//! (`pcbnew/router/pns_line_placer.cpp:1596`). The overlap reaches the
+//! board and only the host's own violation list sees it. In walkaround
+//! and mark obstacles mode the same gate refuses the fix, so the overlap
+//! cannot be committed there.
+//!
+//! The arc paths are still written, and written correctly, because this
+//! port's world hands the shove whatever a host put on the board: the
+//! day `OBSTACLE_SEARCH_ORDER` gains [`Kind::ARC`], or another caller
+//! dispatches an arc obstacle, `Shove::on_colliding_arc` and the two arms
+//! have to be right. See `doc/log/2026-09-12.md`.
 //!
 //! # Solids and the walkaround escalation
 //!
@@ -139,6 +172,7 @@ use std::collections::BTreeMap;
 
 use crate::algo_base::AlgoContext;
 use crate::collide::{CollisionSearchOptions, LineHead, collide_line_items};
+use crate::geometry::arc::ShapeArc;
 use crate::geometry::box2::Box2;
 use crate::geometry::direction45::Direction45;
 use crate::geometry::line_chain::{LineChain, PointInsideTracker};
@@ -246,8 +280,30 @@ const FANOUT_WIDTH_SLACK: i32 = 1;
 /// a priority ladder: solids first because they can never be shoved and
 /// therefore have to be walked around before anything else is disturbed,
 /// then vias, then segments, then holes.
+///
+/// [`Kind::ARC`] is deliberately **not** in the list, because KiCad does
+/// not ask for it either; the module documentation has the whole finding
+/// and what it costs a route that overlaps an arc track.
 const OBSTACLE_SEARCH_ORDER: [Kind; 4] =
   [Kind::SOLID, Kind::VIA, Kind::SEGMENT, Kind::HOLE];
+
+/// How much longer than the obstacle a shoved arc line may be.
+///
+/// `extensionWalkThreshold`, `pcbnew/router/pns_shove.cpp:701`. The gate
+/// is `shovedLen / obsLen - 1.0 > 1.0`, so a shove that more than doubles
+/// the line's length is refused and the walkaround is asked instead.
+/// `Shove::on_colliding_segment` has no counterpart.
+const EXTENSION_WALK_THRESHOLD: f64 = 1.0;
+
+/// The extra clearance a hull built over an arc's approximation gets.
+///
+/// `KiROUND( SHAPE_ARC::DefaultAccuracyForPCB() )`,
+/// `pcbnew/router/pns_shove.cpp:593`, whose comment at `:588` says the
+/// intent: "Arcs need additional clearance to ensure the hulls are always
+/// bigger than the arc". The constant is `ARC_HIGH_DEF`, 5000 nm, while
+/// the chain approximates an arc to `ARC_HIGH_DEF / 5`, 1000 nm, so it
+/// carries a factor of five of headroom.
+const ARC_HULL_EXTRA_CLEARANCE: i32 = ShapeArc::DEFAULT_ACCURACY_FOR_PCB;
 
 // ---------------------------------------------------------------------
 // Via handles
@@ -2109,9 +2165,13 @@ impl Shove {
   /// KiCad writes a direction rejected candidate into its out parameter
   /// before moving on (`:470`), so a caller that ignores the return value
   /// can read a shape that failed. `onCollidingArc` is exactly such a
-  /// caller (note 04 section 1.7); it is `TODO(arcs)`, and every caller
-  /// here reads the shape only on success, so the wart has no
-  /// counterpart.
+  /// caller (note 04 section 1.7): its length gate at
+  /// `pcbnew/router/pns_shove.cpp:704` measures `shovedLine` whether or
+  /// not `ShoveObstacleLine` succeeded. This answers [`None`] on failure
+  /// and every caller here, `Shove::on_colliding_arc` included, reads the
+  /// shape only on success, so the wart has no counterpart; the one
+  /// behaviour that goes with it is recorded on
+  /// `Shove::on_colliding_arc`.
   fn shove_line_to_hull_set(
     &self,
     world: &World,
@@ -2258,9 +2318,24 @@ impl Shove {
   /// placer uses it as a geometric primitive outside any run
   /// (`pcbnew/router/pns_diff_pair_placer.cpp:251`).
   ///
-  /// `TODO(arcs)`: the arc clearance bump at `:593`, whose accumulation
-  /// across several arc segments note 04 section 2.3 flags as probably
-  /// unintended.
+  /// # The arc clearance bump, erratum E26 fixed
+  ///
+  /// A hull built around one chord of an arc's approximation has to be
+  /// bigger than the arc itself, so KiCad adds
+  /// `ARC_HULL_EXTRA_CLEARANCE` for an arc segment (`:593`). It adds it
+  /// with `clearance += ...` on a variable declared outside the loop at
+  /// `:570`, so the bump **accumulates**: an arc spanning twelve
+  /// approximation segments adds 60000 nm and every hull built after it
+  /// in the same pass keeps that inflation, including the hulls of the
+  /// pusher's straight segments and of its via. The comment at `:588`
+  /// states a per hull intent.
+  ///
+  /// The bump is per hull here. The accumulation is not a behaviour to
+  /// preserve: it makes a shove's result depend on how many chords the
+  /// chain happened to approximate an arc with, which is a function of
+  /// the polygonisation accuracy and of nothing a user can see, and it
+  /// inflates hulls of segments that have no arc anywhere near them. See
+  /// `doc/log/2026-09-12.md`.
   pub fn shove_obstacle_line(
     &self,
     world: &World,
@@ -2327,9 +2402,16 @@ impl Shove {
       for index in 0..cur_line.segment_count() {
         let segment = cur_line.segment_item(world, index, PROBE_UID);
 
+        // :589, erratum E26 fixed: the bump belongs to this hull only.
+        let arc_bump = if cur_line.shape().is_arc_segment(index) {
+          ARC_HULL_EXTRA_CLEARANCE
+        } else {
+          0
+        };
+
         // :596
         hulls.push(segment.hull(
-          clearance + extra_expansion,
+          clearance + extra_expansion + arc_bump,
           obstacle.width(),
           obstacle.layer(),
         ));
@@ -2541,6 +2623,111 @@ impl Shove {
       allow_redundant: false,
       push: PushMode::Top,
     })));
+
+    (ShoveStatus::Ok, effects)
+  }
+
+  /// Resolve a collision with a stored arc by pushing its line aside.
+  ///
+  /// Port of `onCollidingArc`,
+  /// `pcbnew/router/pns_shove.cpp:689`, the arc twin of
+  /// `Shove::on_colliding_segment`. It is written out rather than folded
+  /// into that routine because the two differ in five places, every one
+  /// of them KiCad's:
+  ///
+  /// - the assembly is `assembleLine( aObstacleArc, &segIndex )` with the
+  ///   pre cleanup flag left at its default (`:692`), so no `Simplify2`
+  ///   runs over the obstacle before the shove;
+  /// - there is a length gate the segment version has none of: the shoved
+  ///   line may not be more than twice as long as the obstacle was
+  ///   (`:701` to `:711`), and a line that stretched further asks for the
+  ///   walkaround instead. Both lengths are `SHAPE_LINE_CHAIN::Length()`,
+  ///   which measures true arc lengths and not their chords;
+  /// - the shoved line is not simplified before it is stored (`:670` has
+  ///   no counterpart at `:723`);
+  /// - `unwindLineStack( &obstacleLine )` is missing (`:672` has no
+  ///   counterpart), so a stale copy of the obstacle can stay on the line
+  ///   stack;
+  /// - it answers `SH_OK` even when the shove failed (`:731`), where the
+  ///   segment version answers `SH_INCOMPLETE` (`:682`). Note 04 section
+  ///   2.3 already records that one.
+  ///
+  /// All five are reproduced. None is undefined behaviour or a crash and
+  /// the routine is unreachable in KiCad anyway (see the module
+  /// documentation), so there is nothing here the milestone rule would
+  /// have this port fix.
+  ///
+  /// # One deviation, in the length gate
+  ///
+  /// KiCad measures `shovedLine` whether or not `ShoveObstacleLine`
+  /// succeeded, and `shoveLineToHullSet` writes a direction rejected
+  /// candidate into that out parameter before moving on (`:470`). So in
+  /// KiCad a **failed** shove can still trip the gate and ask for a walk.
+  /// `Shove::shove_obstacle_line` answers [`None`] on failure and hands
+  /// out no shape at all, so the gate here measures the obstacle against
+  /// itself and the factor is zero. The difference is confined to a
+  /// failed shove whose last rejected candidate happened to be more than
+  /// twice as long as the obstacle; everything else is unchanged.
+  fn on_colliding_arc(
+    &self,
+    world: &World,
+    context: &AlgoContext<'_>,
+    node: NodeId,
+    current: &Line,
+    obstacle_arc: ItemId,
+  ) -> (ShoveStatus, Vec<ShoveEffect>) {
+    // :692. `aPreCleanup` is left at its default, unlike the segment
+    // path, so nothing simplifies the obstacle first.
+    let obstacle_line =
+      world.assemble_line(node, obstacle_arc, None, true, false, true);
+
+    // :696
+    if obstacle_line.has_locked_segments(world) {
+      trace(context, || {
+        "shove: try walk (locked segments, arc)".to_string()
+      });
+
+      return (ShoveStatus::TryWalk, Vec::new());
+    }
+
+    // :699
+    let shoved =
+      self.shove_obstacle_line(world, context, node, current, &obstacle_line);
+
+    // :703. `Length()` counts an arc's true length, not its chords.
+    let obstacle_length = obstacle_line.shape().length() as f64;
+    let shoved_length = shoved
+      .as_ref()
+      .map_or(obstacle_length, |line| line.shape().length() as f64);
+    let extension_factor = if obstacle_length == 0.0 {
+      0.0
+    } else {
+      shoved_length / obstacle_length - 1.0
+    };
+
+    // :710
+    if extension_factor > EXTENSION_WALK_THRESHOLD {
+      return (ShoveStatus::TryWalk, Vec::new());
+    }
+
+    // :720 and :731. A failed shove still answers `SH_OK`.
+    let Some(shoved) = shoved else {
+      return (ShoveStatus::Ok, Vec::new());
+    };
+
+    // :722
+    let rank = current.rank(world) - 1;
+
+    // :725. No `unwindLineStack` and no `Simplify2`, both of which the
+    // segment path does.
+    let effects = vec![ShoveEffect::ReplaceLine(Box::new(LineReplacement {
+      old: obstacle_line,
+      new: shoved,
+      rank,
+      include_in_changed_area: true,
+      allow_redundant: false,
+      push: PushMode::Top,
+    }))];
 
     (ShoveStatus::Ok, effects)
   }
@@ -3498,7 +3685,7 @@ impl Shove {
   /// Port of `shoveIteration`,
   /// `pcbnew/router/pns_shove.cpp:1633`. It reads the top of the line
   /// stack, looks for the nearest obstacle in the priority order
-  /// [`OBSTACLE_SEARCH_ORDER`] gives, and dispatches on what it found and
+  /// `OBSTACLE_SEARCH_ORDER` gives, and dispatches on what it found and
   /// on how that obstacle is ranked.
   ///
   /// It mutates no item and neither stack: everything it decides comes
@@ -3523,7 +3710,14 @@ impl Shove {
   /// a locked track, a locked via and a via the settings forbid moving
   /// all end up with the current line walking around them.
   ///
-  /// `TODO(arcs)`: the arc branches at `:1793` and `:1833`.
+  /// # Arcs
+  ///
+  /// The forward arm (`:1833`) and the reverse one (`:1793`) are both
+  /// here and are both dead, because `OBSTACLE_SEARCH_ORDER` never asks
+  /// for [`Kind::ARC`] and nothing downstream can rewrite an obstacle
+  /// into one; the module documentation has the whole finding. They are
+  /// written because this port's world holds whatever a host put on the
+  /// board, so the arms have to be right the day anything reaches them.
   fn shove_iteration(
     &self,
     world: &mut World,
@@ -3614,6 +3808,9 @@ impl Shove {
     let (status, pushed) = if kind.of_kind(Kind::SEGMENT) {
       // :1823
       self.on_colliding_segment(world, context, node, &current, obstacle_item)
+    } else if kind.of_kind(Kind::ARC) {
+      // :1836
+      self.on_colliding_arc(world, context, node, &current, obstacle_item)
     } else if kind.of_kind(Kind::VIA) {
       // :1847
       let next_rank = current.rank(world) - 1;
@@ -3670,6 +3867,27 @@ impl Shove {
   /// `pcbnew/router/pns_shove.cpp:1721` to `:1815`, split out so that the
   /// iteration stays readable. The rule is "the earlier decision wins",
   /// so the current line is the one that yields.
+  ///
+  /// # Erratum E27, fixed
+  ///
+  /// KiCad's `ARC_T` arm (`:1793` to `:1808`) is not the twin of its
+  /// `SEGMENT_T` arm (`:1751` to `:1791`). It omits
+  /// `unwindLineStack( &revLine )`, omits `patchTadpoleVia`, omits the
+  /// "the current line ends with a via that collides with the obstacle"
+  /// handling, and passes `revLine.Rank() - 1` where the segment arm
+  /// passes `revLine.Rank() + 1`. The sign is the anti ping pong
+  /// convention of note 04 section 1.4: a **reverse** collision raises the
+  /// obstacle's rank above the pusher, a forward one lowers it, and
+  /// `- 1` on this path files the obstacle below the pusher on a path
+  /// that just decided the pusher has to yield to it. The
+  /// `//TODO(snh): Handle Arc shove separate from track` at `:1795` says
+  /// the arm was never finished.
+  ///
+  /// So an arc reverse collision runs the segment arm here, by the kind
+  /// test below accepting both. Nothing distinguishes the two cases: what
+  /// the arm needs is the obstacle's assembled **line**, and
+  /// [`World::assemble_line`] seeds from an arc as readily as from a
+  /// segment. See `doc/log/2026-09-12.md`.
   #[allow(clippy::too_many_arguments)]
   fn reverse_collision(
     &self,
@@ -3733,9 +3951,9 @@ impl Shove {
       return (status, effects);
     }
 
-    if !kind.of_kind(Kind::SEGMENT) {
+    if !kind.of_kind(Kind::SEGMENT | Kind::ARC) {
       // :1810, KiCad's `assert( false )` for a reverse collision with
-      // anything else. `TODO(arcs)`: the arc branch at `:1793`.
+      // anything else.
       return (ShoveStatus::Incomplete, Vec::new());
     }
 
@@ -4820,6 +5038,8 @@ mod tests {
   use super::*;
   use crate::geometry::seg::Seg;
   use crate::item::{ItemBody, LayerRange, NetId, Segment};
+  use crate::rules::FixedClearance;
+  use crate::settings::RoutingSettings;
 
   /// The width every test track has.
   const WIDTH: i32 = 200000;
@@ -5141,6 +5361,117 @@ mod tests {
 
     assert!(!shove.rewind_to_last_locked_node());
     assert!(!shove.rewind_springback_to(&mut world, root));
+  }
+
+  /// A pusher line whose chain starts with a quarter turn and then runs
+  /// straight east for ten millimetres.
+  ///
+  /// `with_arc` selects whether the chain carries the arc as an arc or
+  /// only as the polyline of it; the points are the same either way.
+  fn arc_then_straight_pusher(with_arc: bool) -> Line {
+    let arc = ShapeArc::from_start_end_center(
+      Vec2::new(0, 0),
+      Vec2::new(1_000_000, 1_000_000),
+      Vec2::new(1_000_000, 0),
+      true,
+      WIDTH,
+    );
+    let mut chain = LineChain::new();
+
+    chain.append_arc(&arc, LineChain::ARC_POLYGONIZATION_MAX_ERROR);
+    chain.append(Vec2::new(11_000_000, 1_000_000));
+
+    if !with_arc {
+      chain = LineChain::from_slice(chain.points(), false);
+    }
+
+    let mut line = Line::new();
+
+    line.set_width(WIDTH);
+    line.set_layer(0);
+    line.set_net(Some(NetId(1)));
+    line.set_shape(chain);
+    line
+  }
+
+  /// A straight obstacle line on its own net.
+  fn obstacle_line(from: Vec2, to: Vec2) -> Line {
+    let mut line = Line::new();
+
+    line.set_width(WIDTH);
+    line.set_layer(0);
+    line.set_net(Some(NetId(2)));
+    line.set_shape(LineChain::from_slice(&[from, to], false));
+    line
+  }
+
+  #[test]
+  fn the_arc_hull_clearance_bump_is_per_hull_erratum_e26() {
+    // `pcbnew/router/pns_shove.cpp:589`. KiCad adds
+    // `ARC_HULL_EXTRA_CLEARANCE` with `clearance +=` on a variable
+    // declared outside the hull loop, so every arc segment permanently
+    // inflates the clearance of every hull built after it in the same
+    // pass. The pusher below opens with a quarter turn of a dozen
+    // approximation chords, so under the erratum the straight run after
+    // it would be hulled at more than 50000 nm of extra clearance and
+    // would push an obstacle that far out of its way.
+    let rules = FixedClearance::uniform(100_000);
+    let settings = RoutingSettings::default();
+    let context = AlgoContext::new(&rules, &settings);
+    let world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let root = world.root();
+    let shove = Shove::new(root);
+    let curved = arc_then_straight_pusher(true);
+    let plain = arc_then_straight_pusher(false);
+
+    assert_eq!(curved.shape().points(), plain.shape().points());
+    assert!(
+      curved.shape().segment_count() > 4,
+      "the quarter turn has to span several chords for the erratum to bite"
+    );
+    assert_eq!(plain.shape().arc_count(), 0);
+
+    // An obstacle alongside the straight run, far from the arc. What the
+    // pusher's chain calls that run may not change where it lands.
+    let far = obstacle_line(
+      Vec2::new(5_000_000, 1_250_000),
+      Vec2::new(9_000_000, 1_250_000),
+    );
+    let pushed_by_arc_line = shove
+      .shove_obstacle_line(&world, &context, root, &curved, &far)
+      .expect("the obstacle can be pushed aside");
+    let pushed_by_polyline = shove
+      .shove_obstacle_line(&world, &context, root, &plain, &far)
+      .expect("the obstacle can be pushed aside");
+
+    assert_eq!(
+      pushed_by_arc_line.shape().points(),
+      pushed_by_polyline.shape().points(),
+      "an arc earlier in the pusher inflated a later hull"
+    );
+
+    // The other half of the claim: the bump is still applied where it
+    // belongs, so an obstacle alongside the **arc** is pushed further
+    // than the same polyline would push it.
+    // Alongside the outside of the quarter turn, 295000 nm from its
+    // centreline: outside every hull the polyline builds, inside the
+    // ones the arc segments get their bump on.
+    let near = obstacle_line(
+      Vec2::new(-127_835, 703_571),
+      Vec2::new(296_429, 1_127_835),
+    );
+    let pushed_by_arc_line = shove
+      .shove_obstacle_line(&world, &context, root, &curved, &near)
+      .expect("the obstacle can be pushed aside");
+    let pushed_by_polyline = shove
+      .shove_obstacle_line(&world, &context, root, &plain, &near)
+      .expect("the obstacle can be pushed aside");
+
+    assert_ne!(
+      pushed_by_arc_line.shape().points(),
+      pushed_by_polyline.shape().points(),
+      "the arc segments got no extra clearance at all"
+    );
   }
 
   #[test]

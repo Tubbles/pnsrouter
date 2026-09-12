@@ -81,12 +81,13 @@ use std::collections::BTreeSet;
 
 use crate::algo_base::AlgoContext;
 use crate::collide::CollisionSearchOptions;
+use crate::geometry::arc::ShapeArc;
 use crate::geometry::direction45::{AngleType, CornerMode, Direction45};
 use crate::geometry::line_chain::LineChain;
 use crate::geometry::seg::Seg;
 use crate::geometry::vec2::Vec2;
 use crate::item::{
-  Item, ItemBody, ItemId, Kind, LayerRange, NetId, Segment, Via,
+  Arc, Item, ItemBody, ItemId, Kind, LayerRange, NetId, Segment, Via,
 };
 use crate::line::{Line, LineVia};
 use crate::mouse_trail::MouseTrailTracer;
@@ -519,6 +520,17 @@ impl Placing {
   /// direction" case, is hard disabled at `:213` and is not ported; note
   /// 03 section 9.5 lists it.
   ///
+  /// # Erratum E11, fixed
+  ///
+  /// KiCad asks `IsPtOnArc` at `:197` and `:204` where the question is
+  /// "does the shape leaving this vertex curve", and `IsPtOnArc` is also
+  /// true for an arc's **last** point even when the segment leaving it is
+  /// straight. In that case KiCad reports the arc's chord direction for a
+  /// straight segment that is not part of the arc. Twenty five lines
+  /// later, at `:222`, the same file asks `IsArcSegment` for the same
+  /// question, which is correct. `shape_direction` asks
+  /// `IsArcSegment` in all three places. See `doc/log/2026-09-12.md`.
+  ///
   /// Returns whether the line changed.
   pub fn handle_pullback(&mut self) -> bool {
     // :178
@@ -539,10 +551,11 @@ impl Placing {
       return true;
     }
 
-    let first_head = Direction45::from_seg(&self.head.segment(0), false);
+    // :197
+    let first_head = shape_direction(self.head.shape(), 0);
     let last_segment_index = point_count - 2;
-    let last_tail =
-      Direction45::from_seg(&self.tail.segment(last_segment_index), false);
+    // :204
+    let last_tail = shape_direction(self.tail.shape(), last_segment_index);
     let angle = first_head.angle(last_tail);
 
     // :218
@@ -550,13 +563,12 @@ impl Placing {
       return false;
     }
 
-    // :224
-    self.direction =
-      Direction45::from_seg(&self.tail.segment(last_segment_index), false);
+    // :222
+    self.direction = shape_direction(self.tail.shape(), last_segment_index);
 
-    // :241. `RemoveShape( -1 )` on an arc free chain is the removal of
-    // the last point.
-    self.tail.chain_mut().remove(point_count - 1);
+    // :241. `RemoveShape( -1 )` drops the whole last **shape**, so an arc
+    // goes as one rather than losing one approximation segment at a time.
+    self.tail.chain_mut().remove_shape(point_count - 1);
 
     // :246
     if self.tail.segment_count() == 0 {
@@ -673,6 +685,13 @@ impl Placing {
   /// a gap, and to contain no forbidden corner either inside itself or at
   /// the junction with the tail.
   ///
+  /// # Erratum E11, fixed
+  ///
+  /// The two posture reads at `:352` and `:362` ask `IsPtOnArc` where
+  /// they mean `IsArcSegment`, exactly as
+  /// [`Placing::handle_pullback`]'s do; `:377`, after the append, already
+  /// asks the right one. All three go through `shape_direction`.
+  ///
   /// Returns whether the line changed.
   pub fn merge_head(&mut self) -> bool {
     // :329
@@ -697,12 +716,17 @@ impl Placing {
       return false;
     }
 
-    let head_direction = Direction45::from_seg(&self.head.segment(0), false);
+    // :352
+    let head_direction = shape_direction(self.head.shape(), 0);
 
     // :357
     if tail_shapes > 0 {
-      let last = self.tail.segment(self.tail.segment_count() - 1);
-      let tail_direction = Direction45::from_seg(&last, false);
+      // :360. KiCad names the index `tail.PointCount() - 2` and then
+      // reads `tail.CSegment( -1 )`, which is the segment at exactly that
+      // index.
+      let last_segment_index = self.tail.point_count() - 2;
+      let tail_direction =
+        shape_direction(self.tail.shape(), last_segment_index);
 
       if head_direction
         .angle(tail_direction)
@@ -718,10 +742,10 @@ impl Placing {
     self.tail.chain_mut().append_chain(&head_chain);
     self.tail.chain_mut().simplify(0);
 
-    // :377
-    let last = self.tail.segment(self.tail.segment_count() - 1);
+    // :375 and :377
+    let last_segment_index = self.tail.point_count() - 2;
 
-    self.direction = Direction45::from_seg(&last, false);
+    self.direction = shape_direction(self.tail.shape(), last_segment_index);
 
     // :382
     self.head.chain_mut().clear();
@@ -2634,6 +2658,123 @@ impl LinePlacer {
     true
   }
 
+  /// Break a stored arc in two at a point.
+  ///
+  /// Port of `SplitAdjacentArcs`,
+  /// `pcbnew/router/pns_line_placer.cpp:1315`, the arc twin of
+  /// [`LinePlacer::split_adjacent_segments`]. Both halves are rebuilt
+  /// through `ConstructFromStartEndCenter` from the original's centre and
+  /// handedness (`:1333`, `:1336`), so each half is a genuine arc of the
+  /// same circle rather than two chords, and both go in with
+  /// `aAllowRedundant` set (`:1340`).
+  ///
+  /// Like the segment version it refuses when the point already carries a
+  /// joint with any link (`:1323`), which is what stops a break landing
+  /// on an endpoint that is already a corner.
+  ///
+  /// Its only caller in KiCad is `ROUTER::BreakSegmentOrArc`
+  /// (`pcbnew/router/pns_router.cpp:1117`), the host's "break track here"
+  /// gesture, which dispatches on the item's kind and sends a segment to
+  /// the other routine. `Start` (`:1466`) and `Move` (`:1543`) call the
+  /// **segment** version only, so clicking on an arc starts a trace
+  /// without breaking it, exactly as in KiCad.
+  ///
+  /// # Erratum E37, reproduced
+  ///
+  /// `at` is used directly as the end of the first half and the start of
+  /// the second with no containment test, so a point that is not on the
+  /// arc produces two arcs that meet somewhere the original never passed
+  /// through. The behaviour is defined rather than a crash, so the
+  /// milestone rule says reproduce it, and
+  /// [`LinePlacer::split_adjacent_segments`] already reproduces the same
+  /// hole in `SplitAdjacentSegments` (`:1304`). The arc version's
+  /// consequence is larger because both halves are rebuilt through a
+  /// centre: an off arc point moves both endpoints, not just the join.
+  /// See `doc/log/2026-09-12.md`.
+  ///
+  /// Answers whether the arc was split.
+  pub fn split_adjacent_arcs(
+    world: &mut World,
+    node: NodeId,
+    item: Option<ItemId>,
+    at: Vec2,
+  ) -> bool {
+    // :1317
+    let Some(id) = item else {
+      return false;
+    };
+
+    let Some(stored) = world.item(id) else {
+      return false;
+    };
+
+    // :1320
+    if !stored.of_kind(Kind::ARC) {
+      return false;
+    }
+
+    let ItemBody::Arc(body) = stored.body() else {
+      return false;
+    };
+
+    let arc = body.arc();
+    let layers = stored.layers();
+    let net = stored.net();
+    let source = stored.source();
+    let flashed = stored.flashed_layers();
+
+    // :1323
+    if let Some(joint) = world.find_joint(node, at, layers.start(), net)
+      && world
+        .joint(joint)
+        .is_some_and(|joint| joint.link_count(world.items(), Kind::ANY) >= 1)
+    {
+      return false;
+    }
+
+    // :1333. `IsClockwise` is `!IsCCW` (`shape_arc.h:319`), and the
+    // centre and the width come off the original.
+    let center = arc.center();
+    let clockwise = !arc.is_ccw();
+    let width = arc.width();
+    let mut halves = [
+      world.make_item(ItemBody::Arc(Arc::new(
+        ShapeArc::from_start_end_center(
+          arc.start(),
+          at,
+          center,
+          clockwise,
+          width,
+        ),
+      ))),
+      world.make_item(ItemBody::Arc(Arc::new(
+        ShapeArc::from_start_end_center(
+          at,
+          arc.end(),
+          center,
+          clockwise,
+          width,
+        ),
+      ))),
+    ];
+
+    for half in &mut halves {
+      half.set_layers(layers);
+      half.set_flashed_layers(flashed);
+      half.set_net(net);
+      half.set_source(source);
+    }
+
+    let [first, second] = halves;
+
+    // :1339
+    world.remove(node, id);
+    world.add_arc(node, first, true);
+    world.add_arc(node, second, true);
+
+    true
+  }
+
   // -----------------------------------------------------------------
   // Start
   // -----------------------------------------------------------------
@@ -3013,26 +3154,41 @@ impl LinePlacer {
   /// `Placing::chained` stays false so the layer may still change
   /// (`:1725`).
   ///
-  /// # `TODO(arcs)`: the commit path is still chord by chord, slice 7
+  /// # Arcs
   ///
-  /// From slice 6 on, a rounded corner mode gives the head a chain that
-  /// carries an arc. The emission loop below walks
-  /// [`LineChain::segment`] by index, so an arc reaches the node as the
-  /// straight chords of its own 1000 nanometre approximation, one
-  /// `SEGMENT` each, rather than as one `ARC`. The route is committed in
-  /// the right place and is clear; what is lost is that the board gets a
-  /// polyline where the user asked for a curve, and the arc cannot be
-  /// recognised again when the line is reassembled.
+  /// The emission loop walks the trace shape by shape rather than segment
+  /// by segment (`:1669`), so a whole arc becomes one `ARC` item and not
+  /// one `SEGMENT` per approximation chord.
   ///
-  /// Three more things wait for the same slice, all of them at
-  /// `pcbnew/router/pns_line_placer.cpp`: the "rollback doesn't work
-  /// properly if fix-all isn't enabled and we are placing arcs" override
-  /// that forces `fix_all` on (`:1650`, `:1651`), the arc aware direction
-  /// of `lastDirSeg` (`:1653`, `:1654`), and the emission loop itself
-  /// (`:1669` to `:1702`) with erratum E24 fixed. Slice 7 replaces all
-  /// four; `fix_route_commits_an_arc_as_its_chords_until_slice_7` in
-  /// `tests/arcs.rs` pins what happens until it does, so that the change
-  /// is visible in that test's diff.
+  /// Two things follow the arc around. `fix_all` is forced on as soon as
+  /// the trace holds an arc (`:1650`), with KiCad's comment "Rollback
+  /// doesn't work properly if fix-all isn't enabled and we are placing
+  /// arcs", so a click in a rounded corner mode silently commits the
+  /// whole trace instead of leaving the last shape rubber banded. And
+  /// `lastDirSeg` (`:1654`) is then always `CSegment( -1 )`, because the
+  /// `-2` branch is gated on `!fixAll`; KiCad's own comment at `:1653`
+  /// says it "will be calculated incorrectly if we end on an arc", and
+  /// what that means in practice is that the direction handed to the next
+  /// leg is the last **approximation chord**'s, not the arc's chord.
+  /// Both are reproduced.
+  ///
+  /// # Erratum E24, fixed
+  ///
+  /// KiCad decides per vertex with `ArcIndex( i ) < 0`, which is true at
+  /// an arc's last point even when the shape leaving it is straight; the
+  /// else branch then runs, `arcIndex == lastArc` holds and the `continue`
+  /// at `:1688` swallows that straight segment. A chain shaped arc,
+  /// straight, arc therefore commits the two arcs and loses the straight
+  /// between them. The rescue condition at `:1673` only covers the case
+  /// where the lost segment is the last one in the trace.
+  ///
+  /// The loop below asks [`LineChain::is_arc_segment`], "does the shape
+  /// leaving this vertex curve", which is the question the whole loop is
+  /// about. The rescue condition is then unnecessary and is not ported:
+  /// its only job was to paper over the same bug at the trace's end.
+  /// `World::add_line`'s arc loop was given the same shape by erratum
+  /// E22 in slice 5, so the two producers of arc items now agree. See
+  /// `doc/log/2026-09-12.md`.
   ///
   /// The collision gate runs against the shove's node in shove mode and
   /// against the placement branch otherwise (`:1589`), because in shove
@@ -3170,9 +3326,9 @@ impl LinePlacer {
       real_end = true;
     }
 
-    // :1650. `TODO(arcs)`: KiCad forces `fix_all` on as soon as the line
-    // holds an arc. Slice 7 writes that, together with the arc emission
-    // loop it belongs to; see the doc comment above.
+    // :1650. An arc anywhere in the trace forces "fix all segments" on,
+    // whatever the settings say.
+    let fix_all = fix_all || trace.arc_count() > 0;
 
     // :1654
     let direction_segment = if !fix_all && trace.segment_count() > 1 {
@@ -3193,8 +3349,49 @@ impl LinePlacer {
 
     // :1669
     let mut last_item = None;
+    // The arc the previous chain segment belonged to, so that the several
+    // approximation segments of one arc emit one item. KiCad's `lastArc`
+    // (`:1667`).
+    let mut open_arc: Option<usize> = None;
 
     for index in 0..last_vertex {
+      // :1671, with erratum E24 fixed: the question is whether the shape
+      // leaving this vertex curves, not whether the vertex belongs to an
+      // arc.
+      if trace.shape().is_arc_segment(index) {
+        let slot = trace.shape().arc_index(index);
+
+        // :1687
+        if slot == open_arc {
+          continue;
+        }
+
+        open_arc = slot;
+
+        let Some(mut shape) = slot.and_then(|slot| trace.shape().arc(slot))
+        else {
+          continue;
+        };
+
+        // :1690, `ARC( l.Arc( arcIndex ), m_currentNet )` then
+        // `SetWidth( pl.Width() )`: the chain's copy of an arc carries no
+        // width of its own (`shape_line_chain.cpp:1624`).
+        shape.set_width(trace.width());
+
+        let mut item = world.make_item(ItemBody::Arc(Arc::new(shape)));
+
+        item.set_net(net);
+        item.set_layers_and_flash_all(LayerRange::single(layer));
+
+        // :1697
+        last_item = world.add_arc(last, item, false);
+
+        continue;
+      }
+
+      open_arc = None;
+
+      // :1675
       let mut item = world.make_item(ItemBody::Segment(Segment::new(
         trace.segment(index),
         trace.width(),
@@ -3203,6 +3400,7 @@ impl LinePlacer {
       item.set_net(net);
       item.set_layers_and_flash_all(LayerRange::single(layer));
 
+      // :1682
       last_item = world.add_segment(last, item, false);
     }
 
@@ -3611,6 +3809,12 @@ impl LinePlacer {
   /// Phase two assembles the line, merges its collinear segments,
   /// simplifies the chain and stores the result when either step changed
   /// something.
+  ///
+  /// `latest` is a `LINKED_ITEM*` in KiCad and its assertion accepts
+  /// `SEGMENT_T | ARC_T` (`:1896`), so from slice 7 of
+  /// `doc/work/012-arcs.md` on it can be the last `ARC`
+  /// [`LinePlacer::fix_route`] emitted (`:1695`).
+  /// [`World::assemble_line`] seeds from either.
   fn simplify_new_line(
     world: &mut World,
     context: &AlgoContext<'_>,
@@ -3673,6 +3877,43 @@ impl LinePlacer {
   }
 }
 
+/// The routing direction of the shape leaving a vertex.
+///
+/// The four `DIRECTION_45( head.CArcs()[head.ArcIndex( i )] )` reads of
+/// `pcbnew/router/pns_line_placer.cpp` (`:197`, `:204`, `:222`, `:352`,
+/// `:362`, `:377`), folded into one place: a vertex whose leaving shape
+/// curves answers the **arc's chord** direction, and every other vertex
+/// answers the direction of the straight segment leaving it.
+///
+/// # Erratum E11, fixed
+///
+/// Four of the six sites ask `IsPtOnArc`, which is also true at an arc's
+/// last point when the segment leaving it is straight; the other two ask
+/// `IsArcSegment`, which is the question all six mean. This asks
+/// [`LineChain::is_arc_segment`] everywhere. A chain with no arcs cannot
+/// tell the difference, so no mitered session moves.
+///
+/// # The octant boundary
+///
+/// `Direction45::from_arc` reads the chord, and the chord of a 45 degree
+/// fillet is the bisector of its two tangents, 22.5 degrees off each,
+/// which is not an octant. Note 09 section 3.3 and the slice 6 entry of
+/// `doc/log/2026-09-12.md` measure one such chord a hundredth of a degree
+/// short of the boundary, so a nanometre of noise in either endpoint
+/// answers the neighbouring octant. That is KiCad's behaviour and the
+/// posture decisions built on it inherit the knife edge; a quarter turn
+/// is the clean case, its chord landing exactly on a diagonal.
+fn shape_direction(chain: &LineChain, vertex: usize) -> Direction45 {
+  if chain.is_arc_segment(vertex)
+    && let Some(slot) = chain.arc_index(vertex)
+    && let Some(arc) = chain.arc(slot)
+  {
+    return Direction45::from_arc(&arc, false);
+  }
+
+  Direction45::from_seg(&chain.segment(vertex), false)
+}
+
 /// Queue the collinear stubs hanging off one joint for removal.
 ///
 /// The `processJoint` lambda of `simplifyNewLine`,
@@ -3681,6 +3922,31 @@ impl LinePlacer {
 /// width and overlapping layers that contains, or is contained in, the
 /// reference segment and whose far joint has exactly one link is queued.
 /// The second case queues the reference segment itself and stops looking.
+///
+/// # Erratum E25, unrepresentable here
+///
+/// KiCad's neighbour filter accepts `SEGMENT_T | ARC_T` (`:1919`) and
+/// then reads `Width()` and `Seg()` through
+/// `static_cast<const SEGMENT*>` (`:1925`, `:1931`). `ARC` and `SEGMENT`
+/// are siblings under `LINKED_ITEM` (`pns_arc.h:37`,
+/// `pns_segment.h:38`), not related by inheritance, so for an arc
+/// neighbour those casts read a `SHAPE_SEGMENT` out of a `SHAPE_ARC`'s
+/// bytes and the containment test runs on whatever falls out. Rust has no
+/// way to write that, so the port has to decide what an arc neighbour
+/// does, and the answer is **nothing**: the body match below skips it.
+///
+/// That is what the routine means. It exists to drop a collinear stub
+/// that would block line assembly (`:1898`), and `SEG::Contains( SEG )`
+/// is a statement about two straight, collinear segments; an arc is
+/// neither contained in a segment nor a container of one unless it is
+/// degenerate, in which case it has no business on the board. The
+/// reference item is never an arc either, the outer loop at `:1961`
+/// filtering `added` down to `SEGMENT_T` alone, which is reproduced.
+///
+/// The kind filter is kept as KiCad writes it rather than narrowed to
+/// `Kind::SEGMENT`, so that the shape of the transcription still matches
+/// and a future reader can see where the cast was. See
+/// `doc/log/2026-09-12.md`.
 fn process_stub_joint(
   world: &World,
   node: NodeId,
@@ -3732,6 +3998,9 @@ fn process_stub_joint(
       continue;
     }
 
+    // :1925 and :1931 in KiCad read `Width()` and `Seg()` off this
+    // neighbour through a cast that is undefined for an arc; here an arc
+    // neighbour simply takes no part, see erratum E25 above.
     let ItemBody::Segment(other_body) = other.body() else {
       continue;
     };
@@ -4101,6 +4370,303 @@ mod tests {
         )
         .is_none()
     );
+  }
+
+  /// A quarter turn arc of radius 1 mm, clockwise about
+  /// `start + (1 mm, 0)`.
+  fn quarter_arc(start: Vec2) -> ShapeArc {
+    ShapeArc::from_start_end_center(
+      start,
+      start + at(1_000_000, 1_000_000),
+      start + at(1_000_000, 0),
+      true,
+      WIDTH,
+    )
+  }
+
+  /// A placer standing on a branch, its whole trace in the tail, ready to
+  /// be asked to fix.
+  ///
+  /// The emission loop of [`LinePlacer::fix_route`] is reached only from
+  /// a live placement, and the chains the tests below need cannot be
+  /// produced by routing at will, so the state is assembled here.
+  fn placer_with_tail(
+    world: &mut World,
+    settings: &RoutingSettings,
+    chain: LineChain,
+  ) -> LinePlacer {
+    let root = world.root();
+    let mut placer = LinePlacer::new(world, root, settings, Sizes::default());
+    let mut placing = placing_at(chain.point(0));
+
+    placing.tail.set_shape(chain);
+    placing.net = Some(NetId(1));
+
+    placer.state = PlacerState::Placing(Box::new(placing));
+    placer.last_node = Some(world.branch(root));
+    placer
+  }
+
+  /// The kind of every item a fix stored, in the order the emission loop
+  /// produced them.
+  fn committed_kinds(world: &World, placer: &LinePlacer) -> Vec<Kind> {
+    let node = placer.last_node.expect("the fix wrote into a branch");
+    let (added, _removed) = world.get_updated_items(node);
+
+    added
+      .into_iter()
+      .filter_map(|id| world.item(id).map(Item::kind))
+      .filter(|kind| kind.of_kind(Kind::SEGMENT | Kind::ARC))
+      .collect()
+  }
+
+  #[test]
+  fn fix_route_emits_a_whole_arc_as_one_item() {
+    let rules = FixedClearance::uniform(1000);
+    let settings = RoutingSettings {
+      corner_mode: CornerMode::Rounded45,
+      ..RoutingSettings::default()
+    };
+    let context = AlgoContext::new(&rules, &settings);
+    let mut world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let arc = quarter_arc(at(1_000_000, 0));
+    let mut chain = LineChain::new();
+
+    chain.append(at(0, 0));
+    chain.append_arc(&arc, LineChain::ARC_POLYGONIZATION_MAX_ERROR);
+    chain.append(arc.end() + at(0, 1_000_000));
+
+    let mut placer = placer_with_tail(&mut world, &settings, chain);
+
+    // The arc alone is a dozen chain segments, and it has to reach the
+    // node as one `ARC` between the two straights.
+    assert!(placer.trace().expect("placing").segment_count() > 5);
+    assert!(placer.fix_route(&mut world, &context, arc.end(), None, true));
+    assert_eq!(
+      committed_kinds(&world, &placer),
+      vec![Kind::SEGMENT, Kind::ARC, Kind::SEGMENT]
+    );
+
+    // And the arc stored is the arc the chain carried, with the line's
+    // width rather than the chain copy's zero (`:1691`).
+    let node = placer.last_node.expect("the fix wrote into a branch");
+    let stored: Vec<ShapeArc> = world
+      .all_items_in_net(node, Some(NetId(1)), Kind::ARC)
+      .into_iter()
+      .filter_map(|id| match world.item(id)?.body() {
+        ItemBody::Arc(body) => Some(body.arc()),
+        _ => None,
+      })
+      .collect();
+
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].start(), arc.start());
+    assert_eq!(stored[0].arc_mid(), arc.arc_mid());
+    assert_eq!(stored[0].end(), arc.end());
+    assert_eq!(stored[0].width(), WIDTH);
+  }
+
+  #[test]
+  fn fix_route_forces_fix_all_when_the_trace_holds_an_arc() {
+    // `:1650`. Without an arc and without "fix all segments", an
+    // intermediate fix leaves the last shape rubber banded and the next
+    // leg starts one point back; with an arc anywhere in the trace the
+    // whole thing is committed and the next leg starts at its end.
+    let rules = FixedClearance::uniform(1000);
+    let settings = RoutingSettings {
+      corner_mode: CornerMode::Rounded45,
+      fix_all_segments: false,
+      ..RoutingSettings::default()
+    };
+    let context = AlgoContext::new(&rules, &settings);
+    let arc = quarter_arc(at(1_000_000, 0));
+    let tail_end = arc.end() + at(0, 1_000_000);
+
+    let mut straight_world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let straight = LineChain::from_slice(
+      &[at(0, 0), at(1_000_000, 0), at(2_000_000, 1_000_000)],
+      false,
+    );
+    let mut straight_placer =
+      placer_with_tail(&mut straight_world, &settings, straight);
+
+    assert!(!straight_placer.fix_route(
+      &mut straight_world,
+      &context,
+      at(2_000_000, 1_000_000),
+      None,
+      false
+    ));
+    assert_eq!(
+      committed_kinds(&straight_world, &straight_placer),
+      vec![Kind::SEGMENT],
+      "an arc free trace leaves its last segment unfixed"
+    );
+    assert_eq!(
+      straight_placer
+        .state
+        .placing()
+        .expect("the fix continued")
+        .current_start,
+      at(1_000_000, 0)
+    );
+
+    let mut arc_world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let mut chain = LineChain::new();
+
+    chain.append(at(0, 0));
+    chain.append_arc(&arc, LineChain::ARC_POLYGONIZATION_MAX_ERROR);
+    chain.append(tail_end);
+
+    let mut arc_placer = placer_with_tail(&mut arc_world, &settings, chain);
+
+    assert!(!arc_placer.fix_route(
+      &mut arc_world,
+      &context,
+      tail_end,
+      None,
+      false
+    ));
+    assert_eq!(
+      committed_kinds(&arc_world, &arc_placer),
+      vec![Kind::SEGMENT, Kind::ARC, Kind::SEGMENT],
+      "an arc in the trace commits every shape"
+    );
+    assert_eq!(
+      arc_placer
+        .state
+        .placing()
+        .expect("the fix continued")
+        .current_start,
+      tail_end,
+      "the next leg starts at the trace's end once fix all is forced"
+    );
+  }
+
+  #[test]
+  fn split_adjacent_arcs_makes_a_joint_in_the_middle_of_an_arc() {
+    let mut world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let root = world.root();
+    let arc = quarter_arc(at(0, 0));
+    let mut item = world.make_item(ItemBody::Arc(Arc::new(arc)));
+
+    item.set_layers_and_flash_all(LayerRange::single(0));
+    item.set_net(Some(NetId(1)));
+
+    let stored = world.add_arc(root, item, true).expect("the arc went in");
+    let middle = arc.arc_mid();
+
+    assert!(LinePlacer::split_adjacent_arcs(
+      &mut world,
+      root,
+      Some(stored),
+      middle
+    ));
+    assert!(world.item(stored).is_none());
+
+    // Two halves of the same circle, meeting at the split point, each
+    // still an arc and not a chord.
+    let halves: Vec<ShapeArc> = world
+      .all_items_in_net(root, Some(NetId(1)), Kind::ARC)
+      .into_iter()
+      .filter_map(|id| match world.item(id)?.body() {
+        ItemBody::Arc(body) => Some(body.arc()),
+        _ => None,
+      })
+      .collect();
+
+    assert_eq!(halves.len(), 2);
+    assert_eq!(halves[0].start(), arc.start());
+    assert_eq!(halves[0].end(), middle);
+    assert_eq!(halves[1].start(), middle);
+    assert_eq!(halves[1].end(), arc.end());
+
+    for half in &halves {
+      assert_eq!(half.width(), WIDTH);
+      assert!(!half.is_effective_line());
+      assert_eq!(half.center(), arc.center());
+    }
+
+    // A second break at a point that already carries a joint is refused,
+    // which is the `jt->LinkCount() >= 1` gate at `:1325`.
+    let again = world
+      .all_items_in_net(root, Some(NetId(1)), Kind::ARC)
+      .into_iter()
+      .next()
+      .expect("a half survived");
+
+    assert!(!LinePlacer::split_adjacent_arcs(
+      &mut world,
+      root,
+      Some(again),
+      middle
+    ));
+
+    // And a segment is not an arc, so the arc routine refuses it, exactly
+    // as `SplitAdjacentSegments` refuses an arc (`:1320`).
+    let mut segment = world.make_item(ItemBody::Segment(Segment::new(
+      Seg::new(at(0, -1_000_000), at(1_000_000, -1_000_000)),
+      WIDTH,
+    )));
+
+    segment.set_layers_and_flash_all(LayerRange::single(0));
+    segment.set_net(Some(NetId(1)));
+
+    let segment = world
+      .add_segment(root, segment, true)
+      .expect("the segment went in");
+
+    assert!(!LinePlacer::split_adjacent_arcs(
+      &mut world,
+      root,
+      Some(segment),
+      at(500_000, -1_000_000)
+    ));
+  }
+
+  #[test]
+  fn split_adjacent_arcs_does_not_check_the_point_erratum_e37() {
+    // `:1333` and `:1336` use `aP` as the end of the first half and the
+    // start of the second with no containment test, so an off arc point
+    // produces two arcs that meet somewhere the original never passed
+    // through. Reproduced: the behaviour is defined, and
+    // `SplitAdjacentSegments` has the same hole.
+    let mut world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let root = world.root();
+    let arc = quarter_arc(at(0, 0));
+    let mut item = world.make_item(ItemBody::Arc(Arc::new(arc)));
+
+    item.set_layers_and_flash_all(LayerRange::single(0));
+    item.set_net(Some(NetId(1)));
+
+    let stored = world.add_arc(root, item, true).expect("the arc went in");
+    // Well inside the quarter turn's chord, so nowhere near the curve.
+    let off_arc = at(1_000_000, 100_000);
+
+    assert_ne!(
+      arc.nearest_point(off_arc),
+      off_arc,
+      "the split point is on the arc, so the test proves nothing"
+    );
+    assert!(LinePlacer::split_adjacent_arcs(
+      &mut world,
+      root,
+      Some(stored),
+      off_arc
+    ));
+
+    let halves: Vec<ShapeArc> = world
+      .all_items_in_net(root, Some(NetId(1)), Kind::ARC)
+      .into_iter()
+      .filter_map(|id| match world.item(id)?.body() {
+        ItemBody::Arc(body) => Some(body.arc()),
+        _ => None,
+      })
+      .collect();
+
+    assert_eq!(halves.len(), 2);
+    assert_eq!(halves[0].end(), off_arc);
+    assert_eq!(halves[1].start(), off_arc);
   }
 
   #[test]

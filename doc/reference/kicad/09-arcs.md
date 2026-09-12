@@ -528,7 +528,7 @@ Method: `grep -n -i "SHAPE_ARC\|IsArcSegment\|ArcIndex\|ArcHull\|CArcs\|IsPtOnAr
 
 Forty three hits. One include (`:29`). Six are corner mode branches already covered in section 3.4 (`:763`, `:827`, `:983`, `:2047` plus the two `SMART_PADS` guards). Two are kind masks (`:1896`, `:1919`). The rest:
 
-**Posture from an arc, `:197` to `:207` and `:352` to `:365`.** `reduceTail` and `mergeHead` both take the head's leading direction and the tail's trailing direction, and both use the **arc chord** when the relevant point is on an arc:
+**Posture from an arc, `:197` to `:207` and `:352` to `:365`.** `handlePullback` (`:173` to `:253`, the first block; `reduceTail` at `:256` to `:317` has no arc branch at all, corrected in slice 7, 2026-09-12) and `mergeHead` both take the head's leading direction and the tail's trailing direction, and both use the **arc chord** when the relevant point is on an arc:
 
 ```cpp
 if( !head.IsPtOnArc( 0 ) )          first_head = DIRECTION_45( head.CSegment( 0 ) );
@@ -1018,7 +1018,7 @@ Neither `Simplify` (`shape_line_chain.cpp:2782`) nor `Simplify2` (`:2906`) nor `
 
 ### E27. `shoveIteration`'s reverse `ARC_T` case diverges from `SEGMENT_T`
 
-`pcbnew/router/pns_shove.cpp:1793` to `:1808` versus `:1751` to `:1791`. The arc case omits `unwindLineStack`, omits `patchTadpoleVia`, omits the "current line ends with a colliding via" handling, and passes `revLine.Rank() - 1` where the segment case passes `revLine.Rank() + 1`. The sign is the anti ping pong rank convention (note 04 section 1.4): `+ 1` on a reverse collision, `- 1` on a forward one. The `//TODO(snh): Handle Arc shove separate from track` at `:1795` suggests the branch was never finished. How the branch is reached at all is a second question: `shoveIteration`'s obstacle search iterates `{ SOLID_T, VIA_T, SEGMENT_T, HOLE_T }` and sets the search kind mask to one of them per pass (`:1650`), so `ARC_T` is never asked for, and the arc cases can only be entered through an obstacle the filter let through under another kind. Slice 7 has to establish which before rewriting them (found in slice 5, 2026-09-12).
+`pcbnew/router/pns_shove.cpp:1793` to `:1808` versus `:1751` to `:1791`. The arc case omits `unwindLineStack`, omits `patchTadpoleVia`, omits the "current line ends with a colliding via" handling, and passes `revLine.Rank() - 1` where the segment case passes `revLine.Rank() + 1`. The sign is the anti ping pong rank convention (note 04 section 1.4): `+ 1` on a reverse collision, `- 1` on a forward one. The `//TODO(snh): Handle Arc shove separate from track` at `:1795` suggests the branch was never finished. How the branch is reached at all is a second question: `shoveIteration`'s obstacle search iterates `{ SOLID_T, VIA_T, SEGMENT_T, HOLE_T }` and sets the search kind mask to one of them per pass (`:1650`), so `ARC_T` is never asked for, and the arc cases can only be entered through an obstacle the filter let through under another kind. Slice 7 established it (2026-09-12): none. `OfKind` is a bitwise test over disjoint bits (`pns_item.h:107`, `:108`, `:181`), the collision visitor rejects on it as its first statement (`pns_node.cpp:243`), and the only rewriter of the obstacle afterwards, `fixupViaCollisions`, substitutes a via (`:1591`). Both `ARC_T` arms are dead code, and the consequence is erratum E40.
 
 ### E28. `mergeStep`'s arc guard looks unreachable and is not
 
@@ -1069,6 +1069,10 @@ Measured by reimplementing `IO_UTILS::fileHashMMH3` (`common/io/io_utils.cpp:86`
 ### E39. `ArcHull`'s whole circle branch leaves the arc's width out
 
 `pcbnew/router/pns_utils.cpp:76` to `:83`. When the arc sweeps more than half a turn through an opening narrower than the combined clearance, the hull is `OctagonalHull` around the centre line circle of radius `r` inflated by `cl`, where `cl` is the clearance plus half the walkaround thickness (`:73`). The mitred branch below it offsets by `GetWidth() / 2 + cl + DefaultAccuracyForPCB()` (`:85`). So in the circle branch doubling the arc's width changes the hull not at all, and once the width passes twice the clearance the hull cuts inside the copper. Defined behaviour and reachable only for such an arc, so the port reproduces it behind `arc_hull_of_a_whole_turn_leaves_the_arc_width_out` in `src/geometry/hull.rs` (slice 4, 2026-09-12). Worth a look in slice 6, where the placer first produces hulls the walkaround has to respect.
+
+### E40. The shove cannot see an arc track
+
+`pcbnew/router/pns_shove.cpp:1650`. `shoveIteration` runs one obstacle search per kind over `{ SOLID_T, VIA_T, SEGMENT_T, HOLE_T }`, `OfKind` is `( aKindMask & m_kind ) != 0` over the disjoint bits `SEGMENT_T = 8` and `ARC_T = 16` (`pns_item.h:107`, `:108`, `:181`), and `QueryColliding`'s visitor rejects a candidate on that test before anything else (`pns_node.cpp:243`). An arc track is therefore never an obstacle to the shove, the two `ARC_T` arms of `shoveIteration` (E27) are unreachable, and a line shoved across an arc track is committed in collision: `FixRoute`'s own gate blocks on solids alone in shove mode (`pns_line_placer.cpp:1596`), so only the host's DRC sees it. Walkaround mode is unaffected, its obstacle search having no kind filter. Reproduced in slice 7 (2026-09-12) behind `a_rounded_shove_cannot_see_an_arc_track_erratum_e27` in `tests/arcs.rs` (named for E27 because the arms' unreachability is what it pins); the port's `on_colliding_arc` and both arms exist and are correct, so the deviation that would make the shove push arc tracks is one entry in the search order. Worth a KiCad issue: issue 9023 was closed for 6.0.8 by kimath collision fixes and this is a different mechanism.
 
 ---
 
@@ -1210,7 +1214,7 @@ Not ported at all: KiCad's `Format`, `Parse`, `CompareGeometry`, `Rotate`, `Self
 
 **`src/snapshot.rs`.** `WorldGeometry` (`:248`) gains an `Arc { start, mid, end, width }` variant, and the world builder an arm.
 
-**`src/router.rs`.** `NewGeometry` (`:718`) gains `Arc { start, mid, end, width }`. `PreviewItem` (`:434`) already carries a `LineChain`, which will simply contain arcs once `LineChain` can, so **no change is needed there**, but the host has to be told that a preview chain can now hold arcs and that drawing the polyline alone is a valid, slightly wrong, fallback.
+**`src/router.rs`.** `NewGeometry` (`:718`) gains `Arc { start, mid, end, width }` (landed in slice 7 rather than 8, because `fix_route` commits an `ARC` from slice 7 on and the diff has to name it). `PreviewItem` (`:434`) already carries a `LineChain`, which will simply contain arcs once `LineChain` can, so **no change is needed there**, but the host has to be told that a preview chain can now hold arcs and that drawing the polyline alone is a valid, slightly wrong, fallback.
 
 **`src/eventlog.rs`.** `CornerStyle::Round` in the name table (`:1155`), the two new `CornerMode` names, and an arc case in the golden geometry records. Use KiCad's log form, `{ start, mid, end, width }` (`pns_logger.cpp:245`), not `SHAPE_LINE_CHAIN::Format`'s (E15).
 

@@ -21,3 +21,7 @@ Ideas noticed during work, for the user to pick up or discard.
 
 - **KiCad's regression runner passes on an unresolved board.** `qa/tools/pns/qa_pns_regressions_main.cpp:101` to `:108` turns a `board_hash` that matches nothing into `BOOST_CHECK( true )`, and at the reference commit six of the eleven cases are in that state, so KiCad's own suite runs five cases while reporting eleven green (note 09 erratum E34). This crate's harness resolves boards by name and is not affected. Worth a KiCad issue; the fix is a `BOOST_FAIL` in that branch.
 - The only corpus board with arc tracks, `stickhub-extra-via.kicad_pcb`, is referenced by no case. Once slice 5 of work item 012 can load it, a recorded session over it would be the first arc fixture with real geometry; KiCad's own `pns_log_viewer` can record one if a KiCad build is at hand.
+
+## After arcs slice 7 (2026-09-12)
+
+- **KiCad's shove is blind to arc tracks** (note 09 erratum E40): its obstacle search never asks for the arc kind, so a line shoved across an arc track is committed overlapping it and only the host's DRC notices. The crate reproduces that. The deviation that would make the shove push arc tracks aside is one entry in `OBSTACLE_SEARCH_ORDER` in `src/shove.rs`, since `on_colliding_arc` and both shove arms are ported and tested; it would matter to Horizon, which has arc tracks, and to any KiCad board with rounded traces. A KiCad issue is worth filing either way, since the two `ARC_T` arms in `shoveIteration` are dead code upstream.

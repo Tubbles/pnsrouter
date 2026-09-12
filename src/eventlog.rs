@@ -1019,11 +1019,29 @@ fn item_text(item: &WorldItem) -> String {
 }
 
 /// One committed item: its geometry, then its net, layers and source.
+///
+/// The geometry tokens are the same ones [`world_geometry_text`] writes
+/// for the snapshot side, so `arc <start> <mid> <end> <width>` reads the
+/// same whether it came off the board or out of a commit. A recording of
+/// a session that committed no arc is byte for byte what it was before
+/// `doc/work/012-arcs.md` slice 7, the new token only ever being written
+/// for a [`NewGeometry::Arc`].
 fn new_item_text(item: &NewItem) -> String {
   let geometry = match item.geometry {
     NewGeometry::Segment { seg, width } => {
       format!("segment {} {width}", seg_text(seg))
     }
+    NewGeometry::Arc {
+      start,
+      mid,
+      end,
+      width,
+    } => format!(
+      "arc {} {} {} {width}",
+      vec2_text(start),
+      vec2_text(mid),
+      vec2_text(end)
+    ),
     NewGeometry::Via {
       pos,
       diameter,
@@ -1389,8 +1407,10 @@ impl SessionRecording {
   /// `line-chain <chain>` or `compound <count> <shape>...`, and a
   /// `<chain>` is `chain <closed> <width> <count> <x> <y>...`.
   ///
-  /// A `<new-item>` is `<segment|via geometry> <net> <layer-start>
-  /// <layer-end> <source-host>`. A `<pos>`, an `<offset>` and an
+  /// A `<new-item>` is `<segment|arc|via geometry> <net> <layer-start>
+  /// <layer-end> <source-host>`, the three geometries spelled exactly as
+  /// the snapshot side spells them, so a committed arc reads
+  /// `arc <start> <mid> <end> <width>`. A `<pos>`, an `<offset>` and an
   /// `<anchor>` are each an `<x> <y>` pair.
   ///
   /// The events, one line each:
@@ -1999,6 +2019,18 @@ impl<'a> Tokens<'a> {
 
         NewGeometry::Segment {
           seg,
+          width: self.number("a track width")?,
+        }
+      }
+      "arc" => {
+        let start = self.vec2("an arc start")?;
+        let mid = self.vec2("an arc mid point")?;
+        let end = self.vec2("an arc end")?;
+
+        NewGeometry::Arc {
+          start,
+          mid,
+          end,
           width: self.number("a track width")?,
         }
       }

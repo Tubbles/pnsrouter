@@ -228,7 +228,7 @@ fn lane(diff: &CommitDiff, net: NetId, start: Vec2) -> LineChain {
     .filter(|item| item.net == Some(net))
     .filter_map(|item| match item.geometry {
       NewGeometry::Segment { seg, .. } => Some(seg),
-      NewGeometry::Via { .. } => None,
+      NewGeometry::Arc { .. } | NewGeometry::Via { .. } => None,
     })
     .collect();
   let mut chain = LineChain::new();
@@ -287,7 +287,7 @@ fn added_vias(diff: &CommitDiff) -> Vec<(Option<NetId>, Vec2, i32)> {
     .iter()
     .filter_map(|item| match item.geometry {
       NewGeometry::Via { pos, diameter, .. } => Some((item.net, pos, diameter)),
-      NewGeometry::Segment { .. } => None,
+      NewGeometry::Arc { .. } | NewGeometry::Segment { .. } => None,
     })
     .collect()
 }

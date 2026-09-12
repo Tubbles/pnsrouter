@@ -407,7 +407,7 @@ fn committed_segments(diff: &CommitDiff) -> Vec<(Option<NetId>, Seg)> {
     .chain(diff.updated.iter().map(|(_, item)| item))
     .filter_map(|item| match item.geometry {
       NewGeometry::Segment { seg, .. } => Some((item.net, seg)),
-      NewGeometry::Via { .. } => None,
+      NewGeometry::Arc { .. } | NewGeometry::Via { .. } => None,
     })
     .collect()
 }
