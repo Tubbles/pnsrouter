@@ -44,9 +44,10 @@ The LibrePCB side checks, all from this repository (the build directory is alrea
     dev/librepcb-in-container.sh cargo fmt --manifest-path libs/librepcb/rust-core/Cargo.toml --check
     dev/librepcb-in-container.sh cargo clippy --manifest-path libs/librepcb/rust-core/Cargo.toml --lib --features ffi -- -D warnings
     dev/librepcb-in-container.sh cargo test --manifest-path libs/librepcb/rust-core/Cargo.toml --quiet
+    dev/librepcb-in-container.sh cargo test --manifest-path libs/librepcb/rust-core/Cargo.toml --features ffi --lib --quiet
     dev/librepcb-in-container.sh sh -c 'cd build && ninja -j16 librepcb_unittests'
     dev/librepcb-in-container.sh sh -c 'xvfb-run -a ./build/tests/unittests/librepcb-unittests --gtest_filter="BoardPns*"'
 
 The fork carries feature branches that stay separate until upstreamed: `pns-router` (this crate's integration), `fix-selection-rect-performance` (an upstream regression fix), and later `diff-pairs`, `compare-trace-lengths` and `pns-router-pairs`. The branch `integration` is upstream master plus every feature branch merged, for the user to test everything at once. It is disposable: when a feature branch changes, recreate it from master (`git branch -D integration`, then `git worktree add tmp/integration -b integration <master sha>`), merge each feature branch, push with `git push --force-with-lease origin integration`, remove the worktree. This is the one branch the user has authorised a force push for (2026-09-11); feature branches stay fast forward only. Small additions can also be merged into the existing branch.
 
-Plain `--lib` does not compile the `ffi` module and `--all-targets` fails on pre-existing test lints in rust-core, so `--lib --features ffi` is the clippy check that matters. `clang-format` is not in the image yet.
+Plain `--lib` does not compile the `ffi` module and `--all-targets` fails on pre-existing test lints in rust-core, so `--lib --features ffi` is the clippy check that matters. The same goes for the tests: the unit tests inside the `ffi` module only run with `--features ffi --lib`, which is why both test lines are listed. `clang-format` is not in the image yet.

@@ -96,6 +96,10 @@ Deferred during the arcs milestone (2026-09-12):
 
 - `LineChain` grew from 40 to 88 bytes with the `shapes` vector parallel to the points, so every non empty chain carries a second heap allocation whether or not it holds an arc (slice 3 log entry). A lazily allocated `shapes` (empty means all plain) would remove it for the arc free case at the cost of relaxing the `shapes.len() == points.len()` invariant. Measure with `examples/latency.rs` before deciding; the walkaround builds many short chains per move.
 
+Deferred during the arcs milestone, host side (2026-09-12):
+
+- The `PnsMeanderSettings` doc and `to_meander_request` on the fork's `pns-router-pairs` branch still give "arcs are on hold" as the reason for forcing `MeanderStyle::Chamfer`. The behaviour is right (LibrePCB cannot store an arc trace, and the crate's default is `Round` now), the stated reason is stale; fix the comment when `pns-router` is next merged into that branch.
+
 Deferred during the LibrePCB tuning UI (2026-09-11):
 
 - `MeanderSettings::new` can refuse a request (zero step, round corners), which is not a `StartError`, so the LibrePCB FFI invents its own refusal value; a `StartError::MeanderSettings(..)` variant would remove that seam.
