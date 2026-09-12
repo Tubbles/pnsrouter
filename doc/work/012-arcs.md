@@ -1,0 +1,40 @@
+# 012 Arcs
+
+Status: in progress (2026-09-12)
+
+## Goal
+
+Milestone 12: arc tracks as first class items and the two rounded corner modes, as KiCad's `SHAPE_ARC`, `PNS::ARC`, `ROUNDED_45` and `ROUNDED_90` do. A host with arc tracks (KiCad, Horizon) can then route among them, the placer can produce them, and the meanders get their round corner style back. The LibrePCB side stays straight only: a trace serialises no angle (`libs/librepcb/core/geometry/trace.cpp:236`) and the file format is stable, so LibrePCB keeps its corner mode mitered and refuses the rounded ones at the settings boundary until its format carries an arc trace.
+
+Reference: `doc/reference/kicad/09-arcs.md`. The research behind lifting the hold is in `doc/log/2026-09-12.md`.
+
+## Decisions
+
+- Representation: KiCad's three point form, `start`, `mid`, `end` and a width, with no cached derived values. Every derived quantity (centre, radius, angles, length, bounding box) is computed on demand. Reason: the only form that is exact in `i32` nanometres and survives a round trip with KiCad's board file (note 09 sections 7.4 and 11.2).
+- Hosts convert at the boundary. Two named constructors, `from_start_end_center` and `from_start_end_angle`, are documented as lossy and store nothing but the three points. A host that stores angles (LibrePCB) or centres (Horizon) must not rewrite an arc the commit diff did not list as updated.
+- The `ArcRef` plan of note 01 section 14.3 is kept with the four changes of note 09 section 11.1: the reference carries the point's role, the chain order invariant is enforced, arcs are only reachable through a live iterator, and the accessors return `Option`.
+- Every erratum a slice meets is either reproduced or fixed by an explicit, logged decision with a test naming it. Note 09 section 11.3 lists the intended fixes (E4, E8, E11, E22, E24, E26, E27, E29) and the intended reproductions (E38, the `MIN_PRECISION_IU` re-snap pending E18).
+
+## Tasks
+
+The eight slices of note 09 section 12, each leaving the crate green.
+
+- [x] Reference note `doc/reference/kicad/09-arcs.md` (2026-09-12).
+- [ ] Slice 1, `ShapeArc` as a value type: `src/geometry/arc.rs` and the angle helpers in `src/geometry/math.rs`. Exit: the twelve `test_shape_arc.cpp` cases of section 8.4 items 1 and 2, including all six `CalcArcCenter` cases; the E1 decision logged.
+- [ ] Slice 2, arc collision primitives: `collide_point`, `collide_seg`, `nearest_point`, the four `nearest_points` overloads. Exit: `CollidePt`, `CollideSeg`, `CollideArc`, `CollideCircle`, `CollideNearlyFlatArcDoesNotOverflow`; E2 and E3 decided.
+- [ ] Slice 3, arcs inside `LineChain`: the `shapes` and `arcs` fields, `ArcRef`, the predicates, the mutators and queries of section 11.3. Exit: the eleven `test_shape_line_chain.cpp` cases of section 8.4 item 4 plus the two property tests; E5, E6, E7, E10, E12, E13, E14 each behind a named test.
+- [ ] Slice 4, `Shape::Arc`, the six collision rows and `arc_hull`. Exit: `CollideArcToShapeLineChain`, `CollideArcToPolygonApproximation`, and a hull table reproducing `pns_utils.cpp:86`'s truncation.
+- [ ] Slice 5, `ItemBody::Arc` and the world: `add_arc`, `remove_arc_index`, `find_redundant_arc`, the arc loop in `add_line`, `assemble_line` and `follow_line`, `WorldGeometry::Arc`. Exit: a scenario round trips an arc through the world unchanged; `stickhub-extra-via.kicad_pcb` becomes a fixture.
+- [ ] Slice 6, `CornerMode::Rounded45` and `Rounded90`: `build_initial_trace`'s two branches, `Direction45::from_arc`, the corner mode branches in the node, walkaround, optimizer and placer, the `has_arcs` gate. Exit: the port's own `build_initial_trace` table for all four modes and a rounded walkaround scenario that commits an arc; E17, E18, E19 decided.
+- [ ] Slice 7, the placer's commit path and the shove: `fix_route`'s arc emission (E24 fixed), `split_adjacent_arcs`, the direction branches of `reduce_tail` and `merge_head` (E11 fixed), the per hull clearance bump (E26 fixed), `on_colliding_arc`, the two arc arms of `shove_iteration` (E27 fixed). Retires the six `TODO(arcs)` markers. Exit: a rounded shove scenario pushes an arc track aside, an arc, straight, arc chain reaches the commit whole, and the KiCad goldens do not move.
+- [ ] Slice 8, the dragger, the meanders and the host: `drag_arc`, the component dragger's arm, `CornerStyle::Round` with `make_miter_shape`'s round branch and the `RoundCornersUnsupported` refusal deleted, the meander placers' arc passthrough (E29 fixed), `NewGeometry::Arc`, the FFI additions of section 11.3. Exit: an arc drags in all three modes, a round style tune hits its target, LibrePCB builds with the rounded modes refused at the settings boundary.
+
+The TODO entries this work item absorbed on 2026-09-12: the milestone 1 arc bullet (`SHAPE_ARC`, `ArcHull`, the arc reference vector, `SelfIntersectingWithArcs`, the rounded corner modes), `LineChain::nearest_point`'s `aAllowInternalShapePoints` flag, the `EDA_ANGLE` and `RotatePoint` bullets, and "arcs throughout the shove are marked `TODO(arcs)`".
+
+## Acceptance
+
+A trace routed in `Rounded45` between two pads around an obstacle commits an arc whose three points are exact integers, replays from its recorded session to the same commit, and an existing arc track is shoved aside and dragged in all three modes.
+
+## What the fixture cannot cover
+
+No KiCad regression case exercises an arc. The corpus has one board with arc tracks, `stickhub-extra-via.kicad_pcb` with 180 of them, and no case replays it (note 09 section 8.3). KiCad's own unit tests cover `SHAPE_ARC` and the arc parts of `SHAPE_LINE_CHAIN` well (27 and 13 cases) and cover nothing above them: `DIRECTION_45::BuildInitialTrace` has no test in KiCad at all, and the four PNS unit tests never construct an arc. So slices 1 to 4 stand on mirrored KiCad tests and slices 5 to 8 stand on the port's own scenarios and recorded sessions, which is the footing milestone 11 had.

@@ -16,3 +16,8 @@ Ideas noticed during work, for the user to pick up or discard.
 ## After milestone 9 slice 6, component drag (2026-09-10)
 
 - **KiCad's unconnected trace end handling is nearly dead code** and this crate now reproduces that faithfully; note 06 erratum E36 has the reading. If it ever looks like a bug worth reporting upstream, the one line fix is to drop the same net test at `pcbnew/router/pns_component_dragger.cpp:142` or to give the collide call a search context with `m_differentNetsOnly = false`. Worth raising on the KiCad tracker rather than deviating here.
+
+## After the arc reference note (2026-09-12)
+
+- **KiCad's regression runner passes on an unresolved board.** `qa/tools/pns/qa_pns_regressions_main.cpp:101` to `:108` turns a `board_hash` that matches nothing into `BOOST_CHECK( true )`, and at the reference commit six of the eleven cases are in that state, so KiCad's own suite runs five cases while reporting eleven green (note 09 erratum E34). This crate's harness resolves boards by name and is not affected. Worth a KiCad issue; the fix is a `BOOST_FAIL` in that branch.
+- The only corpus board with arc tracks, `stickhub-extra-via.kicad_pcb`, is referenced by no case. Once slice 5 of work item 012 can load it, a recorded session over it would be the first arc fixture with real geometry; KiCad's own `pns_log_viewer` can record one if a KiCad build is at hand.
