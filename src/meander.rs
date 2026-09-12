@@ -22,12 +22,15 @@
 //!   of `MINOPTMAX<long long>` and its one kilometre sentinel,
 //!   [`CornerStyle`], [`MeanderSide`], [`MeanderType`] and
 //!   [`TuningStatus`].
-//! - [`MeanderShape`]: the turtle, the chamfered corner, the five bodies
-//!   of `genMeanderShape`, the amplitude search of `Fit`, and the
-//!   measurements `tuneLineLength` compares meanders by.
+//! - [`MeanderShape`]: the turtle, both corner styles, the five bodies
+//!   of `genMeanderShape`, the amplitude search of `Fit`, the
+//!   measurements `tuneLineLength` compares meanders by, and
+//!   [`MeanderShape::make_arc`], which carries an arc the tuned stretch
+//!   already held through untouched.
 //! - [`MeanderedLine`]: the ordered list of shapes covering one base
-//!   segment, the fitting loop `MeanderSegment`, and the self
-//!   intersection test both placers' `CheckFit` ends on.
+//!   segment, the fitting loop `MeanderSegment`,
+//!   [`MeanderedLine::add_arc`], and the self intersection test both
+//!   placers' `CheckFit` ends on.
 //! - The shared placer arithmetic: [`tune_line_length`],
 //!   [`find_amplitude_for_length`], [`find_amplitude_binary_search`],
 //!   [`amplitude_step`], [`spacing_step`] and [`clearance`].
@@ -38,17 +41,12 @@
 //!   on top of this module is state: the world branch, the assembled
 //!   path, the cut and reassembly of the original line, and the status
 //!   readout.
-//! - Arcs. `MEANDER_STYLE_ROUND` builds the only `SHAPE_ARC` in the
-//!   router (`pns_meander.cpp:496`) and `MakeArc`, `AddArc`,
-//!   `AddArcAndPt` and `AddPtAndArc` carry a pre existing arc through a
-//!   tuned stretch. [`CornerStyle`] has one variant and
-//!   [`MeanderSettings::new`] refuses [`MeanderStyle::Round`], so no
-//!   caller can reach a code path that would need one. Note 08 section
-//!   9.3 works out that this costs no behaviour the crate could otherwise
-//!   exhibit, because a [`crate::geometry::line_chain::LineChain`] cannot
-//!   hold an arc in the first place.
+//! - `AddArcAndPt` and `AddPtAndArc` (`pns_meander.cpp:888`, `:896`),
+//!   which wrap [`MeanderedLine::add_arc`] with a degenerate arc on one
+//!   lane and have no caller anywhere in KiCad's tree (erratum E5).
 //! - `MT_ARC` as a meander type: `MakeArc` sets `MT_CORNER`, so nothing
-//!   in KiCad's tree ever produces it (erratum E4).
+//!   in KiCad's tree ever produces it (erratum E4), and the four places
+//!   that test for it are dead.
 //! - The time domain and net chain halves of `MEANDER_SETTINGS`
 //!   (`m_signalExtraLength`, `m_targetLengthDelay`, `m_isTimeDomain`,
 //!   `m_netClass` and six more) and of `MEANDER_PLACER_BASE`
@@ -120,8 +118,9 @@
 
 use std::fmt;
 
+use crate::geometry::arc::ShapeArc;
 use crate::geometry::line_chain::LineChain;
-use crate::geometry::math::kiround;
+use crate::geometry::math::{Degrees, kiround};
 use crate::geometry::seg::Seg;
 use crate::geometry::vec2::Vec2;
 use crate::rules::{ConstraintType, ItemRef, RuleResolver};
@@ -264,25 +263,27 @@ impl LengthTarget {
 
 /// The shape of a meander's corners.
 ///
-/// Port of `MEANDER_STYLE` (`pcbnew/router/pns_meander.h:53`), restricted
-/// to what this crate can draw. KiCad's `MEANDER_STYLE_ROUND` (`:54`) is a
-/// 90 degree `SHAPE_ARC` built in `makeMiterShape`
-/// (`pns_meander.cpp:496`), and arcs are on hold (`PLAN.md`), so this enum
-/// has one variant. Adding `Round` is the change that lands with them, and
-/// `#[non_exhaustive]` keeps that from breaking a host that matches on it.
+/// Port of `MEANDER_STYLE` (`pcbnew/router/pns_meander.h:53`), now in
+/// full. It is read in exactly three places, as KiCad's is:
+/// [`MeanderShape::min_amplitude`] (`pns_meander.cpp:415`),
+/// [`MeanderShape::corner_radius`] (`:436`) and `make_miter_shape`
+/// (`:489`), the last of which is the only place an arc is built.
 ///
-/// The round style is refused rather than silently drawn as a chamfer
-/// because the two differ in length by `radius * (pi / 2 - sqrt( 2 ))` per
-/// corner, so substituting one for the other would make a "tuned" trace
-/// miss its target by roughly `0.62 * radius` per meander. Say so with
-/// [`MeanderStyle`] and let [`MeanderSettings::new`] answer
-/// [`MeanderSettingsError::RoundCornersUnsupported`].
+/// The two styles consume the same amount of baseline and differ only in
+/// the corner's own length, `radius * pi / 2` against
+/// `radius * sqrt( 2 )`, so a host that cannot store arcs must ask for
+/// [`CornerStyle::Chamfer`] rather than take the default: substituting one
+/// for the other silently would make a tuned trace miss its target by
+/// roughly `0.62 * radius` per meander.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, Default)]
-#[non_exhaustive]
 pub enum CornerStyle {
+  /// A 90 degree arc across the corner. `MEANDER_STYLE_ROUND`
+  /// (`pcbnew/router/pns_meander.h:54`), and KiCad's default
+  /// (`pns_meander.cpp:56`).
+  #[default]
+  Round,
   /// A 45 degree chord across the corner. `MEANDER_STYLE_CHAMFER`
   /// (`pcbnew/router/pns_meander.h:55`).
-  #[default]
   Chamfer,
 }
 
@@ -291,19 +292,18 @@ pub enum CornerStyle {
 /// Port of `MEANDER_STYLE`, `pcbnew/router/pns_meander.h:53`, with
 /// KiCad's discriminants so a host bridging to a stored "rounded" flag
 /// (`pcbnew/generators/pcb_tuning_pattern.cpp:1802`) has somewhere to put
-/// it. It exists separately from [`CornerStyle`] because a value has to be
-/// expressible before it can be refused: [`MeanderSettings::new`] is the
-/// boundary that turns the supported half of this into a [`CornerStyle`]
-/// and answers [`MeanderSettingsError::RoundCornersUnsupported`] for the
-/// other half.
+/// it. It exists separately from [`CornerStyle`] because it carries
+/// KiCad's numbering, where [`CornerStyle`] is the value the generator
+/// matches on; [`MeanderSettings::new`] converts between them and refuses
+/// nothing.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, Default)]
 #[repr(i32)]
 pub enum MeanderStyle {
-  /// A 90 degree arc. `MEANDER_STYLE_ROUND` (`:54`), which is KiCad's own
-  /// default (`pns_meander.cpp:56`) and is not implemented here.
+  /// A 90 degree arc. `MEANDER_STYLE_ROUND` (`:54`), and KiCad's own
+  /// default (`pns_meander.cpp:56`).
+  #[default]
   Round = 1,
   /// A 45 degree chord. `MEANDER_STYLE_CHAMFER` (`:55`).
-  #[default]
   Chamfer = 2,
 }
 
@@ -430,12 +430,6 @@ pub enum MeanderSettingsError {
   /// Nothing in KiCad's tree can set it to zero, which is why it is a
   /// latent hazard there and an error here. Erratum E22.
   NonPositiveStep,
-  /// The round corner style was asked for.
-  ///
-  /// It needs a `SHAPE_ARC` (`pcbnew/router/pns_meander.cpp:496`) and
-  /// arcs are on hold. See [`CornerStyle`] for why silently drawing
-  /// chamfers instead is not an option.
-  RoundCornersUnsupported,
 }
 
 impl fmt::Display for MeanderSettingsError {
@@ -443,9 +437,6 @@ impl fmt::Display for MeanderSettingsError {
     match self {
       Self::NonPositiveStep => {
         formatter.write_str("the meander amplitude step must be positive")
-      }
-      Self::RoundCornersUnsupported => {
-        formatter.write_str("rounded meander corners need arcs")
       }
     }
   }
@@ -456,12 +447,11 @@ impl std::error::Error for MeanderSettingsError {}
 /// The settings a host hands to [`MeanderSettings::new`].
 ///
 /// Plain data with public fields, so a host can build one field by field;
-/// [`MeanderSettings`] itself keeps its fields private because two of them
-/// carry an invariant. [`Default`] is KiCad's constructor
-/// (`pcbnew/router/pns_meander.cpp:42` to `:63`) with one deliberate
-/// change: the corner style is [`MeanderStyle::Chamfer`] where KiCad's is
-/// [`MeanderStyle::Round`] (`:56`), so that the default request is one
-/// this crate can honour.
+/// [`MeanderSettings`] itself keeps its fields private because one of them
+/// carries an invariant. [`Default`] is KiCad's constructor
+/// (`pcbnew/router/pns_meander.cpp:42` to `:63`) field for field, the
+/// round corner style of `:56` included; a host whose file format cannot
+/// store an arc has to ask for [`MeanderStyle::Chamfer`] itself.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct MeanderSettingsRequest {
   /// `m_minAmplitude` (`pcbnew/router/pns_meander.h:101`), default
@@ -505,7 +495,7 @@ impl Default for MeanderSettingsRequest {
       max_amplitude: 1_000_000,
       spacing: 600_000,
       step: 50_000,
-      corner_style: MeanderStyle::Chamfer,
+      corner_style: MeanderStyle::Round,
       corner_radius_percentage: 80,
       single_sided: false,
       initial_side: MeanderSide::Left,
@@ -523,10 +513,9 @@ impl Default for MeanderSettingsRequest {
 /// the two that are dead in KiCad itself (erratum E1). See note 08 section
 /// 1.4 for the accounting.
 ///
-/// The fields are private because two of them carry invariants that the
-/// rest of the module relies on: the step is positive and the corner style
-/// is one this crate can draw. Build one with [`MeanderSettings::new`],
-/// which is the boundary those are checked at.
+/// The fields are private because one of them carries an invariant the
+/// rest of the module relies on: the step is positive. Build one with
+/// [`MeanderSettings::new`], which is the boundary it is checked at.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct MeanderSettings {
   /// `m_minAmplitude` (`pcbnew/router/pns_meander.h:101`).
@@ -554,15 +543,16 @@ pub struct MeanderSettings {
 }
 
 impl Default for MeanderSettings {
-  /// KiCad's defaults, `pcbnew/router/pns_meander.cpp:42` to `:63`, with
-  /// the corner style changed to the one that is implemented.
+  /// KiCad's defaults, `pcbnew/router/pns_meander.cpp:42` to `:63`,
+  /// field for field. `test_meander_corner_radius.cpp:38` is the case
+  /// that pins them.
   fn default() -> Self {
     Self {
       min_amplitude: 200_000,
       max_amplitude: 1_000_000,
       spacing: 600_000,
       step: 50_000,
-      corner_style: CornerStyle::Chamfer,
+      corner_style: CornerStyle::Round,
       corner_radius_percentage: 80,
       single_sided: false,
       initial_side: MeanderSide::Left,
@@ -576,18 +566,16 @@ impl Default for MeanderSettings {
 impl MeanderSettings {
   /// Check a request and turn it into settings.
   ///
-  /// The two things it refuses are a step that is not positive, which
-  /// would make `Fit`'s amplitude loop spin forever (erratum E22,
-  /// `pcbnew/router/pns_meander.cpp:789`), and the round corner style,
-  /// which needs an arc (`:496`). Everything else KiCad accepts, this
-  /// accepts: a negative amplitude, a corner radius percentage over 100
-  /// and an inverted length window all have defined behaviour further
+  /// The one thing it refuses is a step that is not positive, which would
+  /// make `Fit`'s amplitude loop spin forever (erratum E22,
+  /// `pcbnew/router/pns_meander.cpp:789`). Everything else KiCad accepts,
+  /// this accepts: a negative amplitude, a corner radius percentage over
+  /// 100 and an inverted length window all have defined behaviour further
   /// down and none of them can make a loop run away.
   ///
   /// # Errors
   ///
-  /// [`MeanderSettingsError::NonPositiveStep`] and
-  /// [`MeanderSettingsError::RoundCornersUnsupported`].
+  /// [`MeanderSettingsError::NonPositiveStep`].
   pub fn new(
     request: MeanderSettingsRequest,
   ) -> Result<Self, MeanderSettingsError> {
@@ -597,9 +585,7 @@ impl MeanderSettings {
 
     let corner_style = match request.corner_style {
       MeanderStyle::Chamfer => CornerStyle::Chamfer,
-      MeanderStyle::Round => {
-        return Err(MeanderSettingsError::RoundCornersUnsupported);
-      }
+      MeanderStyle::Round => CornerStyle::Round,
     };
 
     Ok(Self {
@@ -895,6 +881,9 @@ struct Turtle {
   baseline_offset: i32,
   /// `MEANDER_SHAPE::m_meanCornerRadius` (`:432`), read at `:506`.
   mean_corner_radius: i32,
+  /// `MEANDER_SETTINGS::m_cornerStyle` (`:145`), which KiCad reaches
+  /// through the placer back pointer at `pns_meander.cpp:489`.
+  corner_style: CornerStyle,
 }
 
 impl Turtle {
@@ -910,6 +899,7 @@ impl Turtle {
     dual: bool,
     baseline_offset: i32,
     mean_corner_radius: i32,
+    corner_style: CornerStyle,
   ) -> Self {
     let mut chain = LineChain::new();
     chain.append(position);
@@ -921,6 +911,7 @@ impl Turtle {
       dual,
       baseline_offset,
       mean_corner_radius,
+      corner_style,
     }
   }
 
@@ -1008,19 +999,28 @@ impl Turtle {
   ///
   /// Port of `makeMiterShape`, `pcbnew/router/pns_meander.cpp:470`, the
   /// only function in the router that branches on the corner style and the
-  /// only place a `SHAPE_ARC` is constructed. There is no arc branch here:
-  /// [`CornerStyle`] cannot name the round style, so `:491` to `:499` has
-  /// no reachable input.
+  /// only place a `SHAPE_ARC` is constructed.
   ///
-  /// For a single track the correction is zero, the two inner appends
-  /// collapse onto the endpoints, and the result is exactly two points: a
-  /// 45 degree chord of length `radius * sqrt( 2 )` across a corner whose
-  /// apex would have been at `p + dir`. For a dual meander the correction
-  /// pulls the chamfer's start back along the direction of travel and
-  /// pushes its middle out sideways by `2 * |offset| * tan( 22.5 deg )`,
-  /// so the two lanes stay a constant gap apart around the corner, and the
-  /// `radius > mean_corner_radius` guard at `:506` applies it to the outer
-  /// lane only.
+  /// The round branch (`:491` to `:499`) is one quarter circle from the
+  /// corner's start to its end, turning towards the side the meander is
+  /// on. KiCad reaches the arc's end point through two different
+  /// narrowings, an explicit `(int)` cast at `:486` and `VECTOR2I`'s
+  /// converting constructor at `:496`; both truncate toward zero, so the
+  /// chain's last point and the arc's start agree and there is no one
+  /// nanometre seam between them (note 09 section 5.8). Here the turtle is
+  /// already integral, so there is one value and nothing to reconcile.
+  ///
+  /// For a single track the chamfer correction is zero, the two inner
+  /// appends collapse onto the endpoints, and the result is exactly two
+  /// points: a 45 degree chord of length `radius * sqrt( 2 )` across a
+  /// corner whose apex would have been at `p + dir`. For a dual meander
+  /// the correction pulls the chamfer's start back along the direction of
+  /// travel and pushes its middle out sideways by
+  /// `2 * |offset| * tan( 22.5 deg )`, so the two lanes stay a constant
+  /// gap apart around the corner, and the `radius > mean_corner_radius`
+  /// guard at `:506` applies it to the outer lane only. The round branch
+  /// has no such correction, which is why its two lanes are concentric
+  /// rather than parallel.
   fn make_miter_shape(
     &self,
     p: Vec2,
@@ -1046,6 +1046,26 @@ impl Turtle {
 
     // :486
     chain.append(p);
+
+    if self.corner_style == CornerStyle::Round {
+      // :493 to :497. The width is KiCad's default of zero, because
+      // `SHAPE_ARC`'s width is not what the chain is drawn with; the
+      // placer sets the line's width on the reassembled chain.
+      let arc = ShapeArc::from_start_end_angle(
+        p,
+        end_point,
+        if side {
+          -Degrees::QUARTER_TURN
+        } else {
+          Degrees::QUARTER_TURN
+        },
+        0,
+      );
+
+      chain.append_arc(&arc, LineChain::ARC_POLYGONIZATION_MAX_ERROR);
+
+      return chain;
+    }
 
     // :503 to :507. `radius` is only ever compared, so it stays an
     // integer.
@@ -1282,7 +1302,8 @@ impl MeanderShape {
   /// The corner radius before [`MeanderShape::gen_meander_shape`]'s own
   /// clamps.
   ///
-  /// Port of `cornerRadius()`, `pcbnew/router/pns_meander.cpp:429`. The
+  /// Port of `cornerRadius()`, `pcbnew/router/pns_meander.cpp:429`, one
+  /// of the three readers of the corner style. The
   /// `/ 200` at `:450` is deliberate: the percentage is of the **half**
   /// period, so 100 percent is a radius of exactly half the spacing, the
   /// most that fits.
@@ -1299,11 +1320,17 @@ impl MeanderShape {
     let offset = i64::from(self.baseline_offset).abs();
     let spacing = i64::from(self.spacing(context));
 
-    // :439. The integer division happens first, then the multiplication
-    // by the constant, then the truncation toward zero of the assignment
-    // to `int`. Erratum E15.
-    let minimum =
-      offset + (f64::from(self.width / 2) * ONE_MINUS_TAN_22_5) as i64;
+    // :437 to :440. The integer division happens first, then, for the
+    // chamfer, the multiplication by the constant and the truncation
+    // toward zero of the assignment to `int`. Erratum E15. The round
+    // style takes the half width whole, so a rounded corner is never
+    // tighter than the track it carries.
+    let minimum = match context.settings().corner_style() {
+      CornerStyle::Round => offset + i64::from(self.width / 2),
+      CornerStyle::Chamfer => {
+        offset + (f64::from(self.width / 2) * ONE_MINUS_TAN_22_5) as i64
+      }
+    };
 
     // :441 to :443
     let maximum = ((i64::from(self.amplitude) + offset) / 2).min(spacing / 2);
@@ -1323,7 +1350,8 @@ impl MeanderShape {
 
   /// The shortest excursion this meander may be resized to.
   ///
-  /// Port of `MinAmplitude()`, `pcbnew/router/pns_meander.cpp:411`. The
+  /// Port of `MinAmplitude()`, `pcbnew/router/pns_meander.cpp:411`, one
+  /// of the three readers of the corner style. The
   /// chamfer correction at `:421` is `tan( 1 - tan( 22.5 deg ) )` where
   /// the same expression written correctly eighteen lines down is
   /// `1 - tan( 22.5 deg )`, so the correction is 13.3 percent larger than
@@ -1336,11 +1364,17 @@ impl MeanderShape {
     // :413
     let minimum = i64::from(context.settings().min_amplitude());
 
-    // :421, truncated toward zero by the assignment to `int`, erratum
-    // E15. E3 is the constant itself.
-    let correction = (f64::from(self.width) * TAN_ONE_MINUS_TAN_22_5) as i64;
+    // :415 to :422. The round branch adds the whole width, the chamfer
+    // branch the correction, truncated toward zero by the assignment to
+    // `int` (erratum E15); E3 is the chamfer constant itself.
+    let correction = match context.settings().corner_style() {
+      CornerStyle::Round => i64::from(self.width),
+      CornerStyle::Chamfer => {
+        (f64::from(self.width) * TAN_ONE_MINUS_TAN_22_5) as i64
+      }
+    };
 
-    // :422
+    // :417, :422
     saturate_i32(
       minimum.max(i64::from(self.baseline_offset).abs() + correction),
     )
@@ -1434,6 +1468,7 @@ impl MeanderShape {
       self.dual,
       self.baseline_offset,
       self.mean_corner_radius,
+      context.settings().corner_style(),
     );
 
     match meander_type {
@@ -1471,6 +1506,7 @@ impl MeanderShape {
           self.dual,
           self.baseline_offset,
           self.mean_corner_radius,
+          context.settings().corner_style(),
         );
         turtle.turn(QuarterTurn::Minus90);
 
@@ -1505,6 +1541,7 @@ impl MeanderShape {
           self.dual,
           self.baseline_offset,
           self.mean_corner_radius,
+          context.settings().corner_style(),
         );
         turtle.turn(QuarterTurn::Minus90);
 
@@ -1816,10 +1853,9 @@ impl MeanderShape {
   /// zero baseline and zero length to every sum in
   /// [`tune_line_length`].
   ///
-  /// KiCad's `MakeArc` (`:916`) is the same routine for a pre existing
-  /// arc, and it sets `MT_CORNER` rather than `MT_ARC`, which is why
-  /// `MT_ARC` is not a [`MeanderType`] here (erratum E4). Arcs are on
-  /// hold, so there is nothing to port.
+  /// [`MeanderShape::make_arc`] (`:916`) is the same routine for a pre
+  /// existing arc, and it sets `MT_CORNER` rather than `MT_ARC`, which is
+  /// why `MT_ARC` is not a [`MeanderType`] here (note 08 erratum E4).
   pub fn make_corner(&mut self, p1: Vec2, p2: Vec2) {
     self.meander_type = MeanderType::Corner;
     self.shapes[0].clear();
@@ -1827,6 +1863,32 @@ impl MeanderShape {
     self.shapes[0].append(p1);
     self.shapes[1].append(p2);
     self.clipped_base_seg = Seg::new(p1, p1);
+  }
+
+  /// Make this a pass through marker for an arc the tuned stretch already
+  /// contained.
+  ///
+  /// Port of `MakeArc`, `pcbnew/router/pns_meander.cpp:916`. It is
+  /// [`MeanderShape::make_corner`] with an arc in each chain instead of a
+  /// point, and it sets [`MeanderType::Corner`] for the same reason: `MT_ARC`
+  /// is written nowhere in KiCad's tree, so the four places that test for
+  /// it are dead and the type does not exist here (note 08 erratum E4).
+  ///
+  /// The clipped base segment collapses onto the arc's **end**, which is
+  /// what KiCad's `GetP1()` answers, so the shape contributes zero
+  /// baseline to [`tune_line_length`] and the arc itself is carried
+  /// through the tuned chain untouched.
+  ///
+  /// The second arc is the N lane of a pair; a single track passes the
+  /// same arc twice, as [`MeanderedLine::add_arc`] does for its default
+  /// argument.
+  pub fn make_arc(&mut self, arc1: &ShapeArc, arc2: &ShapeArc) {
+    self.meander_type = MeanderType::Corner;
+    self.shapes[0].clear();
+    self.shapes[1].clear();
+    self.shapes[0].append_arc(arc1, LineChain::ARC_POLYGONIZATION_MAX_ERROR);
+    self.shapes[1].append_arc(arc2, LineChain::ARC_POLYGONIZATION_MAX_ERROR);
+    self.clipped_base_seg = Seg::new(arc1.end(), arc1.end());
   }
 
   /// Recompute which part of the base segment the chains project onto.
@@ -2053,6 +2115,24 @@ impl MeanderedLine {
 
     meander.make_corner(a, b);
     self.last = a;
+    self.meanders.push(meander);
+  }
+
+  /// Add a pass through marker for an arc the tuned stretch already
+  /// contained.
+  ///
+  /// Port of `AddArc`, `pcbnew/router/pns_meander.cpp:877`. The cursor
+  /// advances to the arc's end (`GetP1()` at `:883`), where
+  /// [`MeanderedLine::add_corner`] advances it to the point it was given.
+  ///
+  /// KiCad's `AddArcAndPt` (`:888`) and `AddPtAndArc` (`:896`) wrap this
+  /// with a degenerate arc on one lane and have no caller anywhere in its
+  /// tree, so they are not here (note 08 erratum E5).
+  pub fn add_arc(&mut self, arc1: &ShapeArc, arc2: &ShapeArc) {
+    let mut meander = MeanderShape::new(self.width, self.dual);
+
+    meander.make_arc(arc1, arc2);
+    self.last = arc1.end();
     self.meanders.push(meander);
   }
 
@@ -2875,10 +2955,28 @@ mod tests {
 
   /// Settings with KiCad's defaults and one amplitude and spacing chosen,
   /// so that `fit`'s downward scan lands on the amplitude a test names.
+  ///
+  /// The corner style is asked for rather than taken from the default,
+  /// which is [`CornerStyle::Round`] as KiCad's is: every worked example
+  /// of note 08 section 2.6 is drawn with chamfered corners, and a round
+  /// corner replaces the two point chord with an arc, so the closed forms
+  /// those examples pin only hold for the chamfer.
   fn settings_at(max_amplitude: i32, spacing: i32) -> MeanderSettings {
     MeanderSettings::new(MeanderSettingsRequest {
       max_amplitude,
       spacing,
+      corner_style: MeanderStyle::Chamfer,
+      ..MeanderSettingsRequest::default()
+    })
+    .expect("the defaults with one amplitude and spacing are valid")
+  }
+
+  /// [`settings_at`] in the round corner style.
+  fn round_settings_at(max_amplitude: i32, spacing: i32) -> MeanderSettings {
+    MeanderSettings::new(MeanderSettingsRequest {
+      max_amplitude,
+      spacing,
+      corner_style: MeanderStyle::Round,
       ..MeanderSettingsRequest::default()
     })
     .expect("the defaults with one amplitude and spacing are valid")
@@ -2924,9 +3022,18 @@ mod tests {
   // -----------------------------------------------------------------
 
   /// Every default of `MEANDER_SETTINGS`, pinned against the constructor
-  /// at `pcbnew/router/pns_meander.cpp:42` to `:63`. The four KiCad's own
-  /// suite asserts are the first four
-  /// (`qa/tests/pcbnew/test_meander_corner_radius.cpp:43` to `:52`).
+  /// at `pcbnew/router/pns_meander.cpp:42` to `:63`.
+  ///
+  /// This is the mirror of `DefaultSettings`
+  /// (`qa/tests/pcbnew/test_meander_corner_radius.cpp:38`), whose four
+  /// checks are the round corner style (`:44`), the corner radius
+  /// percentage of 80 (`:47`), the spacing of 600000 (`:50`) and a
+  /// positive minimum amplitude (`:53`). The other two cases in that file
+  /// call no KiCad code at all, computing `width / 2` and
+  /// `min( amplitude / 2, spacing / 2 )` inline and comparing against a
+  /// hand written table, so they cannot fail for any change to
+  /// `pns_meander.cpp` and there is nothing to mirror (note 09 erratum
+  /// E33).
   #[test]
   fn meander_settings_defaults_are_kicads() {
     let settings = MeanderSettings::default();
@@ -2942,9 +3049,10 @@ mod tests {
     assert_eq!(settings.target_length(), None);
     assert_eq!(settings.target_skew(), Some(LengthTarget::around(0)));
 
-    // The one deliberate difference: KiCad's default corner style is
-    // `MEANDER_STYLE_ROUND` (`:56`), which needs an arc.
-    assert_eq!(settings.corner_style(), CornerStyle::Chamfer);
+    // `:56`, the field `test_meander_corner_radius.cpp:44` asserts by
+    // name. A host whose file format cannot store an arc has to ask for
+    // [`CornerStyle::Chamfer`] rather than take this.
+    assert_eq!(settings.corner_style(), CornerStyle::Round);
     assert_eq!(
       MeanderSettings::new(MeanderSettingsRequest::default()),
       Ok(MeanderSettings::default())
@@ -2976,19 +3084,23 @@ mod tests {
     );
   }
 
-  /// The round style needs a `SHAPE_ARC` (`pns_meander.cpp:496`), and
-  /// silently drawing chamfers instead would miss the target by about
-  /// `0.62 * radius` per meander, so it is refused rather than
-  /// substituted.
+  /// Both corner styles are accepted now that the round one can be
+  /// drawn, and the two [`MeanderStyle`] values map onto the two
+  /// [`CornerStyle`] values one for one.
   #[test]
-  fn the_settings_constructor_refuses_the_round_corner_style() {
-    assert_eq!(
-      MeanderSettings::new(MeanderSettingsRequest {
-        corner_style: MeanderStyle::Round,
+  fn the_settings_constructor_accepts_both_corner_styles() {
+    for (asked, expected) in [
+      (MeanderStyle::Round, CornerStyle::Round),
+      (MeanderStyle::Chamfer, CornerStyle::Chamfer),
+    ] {
+      let settings = MeanderSettings::new(MeanderSettingsRequest {
+        corner_style: asked,
         ..MeanderSettingsRequest::default()
-      }),
-      Err(MeanderSettingsError::RoundCornersUnsupported),
-    );
+      })
+      .expect("a positive step and a corner style that can be drawn");
+
+      assert_eq!(settings.corner_style(), expected);
+    }
   }
 
   /// `SetTargetLength( long long int )`,
@@ -3091,7 +3203,14 @@ mod tests {
 
     for sequence in 0_u32..64 {
       for length in 0..6 {
-        let mut turtle = Turtle::start(Vec2::new(0, 0), start, false, 0, 0);
+        let mut turtle = Turtle::start(
+          Vec2::new(0, 0),
+          start,
+          false,
+          0,
+          0,
+          CornerStyle::Round,
+        );
         let mut net: i32 = 0;
 
         for index in 0..length {
@@ -3141,6 +3260,7 @@ mod tests {
 
     let lowered = MeanderSettings::new(MeanderSettingsRequest {
       min_amplitude: 100_000,
+      corner_style: MeanderStyle::Chamfer,
       ..MeanderSettingsRequest::default()
     })
     .expect("a lower minimum amplitude is valid");
@@ -3191,6 +3311,114 @@ mod tests {
     let shape = fit_along_x(&context, MeanderType::Single);
     assert_eq!(shape.spacing(&context), 300_000);
     assert_eq!(shape.corner_radius(&context), 120_000);
+  }
+
+  /// The round branches of the two derived dimensions,
+  /// `pcbnew/router/pns_meander.cpp:415` and `:437`. Both take the width
+  /// whole where the chamfer applies `1 - tan( 22.5 deg )` to it, so a
+  /// rounded corner is never tighter than the track it carries.
+  #[test]
+  fn the_round_style_takes_the_whole_width_into_both_floors() {
+    let round = round_settings_at(1_000_000, 600_000);
+    let context =
+      MeanderContext::accepting_every_fit(&round, NOTE_WIDTH, NOTE_CLEARANCE);
+
+    // :417. The default minimum amplitude still dominates, so drop it to
+    // see the correction itself.
+    let lowered = MeanderSettings::new(MeanderSettingsRequest {
+      min_amplitude: 100_000,
+      corner_style: MeanderStyle::Round,
+      ..MeanderSettingsRequest::default()
+    })
+    .expect("a lower minimum amplitude is valid");
+    let lowered_context =
+      MeanderContext::accepting_every_fit(&lowered, NOTE_WIDTH, NOTE_CLEARANCE);
+    let shape = MeanderShape::new(NOTE_WIDTH, false);
+
+    assert_eq!(shape.min_amplitude(&lowered_context), NOTE_WIDTH);
+
+    // :439. The optimum of 240000 sits above both floors, so the clamp
+    // does not bite and the two styles agree on this case; the floors do
+    // not.
+    let fitted = fit_along_x(&context, MeanderType::Single);
+    assert_eq!(fitted.corner_radius(&context), 240_000);
+
+    let narrow = round_settings_at(240_000, 200_000);
+    let narrow_context =
+      MeanderContext::accepting_every_fit(&narrow, NOTE_WIDTH, NOTE_CLEARANCE);
+    let narrow_shape = fit_along_x(&narrow_context, MeanderType::Single);
+
+    // Spacing 300000, optimum 120000, floored by |offset| + width / 2.
+    assert_eq!(narrow_shape.corner_radius(&narrow_context), 120_000);
+  }
+
+  /// `makeMiterShape`'s round branch, `pcbnew/router/pns_meander.cpp:491`
+  /// to `:499`: one quarter circle from the corner's start to its end,
+  /// turning towards the side the meander is on, where the chamfer puts a
+  /// single 45 degree chord across the same two points.
+  #[test]
+  fn a_round_corner_is_a_quarter_circle_between_the_chamfers_two_points() {
+    let radius = 240_000;
+
+    for side in [false, true] {
+      let round = Turtle::start(
+        Vec2::new(0, 0),
+        Vec2::new(radius, 0),
+        false,
+        0,
+        0,
+        CornerStyle::Round,
+      );
+      let chamfer = Turtle::start(
+        Vec2::new(0, 0),
+        Vec2::new(radius, 0),
+        false,
+        0,
+        0,
+        CornerStyle::Chamfer,
+      );
+      let p = Vec2::new(1_000_000, 2_000_000);
+      let direction = Vec2::new(radius, 0);
+      let round_corner = round.make_miter_shape(p, direction, side);
+      let chamfer_corner = chamfer.make_miter_shape(p, direction, side);
+
+      // The two styles consume the same baseline: same first point, same
+      // last point.
+      assert_eq!(chamfer_corner.points().len(), 2);
+      assert_eq!(
+        round_corner.points().first(),
+        chamfer_corner.points().first()
+      );
+      assert_eq!(round_corner.last_point(), chamfer_corner.last_point());
+
+      // And the round one is a stored arc, not a polyline that happens to
+      // curve.
+      assert_eq!(round_corner.arc_count(), 1);
+
+      let arc = round_corner.arc(0).expect("the corner stores its arc");
+
+      assert_eq!(arc.start(), p);
+      assert_eq!(arc.end(), chamfer_corner.last_point().expect("two points"));
+      assert_eq!(
+        arc.central_angle().as_degrees(),
+        if side { -90.0 } else { 90.0 }
+      );
+
+      // The corner's own length is `radius * pi / 2` against the
+      // chamfer's `radius * sqrt( 2 )`, which is the 0.155 of the radius
+      // note 08 section 2.4 measures.
+      let round_length = arc.length();
+      let chamfer_length = f64::from(chamfer_chord(radius) as i32);
+
+      assert!(
+        (round_length
+          - chamfer_length
+          - f64::from(radius) * (PI / 2.0 - SQRT_2))
+          .abs()
+          < 2.0,
+        "round {round_length} chamfer {chamfer_length}"
+      );
+    }
   }
 
   // -----------------------------------------------------------------

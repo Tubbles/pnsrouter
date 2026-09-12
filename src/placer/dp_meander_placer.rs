@@ -52,14 +52,15 @@
 //! - Erratum E20's first bail out is transcribed as it stands, reporting
 //!   [`TuningStatus::TooShort`] where the second one reports honestly.
 //! - The four way arc walk of `addCornersUntilIndex` (`:392` to `:441`)
-//!   is reduced to its no arc case, because [`LineChain`] cannot hold an
-//!   arc.
+//!   is ported whole, including the forward hunt that pairs an arc on one
+//!   lane with an arc on the other.
 //! - `m_coupledSegments`, `m_tunedPath`, `totalLength`, `meanderSegment`,
 //!   `setWorld`, `release` and `Trace` are not ported (erratum E12).
 
 use crate::algo_base::AlgoContext;
 use crate::collide::CollisionSearchOptions;
 use crate::diff_pair::{CoupledSegments, DiffPair};
+use crate::geometry::arc::ShapeArc;
 use crate::geometry::line_chain::LineChain;
 use crate::geometry::seg::Seg;
 use crate::geometry::vec2::Vec2;
@@ -1211,11 +1212,27 @@ impl CornerCursor {
   /// Carry the uncoupled stretch before a coupled span through unchanged.
   ///
   /// Port of `addCornersUntilIndex`,
-  /// `pcbnew/router/pns_dp_meander_placer.cpp:378`, reduced to its no arc
-  /// case: one `AddCorner( p, n )` per pair of aligned vertices, both
-  /// cursors advancing together, until both have passed their stop index.
-  /// That is what keeps the two lanes' vertices paired up across the parts
-  /// of the tuned stretch no meander is fitted into.
+  /// `pcbnew/router/pns_dp_meander_placer.cpp:378`: one
+  /// `AddCorner( p, n )` per pair of aligned vertices, both cursors
+  /// advancing together, until both have passed their stop index. That is
+  /// what keeps the two lanes' vertices paired up across the parts of the
+  /// tuned stretch no meander is fitted into.
+  ///
+  /// # The four way branch
+  ///
+  /// `:392` to `:441` splits on which side stands on an arc. Neither does:
+  /// one corner. Both do: one `AddArc`, and the two arcs travel together.
+  /// Exactly one does: the corner goes out first and then the walk **hunts
+  /// forward on the other lane alone** until it finds an arc to pair the
+  /// first one with, emitting a corner per straight shape it passes and
+  /// repeating the arc bearing lane's own start point for each of them.
+  /// That hunt is the whole reason the routine exists: two lanes of a pair
+  /// can have their arcs at different indices, and the pairing has to be
+  /// arc to arc or the meander list goes out of step.
+  ///
+  /// The hunt can also run out without finding an arc, in which case the
+  /// outer loop simply carries on with the lane cursor left where the hunt
+  /// abandoned it.
   ///
   /// # The exhausted cursor
   ///
@@ -1224,11 +1241,14 @@ impl CornerCursor {
   /// it reads `GetSegment( -1 )`, which
   /// `SHAPE_LINE_CHAIN::Segment` resolves as an index from the back
   /// (`libs/kimath/include/geometry/shape_line_chain.h:381`) and therefore
-  /// answers the **last** segment. The exhausted side's corner point is
-  /// its last segment's start, over and over, until the other side catches
-  /// up. That is transcribed rather than tidied, and it can only arise
-  /// when the two lanes have different segment counts inside the tuned
-  /// stretch.
+  /// answers the **last** segment. `IsArcSegment( -1 )` is false, the
+  /// `size_t` wrap landing back on the bound check
+  /// (`libs/kimath/src/geometry/shape_line_chain.cpp:3246`), so an
+  /// exhausted cursor never reads as an arc. The exhausted side's corner
+  /// point is its last segment's start, over and over, until the other
+  /// side catches up. That is transcribed rather than tidied, and it can
+  /// only arise when the two lanes have different shape counts inside the
+  /// tuned stretch.
   fn add_corners_until(
     &mut self,
     result: &mut MeanderedLine,
@@ -1238,34 +1258,118 @@ impl CornerCursor {
     last_index_n: usize,
   ) {
     loop {
-      // :382 to :387
-      let p_ok = self.index_p.is_some_and(|index| index <= last_index_p);
-      let n_ok = self.index_n.is_some_and(|index| index <= last_index_n);
+      // :382 to :387. `checkIndex` writes its flag through a reference,
+      // so a hunt below leaves the flag it walked on behind for the
+      // cursor advance at `:443` to read. Both are mutable here for the
+      // same reason.
+      let mut p_ok = self.index_p.is_some_and(|index| index <= last_index_p);
+      let mut n_ok = self.index_n.is_some_and(|index| index <= last_index_n);
 
       if !p_ok && !n_ok {
         break;
       }
 
-      // :389, :390, :394
-      let (Some(point_p), Some(point_n)) = (
-        segment_start(tuned_p, self.index_p),
-        segment_start(tuned_n, self.index_n),
+      // :389, :390
+      let (Some(p_item), Some(n_item)) = (
+        get_item(tuned_p, self.index_p),
+        get_item(tuned_n, self.index_n),
       ) else {
         break;
       };
 
-      result.add_corner(point_p, point_n);
+      match (p_item.arc, n_item.arc) {
+        // :392
+        (None, None) => result.add_corner(p_item.start, n_item.start),
+        // :396
+        (Some(p_arc), Some(n_arc)) => result.add_arc(&p_arc, &n_arc),
+        // :400. P is on an arc, N is not: hunt forward on N.
+        (Some(p_arc), None) => {
+          result.add_corner(p_item.start, n_item.start);
+
+          while n_ok {
+            self.index_n = chain_next_shape(tuned_n, self.index_n);
+
+            let Some(found) = get_item(tuned_n, self.index_n) else {
+              break;
+            };
+
+            if let Some(n_arc) = found.arc {
+              result.add_arc(&p_arc, &n_arc);
+              break;
+            }
+
+            result.add_corner(p_item.start, found.start);
+            n_ok = self.index_n.is_some_and(|index| index <= last_index_n);
+          }
+        }
+        // :420. The mirror image, hunting forward on P.
+        (None, Some(n_arc)) => {
+          result.add_corner(p_item.start, n_item.start);
+
+          while p_ok {
+            self.index_p = chain_next_shape(tuned_p, self.index_p);
+
+            let Some(found) = get_item(tuned_p, self.index_p) else {
+              break;
+            };
+
+            if let Some(p_arc) = found.arc {
+              result.add_arc(&p_arc, &n_arc);
+              break;
+            }
+
+            result.add_corner(found.start, n_item.start);
+            p_ok = self.index_p.is_some_and(|index| index <= last_index_p);
+          }
+        }
+      }
 
       // :443 to :447
       if p_ok {
-        self.index_p = next_shape(tuned_p, self.index_p);
+        self.index_p = chain_next_shape(tuned_p, self.index_p);
       }
 
       if n_ok {
-        self.index_n = next_shape(tuned_n, self.index_n);
+        self.index_n = chain_next_shape(tuned_n, self.index_n);
       }
     }
   }
+}
+
+/// One shape of one lane, as the corner walk sees it.
+///
+/// Port of `GET_ITEM_RET` and the `getItem` lambda,
+/// `pcbnew/router/pns_dp_meander_placer.cpp:340` and `:347`. KiCad carries
+/// the end point too and reads it nowhere, so it is not here.
+struct WalkItem {
+  /// The arc this shape belongs to, or [`None`] for a straight segment.
+  arc: Option<ShapeArc>,
+  /// `startPt`: the arc's start, or the segment's.
+  start: Vec2,
+}
+
+/// The shape a cursor stands on.
+///
+/// `getItem`, `pcbnew/router/pns_dp_meander_placer.cpp:347`. A cursor past
+/// the end, KiCad's `-1`, reads the **last** segment and never reads as an
+/// arc; [`CornerCursor::add_corners_until`] documents why.
+fn get_item(chain: &LineChain, index: Option<usize>) -> Option<WalkItem> {
+  // :352
+  if let Some(index) = index
+    && chain.is_arc_segment(index)
+    && let Some(arc) = chain.arc_index(index).and_then(|which| chain.arc(which))
+  {
+    return Some(WalkItem {
+      arc: Some(arc),
+      start: arc.start(),
+    });
+  }
+
+  // :361
+  Some(WalkItem {
+    arc: None,
+    start: segment_start(chain, index)?,
+  })
 }
 
 /// The start point of a chain's segment, with KiCad's index from the back.
@@ -1287,20 +1391,13 @@ fn segment_start(chain: &LineChain, index: Option<usize>) -> Option<Vec2> {
 
 /// The index of the next shape, or [`None`] at the last one.
 ///
-/// Port of `SHAPE_LINE_CHAIN::NextShape`,
-/// `libs/kimath/src/geometry/shape_line_chain.cpp:1302`, for a chain that
-/// holds no arc: the last point and the last segment's start both answer
-/// "there is no next shape", because the chain is never closed here.
-fn next_shape(chain: &LineChain, index: Option<usize>) -> Option<usize> {
-  let index = index?;
-  let last = chain.point_count().checked_sub(1)?;
-
-  // :1313, :1318
-  if index + 1 >= last {
-    return None;
-  }
-
-  Some(index + 1)
+/// `SHAPE_LINE_CHAIN::NextShape`,
+/// `libs/kimath/src/geometry/shape_line_chain.cpp:1302`, with KiCad's
+/// `-1` spelled as [`None`] on both sides. An already exhausted cursor
+/// stays exhausted, where KiCad would call `NextShape( -1 )` and read
+/// `m_shapes` out of bounds.
+fn chain_next_shape(chain: &LineChain, index: Option<usize>) -> Option<usize> {
+  chain.next_shape(index?)
 }
 
 // ---------------------------------------------------------------------

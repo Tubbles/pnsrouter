@@ -11,11 +11,11 @@
 //!
 //! # What is implemented
 //!
-//! Steps 1 to 10 of that order, which is every `DRAGGER` routine a board
-//! without arcs can reach:
+//! Steps 1 to 10 of that order, plus the arc drag, which is every
+//! `DRAGGER` routine:
 //!
 //! - [`Dragger::start`] with the mode decision of `startDragSegment`
-//!   (`:118`) and `startDragVia` (`:257`);
+//!   (`:118`), `startDragVia` (`:257`) and `startDragArc` (`:155`);
 //! - [`Dragger::drag`]'s dispatch, its first drag fallback and its
 //!   restore branch (`:998`);
 //! - `dragMarkObstacles` (`:381`), which is [`Dragger::drag`] in
@@ -30,6 +30,10 @@
 //!   `dragViaMarkObstacles` (`:452`), `propagateViaForces` (`:62`),
 //!   `dragViaWalkaround` (`:492`) and `dragShove`'s `DM_VIA` case
 //!   (`:908`);
+//! - the arc drag: `startDragArc` with its tangent stubs
+//!   (`:155`) and the `DM_ARC` case of each of the three drag routines
+//!   (`:418`, `:762`, `:865`), all three of which call
+//!   [`crate::line::Line::drag_arc`];
 //! - `optimizeAndUpdateDraggedLine` (`:569`), `bestAnchorForPoint`
 //!   (`:639`) and `pointHasBadCorner` (`:622`), where the walkaround and
 //!   the shove both end;
@@ -53,8 +57,6 @@
 //!
 //! # What is not ported at all
 //!
-//! - `startDragArc` (`:155`) and the `DM_ARC` cases, because this crate
-//!   has no arcs (`PLAN.md`).
 //! - `checkVirtualVia` (`:81`). It looks for a via that
 //!   `NODE::FixupVirtualVias` planted, and this crate has no virtual vias
 //!   (`src/node.rs`, `src/snapshot.rs`), so a click near a width change
@@ -94,10 +96,15 @@ use crate::collide::CollisionSearchOptions;
 use crate::geometry::box2::Box2;
 use crate::geometry::direction45::{AngleType, Direction45};
 use crate::geometry::line_chain::LineChain;
+use crate::geometry::math::{euclidean_norm_f64, kiround};
 use crate::geometry::seg::Seg;
 use crate::geometry::vec2::Vec2;
-use crate::item::{Item, ItemBody, ItemId, Kind, MarkerFlags, NetId};
-use crate::line::Line;
+use crate::item::{
+  Item, ItemBody, ItemId, Kind, LayerRange, MarkerFlags, NetId, Segment,
+};
+use crate::line::{
+  Line, MAX_TANGENT_ANGLE_DEVIATION_DEGREES, MAX_TRACK_LENGTH_TO_KEEP_IU,
+};
 use crate::mouse_trail::MouseTrailTracer;
 use crate::node::{NodeId, World};
 use crate::optimizer::{EffortFlags, Optimizer};
@@ -122,9 +129,8 @@ use crate::walkaround::{WalkPolicy, Walkaround, WalkaroundStatus};
 /// caller cannot request a mode, and the free angle bit travels
 /// separately as [`Dragger::set_free_angle_mode`].
 ///
-/// `DM_ARC` has no variant, because this crate has no arcs, and
-/// `DM_COMPONENT` never reaches a dragger at all
-/// (`pcbnew/router/pns_router.cpp:176`).
+/// `DM_COMPONENT` has no variant, because it never reaches a dragger at
+/// all (`pcbnew/router/pns_router.cpp:176`).
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
 pub enum DragMode {
   /// One corner of a line moves. `DM_CORNER = 0x01`.
@@ -135,6 +141,10 @@ pub enum DragMode {
   Segment,
   /// A via moves, taking its fanout with it. `DM_VIA = 0x04`.
   Via,
+  /// An arc is rebuilt around the cursor. `DM_ARC = 0x08`, the mode
+  /// `startDragArc` sets (`:251`) and the only one
+  /// [`crate::line::Line::drag_arc`] is reached from.
+  Arc,
 }
 
 // ---------------------------------------------------------------------
@@ -516,7 +526,9 @@ impl Dragger {
     match kind {
       Kind::SEGMENT => self.start_drag_segment(world, at, item),
       Kind::VIA => self.start_drag_via(world, item),
-      // :352 would be `startDragArc`, and :355 refuses everything else.
+      // :351
+      Kind::ARC => self.start_drag_arc(world, item),
+      // :355 refuses everything else.
       _ => false,
     }
   }
@@ -585,10 +597,15 @@ impl Dragger {
         index += 1;
       }
     } else if self.free_angle_mode {
-      // :135. A mid segment click in free angle mode is a corner drag
-      // too, with two guards the branch above does not have. The arc
-      // test at `:139` has nothing to match here.
-      if distance_b < distance_a && index + 2 < self.dragged_line.point_count()
+      // :135 to :142. A mid segment click in free angle mode is a corner
+      // drag too, with two guards the branch above does not have: the
+      // index only advances to the far endpoint when there is a corner
+      // beyond it, and when that point does not belong to an arc. So a
+      // free angle drag never picks an arc's endpoint as its corner, and
+      // `dragCornerFree`'s own arc insertion never fires from here.
+      if distance_b < distance_a
+        && index + 2 < self.dragged_line.point_count()
+        && !self.dragged_line.shape().is_pt_on_arc(index + 1)
       {
         index += 1;
       }
@@ -603,6 +620,230 @@ impl Dragger {
     self.dragged_segment_index = index;
 
     true
+  }
+
+  /// Assemble the clicked arc's line, give it neighbours to be tangent to
+  /// and enter [`DragMode::Arc`].
+  ///
+  /// Port of `startDragArc` (`:155`). Three things happen:
+  ///
+  /// 1. An arc of half a turn or more is **refused** (`:161`), because
+  ///    the tangent construction [`crate::line::Line::drag_arc`] is built
+  ///    on has no solution there: the two tangents meet on the wrong side
+  ///    of the arc or not at all. KiCad puts a message in front of the
+  ///    user; the facade answers
+  ///    [`crate::router::StartError::NotDraggable`].
+  /// 2. The line is probed for the arc's own first and last vertex
+  ///    (`:170` to `:196`). An arc whose first vertex is the line's first
+  ///    point, or whose last is the line's last, has a free end.
+  /// 3. Each free end gets a **tangent stub segment** of half
+  ///    [`crate::line::MAX_TRACK_LENGTH_TO_KEEP_IU`] added to the pre drag
+  ///    node (`:231`, `:241`), so that the arc has a neighbour to stay
+  ///    tangent to and the drag has something to hinge on. The line is
+  ///    then reassembled from that node so it picks the stubs up.
+  ///
+  /// # Erratum E12, reproduced
+  ///
+  /// The stubs go into [`Dragger::pre_drag_node`], and the collision
+  /// probe of `dragWalkaround` tests against [`Dragger::world_node`], the
+  /// root (note 06 section 2.6 and erratum E12 there). So the stubs are
+  /// visible to the shove, whose root is the pre drag node, and to the
+  /// branch every move works in, and invisible to the test that decides
+  /// whether an arc drag needs a walkaround. Reproduced rather than
+  /// fixed: the stubs are shorter than a quarter micrometre, so nothing a
+  /// walkaround could find is inside one, and the alternative is a
+  /// collision probe that differs between the arc arm and the other two.
+  /// Pinned by `an_isolated_arc_gets_tangent_stubs_erratum_e12`.
+  ///
+  /// KiCad writes the stubs **after** the shove was constructed
+  /// (`:325` against `:352`); the shove stores the node and reads it
+  /// lazily, so they are there by the time it looks. The same holds here.
+  fn start_drag_arc(&mut self, world: &mut World, arc: ItemId) -> bool {
+    let Some(item) = world.item(arc) else {
+      return false;
+    };
+    let ItemBody::Arc(body) = item.body() else {
+      return false;
+    };
+    let shape = body.arc();
+    let net = item.net();
+    let layers = item.layers();
+    let width = body.width();
+
+    // :159 to :167. `GetCentralAngle` is signed; the test is on its
+    // magnitude.
+    let central_angle = shape.central_angle().as_degrees().abs();
+
+    if central_angle + MAX_TANGENT_ANGLE_DEVIATION_DEGREES >= 180.0 {
+      return false;
+    }
+
+    // :170
+    let probe =
+      world.assemble_line(self.world_node, arc, None, false, false, true);
+    let point_count = probe.shape().point_count();
+
+    // :176 to :193. The first and last vertex of the **first** arc the
+    // probe holds, which is not necessarily the one that was clicked; a
+    // line carrying two arcs answers with the first of them, as KiCad's
+    // `arcIdx < 0` latch does.
+    let mut arc_index = None;
+    let mut first_arc_pt = None;
+    let mut last_arc_pt = None;
+
+    for index in 0..point_count {
+      let Some(which) = probe.shape().arc_index(index) else {
+        continue;
+      };
+
+      if arc_index.is_none() {
+        arc_index = Some(which);
+      }
+
+      if arc_index == Some(which) {
+        if first_arc_pt.is_none() {
+          first_arc_pt = Some(index);
+        }
+
+        last_arc_pt = Some(index);
+      }
+    }
+
+    // :195, :196
+    let isolated_start = first_arc_pt == Some(0);
+    let isolated_end = point_count > 0 && last_arc_pt == Some(point_count - 1);
+
+    // :198
+    let Some(pre_drag) = self.pre_drag_node else {
+      return false;
+    };
+
+    if isolated_start || isolated_end {
+      // :200, :201
+      let stub_length = (MAX_TRACK_LENGTH_TO_KEEP_IU / 2).max(1);
+      let center = shape.center();
+      let mid = shape.arc_mid();
+
+      // :207 to :224. The tangent at an endpoint, turned to point away
+      // from the arc's own mid point, so the stub grows outwards.
+      let outward_tangent = |endpoint: Vec2| -> Vec2 {
+        let radial = endpoint - center;
+        let mut perpendicular = Vec2::new(-radial.y, radial.x);
+        let to_mid = mid - endpoint;
+
+        if perpendicular.dot(to_mid) > 0 {
+          perpendicular = Vec2::new(radial.y, -radial.x);
+        }
+
+        let magnitude = euclidean_norm_f64(
+          f64::from(perpendicular.x),
+          f64::from(perpendicular.y),
+        );
+
+        // :219, :220. A degenerate radial leaves the direction
+        // arbitrary, as KiCad's does.
+        if magnitude <= 0.0 {
+          return Vec2::new(stub_length, 0);
+        }
+
+        Vec2::new(
+          kiround(
+            f64::from(perpendicular.x) * f64::from(stub_length) / magnitude,
+          ),
+          kiround(
+            f64::from(perpendicular.y) * f64::from(stub_length) / magnitude,
+          ),
+        )
+      };
+
+      // :226 to :234. The start stub runs **into** the arc's start, so
+      // that the assembled line reads start to end.
+      if isolated_start {
+        let far = shape.start() + outward_tangent(shape.start());
+
+        self.add_stub(
+          world,
+          pre_drag,
+          Seg::new(far, shape.start()),
+          width,
+          net,
+          layers,
+        );
+      }
+
+      // :236 to :244
+      if isolated_end {
+        let far = shape.end() + outward_tangent(shape.end());
+
+        self.add_stub(
+          world,
+          pre_drag,
+          Seg::new(shape.end(), far),
+          width,
+          net,
+          layers,
+        );
+      }
+
+      // :246
+      let mut index = 0;
+
+      self.dragged_line = world.assemble_line(
+        pre_drag,
+        arc,
+        Some(&mut index),
+        false,
+        false,
+        true,
+      );
+      self.dragged_segment_index = index;
+    } else {
+      // :250
+      let mut index = 0;
+
+      self.dragged_line = world.assemble_line(
+        self.world_node,
+        arc,
+        Some(&mut index),
+        false,
+        false,
+        true,
+      );
+      self.dragged_segment_index = index;
+    }
+
+    // :251. `startDragSegment` seeds `m_lastDragSolution` from the
+    // assembled line (`:123`) and this does not, so a failed arc drag
+    // restores an empty line and puts nothing back. Transcribed: the
+    // shove arm writes the field on every successful move (`:901`), so
+    // the only drag this changes is one that fails before any move
+    // succeeded, and repairing it would need a fixture that asked for it.
+    self.mode = DragMode::Arc;
+
+    true
+  }
+
+  /// Put one tangent stub segment into a node.
+  ///
+  /// `:228` to `:234` and `:236` to `:243` of `startDragArc`, which build
+  /// a `SEGMENT` carrying the arc's own width, layers and net. A
+  /// degenerate stub is refused by [`World::add_segment`] itself, which
+  /// is KiCad's `Add()` returning without storing.
+  fn add_stub(
+    &self,
+    world: &mut World,
+    node: NodeId,
+    seg: Seg,
+    width: i32,
+    net: Option<NetId>,
+    layers: LayerRange,
+  ) {
+    let uid = world.next_uid();
+    let mut stub = Item::new(uid, ItemBody::Segment(Segment::new(seg, width)));
+
+    stub.set_layers_and_flash_all(layers);
+    stub.set_net(net);
+    world.add_segment(node, stub, true);
   }
 
   /// Remember the via a drag grabbed.
@@ -820,6 +1061,29 @@ impl Dragger {
         self.clear_dragged_items();
         self.dragged_items.push(dragged);
       }
+      // :418
+      DragMode::Arc => {
+        // :420 to :423
+        let mut original = self.dragged_line.clone();
+        let mut dragged = self.dragged_line.clone();
+
+        dragged.clear_links();
+
+        // :425
+        dragged.drag_arc(at, self.dragged_segment_index);
+
+        // :426, :427. A collapsed arc drag leaves an empty chain, so the
+        // add is a no op and the arc is simply dropped from the route,
+        // which KiCad's own comment calls the intended outcome. No snap
+        // threshold is set here, unlike the two branches above: an arc
+        // drag has no corner to snap.
+        world.remove_line(last, &mut original);
+        world.add_line(last, &mut dragged, false);
+
+        // :432, :433
+        self.clear_dragged_items();
+        self.dragged_items.push(dragged);
+      }
       DragMode::Via => {
         // :437, :438. The answer is discarded, exactly as KiCad discards
         // it: the status below is the collision test and nothing else.
@@ -996,6 +1260,50 @@ impl Dragger {
           );
         }
       }
+      // :762
+      DragMode::Arc => {
+        // :764 to :768
+        let mut original = self.dragged_line.clone();
+        let mut dragged = self.dragged_line.clone();
+
+        dragged.drag_arc(at, self.dragged_segment_index);
+
+        // :770. The probe is against the **root**, which does not carry
+        // `startDragArc`'s tangent stubs; erratum E12, reproduced.
+        let mut walked =
+          if line_collides(world, context, self.world_node, &dragged) {
+            match try_walkaround(world, context, last, &dragged) {
+              Some(walked) => {
+                ok = true;
+
+                walked
+              }
+              None => dragged,
+            }
+          } else {
+            // :776, :777
+            ok = true;
+
+            dragged
+          };
+
+        // :780
+        if walked.shape().point_count() < 2 {
+          ok = false;
+        }
+
+        if ok {
+          // :786, :787
+          world.remove_line(last, &mut original);
+          self.optimize_and_update_dragged_line(
+            world,
+            context,
+            &mut walked,
+            &original,
+            at,
+          );
+        }
+      }
       DragMode::Via => {
         // :791, :792. Note that the fanout is looked up from
         // [`Dragger::initial_via`], the position the drag started at, and
@@ -1153,6 +1461,80 @@ impl Dragger {
         }
 
         // :861
+        self.drag_status = ok;
+      }
+      // :865
+      DragMode::Arc => {
+        let mut ok = false;
+        // :868, :869
+        let mut pre_shove = self.dragged_line.clone();
+
+        pre_shove.drag_arc(at, self.dragged_segment_index);
+
+        let Some(shove) = self.shove.as_mut() else {
+          self.drag_status = false;
+
+          return false;
+        };
+
+        // :871 to :875. A collapsed arc drag can leave fewer than two
+        // points, which is not a valid shove head; KiCad's own comment
+        // says to treat that as an unsuccessful shove rather than feed a
+        // degenerate line to `AddHeads`.
+        if pre_shove.shape().point_count() >= 2 {
+          // :877 to :880
+          let pre_shove_node = shove.current_node();
+
+          world.remove_line(pre_shove_node, &mut pre_shove);
+
+          // :882. No `SHP_REVERSED`, unlike the corner arm: the arc drag
+          // has no first point special case.
+          let policy = ShovePolicy::SHOVE | ShovePolicy::DONT_LOCK_ENDPOINTS;
+
+          // :884 to :886
+          shove.clear_heads();
+          shove.add_head_line(pre_shove.clone(), policy);
+          ok = shove.run(world, context) == ShoveStatus::Ok;
+        }
+
+        // :889
+        let mut post_shove = pre_shove;
+
+        // :891, :892
+        if ok
+          && shove.heads_modified(None)
+          && let Some(head) = shove.modified_head(0)
+        {
+          post_shove = head.clone();
+        }
+
+        // :894
+        let shove_node = shove.current_node();
+        let last = world.branch(shove_node);
+
+        self.last_node = Some(last);
+
+        if ok {
+          // :898, :899
+          post_shove.clear_links();
+          post_shove.unmark(world, MarkerFlags::ALL);
+
+          // :900
+          let original = self.dragged_line.clone();
+
+          self.optimize_and_update_dragged_line(
+            world,
+            context,
+            &mut post_shove,
+            &original,
+            at,
+          );
+
+          // :901
+          self.last_drag_solution = post_shove;
+        }
+
+        // :904
         self.drag_status = ok;
       }
       // :908

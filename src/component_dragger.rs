@@ -176,9 +176,9 @@ pub struct ComponentDragger {
   solids: Vec<ItemId>,
   /// Segments that move rigidly with the pads. `m_fixedItems` (`.h:129`).
   ///
-  /// Uid ordered, for the same reason. KiCad's set can also hold arcs
-  /// (`:210`); this crate has none, so anything that is not a segment is
-  /// skipped where KiCad reaches its `wxFAIL_MSG` (`:224`).
+  /// Uid ordered, for the same reason. Segments and arcs both land here
+  /// (`:196`, `:210`); anything else is skipped where KiCad reaches its
+  /// `wxFAIL_MSG` (`:224`).
   fixed_items: Vec<ItemId>,
   /// The traces that get one corner dragged. `m_conns` (`.h:130`).
   conns: Vec<DraggedConnection>,
@@ -968,16 +968,28 @@ fn move_solid(
   Some(world.add_solid(node, clone, hole))
 }
 
-/// Translate a segment that runs between two dragged pads.
+/// Translate a track that runs between two dragged pads.
 ///
-/// The `SEGMENT_T` case of the `m_fixedItems` loop (`:196` to `:207`):
-/// remove the original from the branch, clone it, move both ends and add
-/// the clone. KiCad's `ARC_T` case (`:210`) has no counterpart, and its
+/// The `SEGMENT_T` case of the `m_fixedItems` loop (`:196` to `:207`) and
+/// the `ARC_T` case below it (`:210` to `:221`): remove the original from
+/// the branch, clone it, move the geometry and add the clone. KiCad's
 /// `wxFAIL_MSG` for anything else (`:224`) is this [`None`].
 ///
 /// The clone is built before the removal, where KiCad reads the original
 /// afterwards. In a branch a removal only shadows, so the two orders
 /// agree; taking the copy first is what keeps the handle honest.
+///
+/// # An arc is not translated exactly
+///
+/// `SHAPE_ARC::Move` translates all three points and re-runs
+/// `update_values()` (`libs/kimath/src/geometry/shape_arc.cpp:1079`), so a
+/// moved arc gets a freshly computed centre; here the centre is never
+/// stored, so it is recomputed on every read anyway. Either way
+/// `CalcArcCenter` snaps the centre to a round number (note 09 erratum
+/// E1), so translating an arc by `d` does **not** in general move its
+/// centre by exactly `d`, and a drag by `d` followed by a drag by `-d` is
+/// not guaranteed to be the identity on the centre. The three points do
+/// return exactly, which is what the commit diff carries.
 fn move_fixed_item(
   world: &mut World,
   node: NodeId,
@@ -985,19 +997,35 @@ fn move_fixed_item(
   delta: Vec2,
 ) -> Option<ItemId> {
   let mut clone = world.item(id)?.clone();
-  let ItemBody::Segment(body) = clone.body_mut() else {
-    return None;
-  };
-  let seg = body.seg();
 
-  // :202
-  body.set_ends(seg.a + delta, seg.b + delta);
+  match clone.body_mut() {
+    ItemBody::Segment(body) => {
+      let seg = body.seg();
 
-  // :192
-  world.remove(node, id);
+      // :202
+      body.set_ends(seg.a + delta, seg.b + delta);
 
-  // :205
-  world.add_segment(node, clone, false)
+      // :192
+      world.remove(node, id);
+
+      // :205
+      world.add_segment(node, clone, false)
+    }
+    ItemBody::Arc(body) => {
+      let mut arc = body.arc();
+
+      // :215
+      arc.move_by(delta);
+      body.set_arc(arc);
+
+      // :192
+      world.remove(node, id);
+
+      // :219
+      world.add_arc(node, clone, false)
+    }
+    _ => None,
+  }
 }
 
 /// Whether two stored items collide under the session's rules.

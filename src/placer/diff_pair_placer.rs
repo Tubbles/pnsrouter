@@ -1300,8 +1300,13 @@ impl DiffPairPlacer {
   /// pair.
   ///
   /// The `LINE_T` branch (`:466`) has no counterpart: a
-  /// [`crate::line::Line`] is a value here and never an arena item. The
-  /// `ARC_T` branch (`:479`) arrives with the arcs.
+  /// [`crate::line::Line`] is a value here and never an arena item.
+  ///
+  /// The `ARC_T` branch (`:479`) is the `SEGMENT_T` branch below it with
+  /// the arc's two endpoints in place of the segment's, so both are one
+  /// arm here. It answers the arc's own `GetP0` or `GetP1` rather than the
+  /// anchor it tested, which is the same point: an arc's two anchors are
+  /// its two endpoints (`pcbnew/router/pns_arc.h:100`).
   pub fn dangling_anchor(
     world: &World,
     node: NodeId,
@@ -1314,11 +1319,12 @@ impl DiffPairPlacer {
       return Some(item.anchor(0));
     }
 
-    // :493
-    let ItemBody::Segment(body) = item.body() else {
-      return None;
+    // :479, :493
+    let ends = match item.body() {
+      ItemBody::Segment(body) => (body.seg().a, body.seg().b),
+      ItemBody::Arc(body) => (body.arc().start(), body.arc().end()),
+      _ => return None,
     };
-    let seg = body.seg();
     let layer = item.layers().start();
     let net = item.net();
     let single_link = |at: Vec2| {
@@ -1329,9 +1335,9 @@ impl DiffPairPlacer {
     };
 
     if single_link(item.anchor(0)) {
-      Some(seg.a)
+      Some(ends.0)
     } else if single_link(item.anchor(1)) {
-      Some(seg.b)
+      Some(ends.1)
     } else {
       None
     }

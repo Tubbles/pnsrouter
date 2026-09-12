@@ -351,8 +351,8 @@ pub enum StartError {
   /// Port of the `default:` of `DRAGGER::Start`
   /// (`pcbnew/router/pns_dragger.cpp:355`), which refuses a solid, a hole
   /// and anything else that is neither a segment, an arc nor a via, and
-  /// of `startDragArc`'s refusal, which has no counterpart while this
-  /// crate has no arcs.
+  /// of `startDragArc`'s own refusal of an arc of half a turn or more
+  /// (`:161`), where KiCad puts a message in front of the user instead.
   NotDraggable(ItemId),
 }
 

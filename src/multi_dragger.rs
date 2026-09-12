@@ -1143,9 +1143,14 @@ impl MultiDragger {
             last_pre_drag,
             snap_threshold,
           ),
-          // Unreachable: a set that reaches this dragger holds more than
-          // one segment or arc (`pcbnew/router/pns_router.cpp:182`).
-          DragMode::Via => ParallelDrag::Skipped,
+          // Unreachable. `MULTI_DRAGGER::Start` writes only `DM_CORNER`
+          // and `DM_SEGMENT` (`pcbnew/router/pns_multi_dragger.cpp:177`
+          // to `:249`), so neither a via drag nor
+          // [`DragMode::Arc`] can be the mode here; a set that reaches
+          // this dragger holds more than one segment or arc
+          // (`pcbnew/router/pns_router.cpp:182`) and both are dragged as
+          // a corner or a segment.
+          DragMode::Via | DragMode::Arc => ParallelDrag::Skipped,
         };
 
         match dragged {

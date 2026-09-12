@@ -29,6 +29,7 @@
 
 use pnsrouter::diff_pair::DiffPair;
 use pnsrouter::eventlog::{SessionRecording, assert_replay_matches};
+use pnsrouter::geometry::arc::ShapeArc;
 use pnsrouter::geometry::line_chain::LineChain;
 use pnsrouter::geometry::seg::Seg;
 use pnsrouter::geometry::shape::Shape;
@@ -918,4 +919,84 @@ fn a_pair_tuning_session_replays() {
 
   assert_eq!(parsed, recording);
   assert_replay_matches(&parsed, || Box::new(PairTuningRules::new(CLEARANCE)));
+}
+
+// ---------------------------------------------------------------------
+// The round corner style
+// ---------------------------------------------------------------------
+
+/// The note's pair settings in the round corner style, with the same
+/// widened window [`settings_with_window`] explains.
+fn round_settings_with_window(target: i64, tolerance: i64) -> MeanderSettings {
+  MeanderSettings::new(MeanderSettingsRequest {
+    corner_style: MeanderStyle::Round,
+    target_length: Some(LengthTarget::explicit(
+      target - tolerance,
+      target,
+      target + tolerance,
+    )),
+    ..request()
+  })
+  .expect("the note's settings are a step of 50000")
+}
+
+/// The length of everything a commit put on one lane, arcs included.
+fn committed_lane_length(diff: &CommitDiff, net: NetId) -> f64 {
+  diff
+    .added
+    .iter()
+    .chain(diff.updated.iter().map(|(_, item)| item))
+    .filter(|item| item.net == Some(net))
+    .map(|item| match item.geometry {
+      NewGeometry::Segment { seg, .. } => f64::from(seg.length()),
+      NewGeometry::Arc {
+        start, mid, end, ..
+      } => ShapeArc::new(start, mid, end, 0).length(),
+      NewGeometry::Via { .. } => 0.0,
+    })
+    .sum()
+}
+
+/// The round twin of [`a_pair_reaches_a_longer_target`]: both lanes grow,
+/// the status settles on `TUNED` inside the same window the chamfered
+/// test uses, and both lanes commit arcs.
+///
+/// The round branch of `makeMiterShape` has no dual correction, unlike
+/// the chamfer's `2 * |offset| * tan( 22.5 deg )`
+/// (`pcbnew/router/pns_meander.cpp:506`), so the two lanes of a rounded
+/// pair are concentric rather than parallel around a corner.
+#[test]
+fn a_round_style_pair_reaches_a_longer_target_and_commits_arcs() {
+  let mut router = router_on(false);
+  let (frame, diff) =
+    tune(&mut router, round_settings_with_window(10_000_000, 600_000));
+  let readout = *frame.tuning.as_deref().expect("a readout after a move");
+
+  assert_eq!(readout.status, TuningStatus::Tuned);
+  assert_eq!(readout.mode, TuningMode::PairLength);
+  assert!(
+    (readout.result - 10_000_000).abs() <= 600_000,
+    "the result {} is outside the tolerance around ten millimetres",
+    readout.result
+  );
+
+  let length_p = committed_lane_length(&diff, NET_P);
+  let length_n = committed_lane_length(&diff, NET_N);
+
+  assert!(
+    length_p > BASELINE as f64 && length_n > BASELINE as f64,
+    "both lanes grew: {length_p} and {length_n}"
+  );
+
+  for net in [NET_P, NET_N] {
+    let arcs = diff
+      .added
+      .iter()
+      .chain(diff.updated.iter().map(|(_, item)| item))
+      .filter(|item| item.net == Some(net))
+      .filter(|item| matches!(item.geometry, NewGeometry::Arc { .. }))
+      .count();
+
+    assert!(arcs > 0, "lane {net:?} commits its corners as arcs");
+  }
 }

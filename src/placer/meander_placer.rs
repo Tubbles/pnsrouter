@@ -52,6 +52,7 @@
 
 use crate::algo_base::AlgoContext;
 use crate::collide::CollisionSearchOptions;
+use crate::geometry::arc::ShapeArc;
 use crate::geometry::line_chain::LineChain;
 use crate::geometry::vec2::Vec2;
 use crate::item::{Item, ItemBody, ItemId, Kind, NetId};
@@ -855,8 +856,42 @@ impl MeanderPlacer {
       let meander_context =
         MeanderContext::new(&settings, width, clearance, &check);
 
-      // :247
-      for index in 0..tuned.segment_count() {
+      // :247. A `while` loop rather than a `for`, because the arc
+      // passthrough below sets the next index itself.
+      let mut index = 0;
+
+      while index < tuned.segment_count() {
+        // :249 to :260. An arc the tuned stretch already contained is
+        // carried through whole, as one pass through marker, and the
+        // walk resumes at the next shape.
+        //
+        // KiCad sets `i = tuned.NextShape( i )` and then `continue`s,
+        // which runs the `for` loop's own `i++` on top of the answer, so
+        // the shape after every arc is never meandered and never emitted
+        // as a corner. That is erratum E29, and it is **fixed** here: the
+        // walk resumes at exactly the shape `next_shape` named. Nothing
+        // in KiCad's corpus can see the difference, no regression case
+        // containing an arc existing (note 09 section 8.3).
+        if tuned.is_arc_segment(index) {
+          if let Some(arc) =
+            tuned.arc_index(index).and_then(|which| tuned.arc(which))
+          {
+            // :252. KiCad's second lane is the default argument, a
+            // default constructed `SHAPE_ARC` (`pns_meander.h:515`);
+            // nothing reads it for a single track, `m_dual` being false.
+            result.add_arc(&arc, &ShapeArc::default());
+          }
+
+          // :254. `NextShape` answering `None` is KiCad's `-1`, the
+          // last shape, and ends the walk.
+          match tuned.next_shape(index) {
+            Some(next) => index = next,
+            None => break,
+          }
+
+          continue;
+        }
+
         let seg = tuned.segment(index);
 
         // :262 to :268
@@ -886,6 +921,8 @@ impl MeanderPlacer {
         }
 
         result.add_corner(seg.b, Vec2::new(0, 0));
+
+        index += 1;
       }
 
       // :275 to :280
@@ -1159,16 +1196,18 @@ impl MeanderPlacer {
 ///
 /// Port of `HELPERS::GetSnappedStartPoint`,
 /// `pcbnew/router/pns_helpers.cpp:187`: the nearest point of a segment,
-/// and for an arc the nearer of its two anchors. The arc branch arrives
-/// with the arcs; a segment is the only kind that reaches here today.
+/// and for an arc the nearer of its two anchors. So a click anywhere on
+/// an arc begins the tuned stretch at one of its ends and never inside
+/// it, which is what keeps the arc whole for `do_move`'s passthrough.
 pub(crate) fn snapped_start_point(item: &Item, at: Vec2) -> Vec2 {
   // :190
   if let ItemBody::Segment(segment) = item.body() {
     return segment.seg().nearest_point_to_point(at);
   }
 
-  // :199 to :207, the arc branch, reached today only by an item that is
-  // neither a segment nor anything else with two anchors.
+  // :199 to :207, the arc branch. KiCad asserts the item is an arc
+  // (`:197`); anything else with two anchors answers the same way here
+  // and anything with fewer answers the click.
   if item.anchor_count() < 2 {
     return at;
   }

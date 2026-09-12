@@ -30,6 +30,7 @@
 #![forbid(unsafe_code)]
 
 use pnsrouter::eventlog::{SessionRecording, assert_replay_matches, replay};
+use pnsrouter::geometry::arc::ShapeArc;
 use pnsrouter::geometry::seg::Seg;
 use pnsrouter::geometry::shape::Shape;
 use pnsrouter::geometry::vec2::Vec2;
@@ -846,4 +847,278 @@ fn every_committed_piece_has_a_length() {
   for seg in committed_segments(&diff) {
     assert!(seg.a != seg.b, "a committed segment is not degenerate");
   }
+}
+
+// ---------------------------------------------------------------------
+// The round corner style
+// ---------------------------------------------------------------------
+
+/// The note's settings in the round corner style, which is KiCad's
+/// default (`pcbnew/router/pns_meander.cpp:56`).
+fn round_settings_for(target: i64) -> MeanderSettings {
+  MeanderSettings::new(MeanderSettingsRequest {
+    corner_style: MeanderStyle::Round,
+    // The host forces it (`pcbnew/generators/pcb_tuning_pattern.cpp:1297`).
+    keep_endpoints: true,
+    target_length: Some(LengthTarget::around(target)),
+    ..MeanderSettingsRequest::default()
+  })
+  .expect("the defaults with a target are a positive step")
+}
+
+/// The length of everything a commit put on the board, arcs included.
+///
+/// [`added_length`] counts straight segments only, which is all a
+/// chamfered tune produces; a rounded one puts an arc at every corner and
+/// those carry a third of the meander's length.
+fn committed_length(diff: &CommitDiff) -> f64 {
+  diff
+    .added
+    .iter()
+    .chain(diff.updated.iter().map(|(_, item)| item))
+    .map(|item| match item.geometry {
+      NewGeometry::Segment { seg, .. } => f64::from(seg.length()),
+      NewGeometry::Arc {
+        start, mid, end, ..
+      } => ShapeArc::new(start, mid, end, 0).length(),
+      NewGeometry::Via { .. } => 0.0,
+    })
+    .sum()
+}
+
+/// How many arcs a commit put on the board.
+fn committed_arcs(diff: &CommitDiff) -> usize {
+  diff
+    .added
+    .iter()
+    .chain(diff.updated.iter().map(|(_, item)| item))
+    .filter(|item| matches!(item.geometry, NewGeometry::Arc { .. }))
+    .count()
+}
+
+/// Start, move once and fix in a given corner style.
+fn tune_with(
+  router: &mut Router,
+  settings: MeanderSettings,
+) -> (TuningStatus, i64, CommitDiff) {
+  router
+    .start_tuning(TUNE_FROM, TRACK, settings)
+    .expect("the fixture track is a track");
+
+  let frame = router.move_to(TUNE_TO, None);
+  let readout = *frame
+    .tuning
+    .as_deref()
+    .expect("a tuning session reports a readout after a move");
+
+  let FixOutcome::Finished(diff) = router.fix_route(TUNE_TO, None, true) else {
+    panic!("a tuning fix always ends the session");
+  };
+
+  (readout.status, readout.result, diff)
+}
+
+/// The round twin of [`a_trace_reaches_a_longer_target`]: a ten
+/// millimetre target on an eight millimetre track reaches `TUNED` inside
+/// the same hundred micrometre tolerance the chamfered style meets, and
+/// the chain it commits carries real arcs rather than the chords of their
+/// approximation.
+///
+/// `makeMiterShape`'s round branch, `pcbnew/router/pns_meander.cpp:491`
+/// to `:499`.
+#[test]
+fn a_round_style_trace_reaches_a_longer_target_and_commits_arcs() {
+  let mut router = router_on(false);
+  let (status, result, diff) =
+    tune_with(&mut router, round_settings_for(10_000_000));
+
+  assert_eq!(status, TuningStatus::Tuned);
+  assert!(
+    (result - 10_000_000).abs() <= 100_000,
+    "the result {result} is outside the tolerance around ten millimetres"
+  );
+
+  let arcs = committed_arcs(&diff);
+
+  assert!(arcs > 0, "a rounded meander commits its corners as arcs");
+
+  let committed = committed_length(&diff);
+
+  assert!(
+    (committed - result as f64).abs() <= f64::from(arcs as i32),
+    "the committed geometry is {committed} where the readout said {result}"
+  );
+  assert!(
+    committed > BASELINE as f64,
+    "a tuned track is longer than it was"
+  );
+}
+
+/// The two styles consume the same baseline and differ only in the
+/// corner's own length, `radius * pi / 2` against `radius * sqrt( 2 )`
+/// (note 08 section 2.4), so the same target is met by both and the
+/// rounded meanders are the shallower ones.
+#[test]
+fn both_corner_styles_reach_the_same_target() {
+  let target = 10_000_000;
+  let round = {
+    let mut router = router_on(false);
+    let (status, result, _) =
+      tune_with(&mut router, round_settings_for(target));
+
+    assert_eq!(status, TuningStatus::Tuned);
+    result
+  };
+  let chamfer = {
+    let mut router = router_on(false);
+    let (status, result, _) = tune(&mut router, target);
+
+    assert_eq!(status, TuningStatus::Tuned);
+    result
+  };
+
+  assert!((round - target).abs() <= 100_000);
+  assert!((chamfer - target).abs() <= 100_000);
+}
+
+/// The round style records and replays like any other, the corner style
+/// being a field of the settings the recording carries
+/// (`meander <block> corner-style round`).
+#[test]
+fn a_round_style_session_replays_to_the_same_commit() {
+  let snapshot = board(false);
+  let mut router = Router::new(
+    &snapshot,
+    Box::new(TuningRules::new(CLEARANCE)),
+    RoutingSettings::default(),
+    sizes(),
+  );
+
+  router.start_recording(&snapshot);
+  tune_with(&mut router, round_settings_for(10_000_000));
+
+  let recording = router.take_recording().expect("recording was started");
+  let text = recording.to_text();
+  let parsed =
+    SessionRecording::from_text(&text).expect("the writer's own output");
+
+  assert_eq!(parsed, recording);
+  assert_replay_matches(&parsed, || Box::new(TuningRules::new(CLEARANCE)));
+}
+
+// ---------------------------------------------------------------------
+// An arc inside the tuned stretch, erratum E29
+// ---------------------------------------------------------------------
+
+/// The arc in the middle of the second fixture: a quarter turn about
+/// `(2000000, 1000000)` of radius one millimetre, from `(2000000, 0)`
+/// heading east round to `(3000000, 1000000)` heading north.
+const BEND: ShapeArc = ShapeArc::new(
+  Vec2::new(2_000_000, 0),
+  Vec2::new(2_707_107, 292_893),
+  Vec2::new(3_000_000, 1_000_000),
+  WIDTH,
+);
+
+/// The straight run out of [`BEND`], and the only meanderable shape in
+/// the tuned stretch.
+const BEND_END: Vec2 = Vec2::new(3_000_000, 9_000_000);
+
+/// The arc track of the second fixture.
+const BEND_TRACK: HostId = HostId(13);
+
+/// Where the tuned stretch of the second fixture ends.
+const BEND_TUNE_TO: Vec2 = Vec2::new(3_000_000, 7_000_000);
+
+/// A board whose track runs straight, bends through an arc and then runs
+/// straight again.
+fn bent_board() -> WorldSnapshot {
+  let mut snapshot = WorldSnapshot::new(1, World::DEFAULT_MAX_CLEARANCE);
+
+  snapshot.items.push(pad(PAD_A, WEST));
+  snapshot.items.push(pad(PAD_B, BEND_END));
+  snapshot
+    .items
+    .push(track(HostId(11), NET, WEST, BEND.start()));
+  snapshot.items.push(WorldItem::new(
+    BEND_TRACK,
+    Some(NET),
+    LayerRange::single(0),
+    WorldGeometry::Arc {
+      start: BEND.start(),
+      mid: BEND.arc_mid(),
+      end: BEND.end(),
+      width: WIDTH,
+    },
+  ));
+  snapshot
+    .items
+    .push(track(HostId(14), NET, BEND.end(), BEND_END));
+
+  snapshot
+}
+
+/// Erratum E29, fixed: a tuned stretch that begins with an arc meanders
+/// the shape **after** it.
+///
+/// `MEANDER_PLACER::doMove` (`pcbnew/router/pns_meander_placer.cpp:247`)
+/// carries an arc through as one pass through marker and then sets
+/// `i = tuned.NextShape( i )` before `continue`ing, which runs the `for`
+/// loop's own `i++` on top of the answer. The walk therefore resumes one
+/// shape **past** the one `NextShape` named, and the shape after every
+/// arc is never meandered and never emitted as a corner.
+///
+/// The tuned stretch here is exactly two shapes, the arc and the six
+/// millimetre straight leaving it, so under KiCad's arithmetic there is
+/// nothing left to meander at all and the session cannot move the length.
+/// It does, which is the fix.
+#[test]
+fn a_tuned_stretch_meanders_the_shape_after_an_arc_erratum_e29() {
+  let snapshot = bent_board();
+  let mut router = Router::new(
+    &snapshot,
+    Box::new(TuningRules::new(CLEARANCE)),
+    RoutingSettings::default(),
+    sizes(),
+  );
+
+  // The click is on the arc, at its own start, so the tuned stretch
+  // begins with the arc and holds nothing before it.
+  let frame = router
+    .start_tuning(BEND.start(), BEND_TRACK, round_settings_for(14_000_000))
+    .expect("an arc is a track a tuning session can start on");
+  let untouched = frame
+    .tuning
+    .as_deref()
+    .expect("a tuning session reports a readout")
+    .result;
+
+  let frame = router.move_to(BEND_TUNE_TO, None);
+  let readout = *frame.tuning.as_deref().expect("a readout after a move");
+
+  assert!(
+    readout.result > untouched + 1_000_000,
+    "the straight after the arc was meandered: {} against {untouched}",
+    readout.result
+  );
+
+  let FixOutcome::Finished(diff) = router.fix_route(BEND_TUNE_TO, None, true)
+  else {
+    panic!("a tuning fix always ends the session");
+  };
+
+  // The arc itself came through the passthrough untouched, three points
+  // and all.
+  let carried = diff
+    .added
+    .iter()
+    .chain(diff.updated.iter().map(|(_, item)| item))
+    .any(|item| match item.geometry {
+      NewGeometry::Arc {
+        start, mid, end, ..
+      } => start == BEND.start() && mid == BEND.arc_mid() && end == BEND.end(),
+      _ => false,
+    });
+
+  assert!(carried, "the arc reaches the board with its three points");
 }

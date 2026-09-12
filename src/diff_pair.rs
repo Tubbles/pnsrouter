@@ -777,13 +777,32 @@ impl DiffPair {
   /// which is why KiCad's comment at `:838` forbids simplifying them
   /// here.
   ///
-  /// KiCad skips arc segments on both sides (`:842`, `:847`). This crate
-  /// has no arcs yet, so those two guards have nothing to skip.
+  /// # Arcs contribute nothing
+  ///
+  /// An arc segment is skipped on both lanes (`:842`, `:847`), so an arc
+  /// is never half of a coupled pair, never adds to
+  /// [`DiffPair::coupled_length`], and never becomes a baseline for the
+  /// pair meander placer. A pair whose two lanes curve alongside each
+  /// other therefore measures as uncoupled, which is deliberate: the gap
+  /// test is a segment to segment distance and there is no arc to arc
+  /// form of it. Without the skip the arcs' approximation chords would
+  /// couple instead, at a gap that is an artefact of how finely they were
+  /// polygonised.
   pub fn coupled_segment_pairs(&self) -> Vec<CoupledSegments> {
     let mut pairs = Vec::new();
 
     for index_p in 0..self.p.segment_count() {
+      // :842
+      if self.p.is_arc_segment(index_p) {
+        continue;
+      }
+
       for index_n in 0..self.n.segment_count() {
+        // :847
+        if self.n.is_arc_segment(index_n) {
+          continue;
+        }
+
         // :850
         let parent_p = self.p.segment(index_p);
         let parent_n = self.n.segment(index_n);
@@ -2544,6 +2563,7 @@ pub fn fit_gateways(
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::geometry::arc::ShapeArc;
   use crate::item::{Item, Via, ViaType};
 
   /// The width of one lane in every measurement test.
@@ -2663,6 +2683,64 @@ mod tests {
     );
     assert!(pair.coupled_segment_pairs().is_empty());
     assert_eq!(pair.coupled_length(), 0);
+  }
+
+  /// An arc segment is skipped on both lanes
+  /// (`pcbnew/router/pns_diff_pair.cpp:842`, `:847`), so a pair whose two
+  /// lanes curve alongside each other couples nowhere.
+  ///
+  /// The two chains here are one quarter turn and the same quarter turn
+  /// translated by the pair pitch, so their approximation chords are
+  /// exactly parallel and, near the end where the tangent is horizontal,
+  /// exactly the pair gap apart. The same two chains flattened into plain
+  /// polylines do couple, which is what makes the skip the thing under
+  /// test rather than the geometry.
+  #[test]
+  fn an_arc_segment_couples_on_neither_lane() {
+    // A quarter turn about `(0, 1000000)`, from the origin heading east
+    // round to `(1000000, 1000000)` heading north.
+    let bend = ShapeArc::new(
+      Vec2::new(0, 0),
+      Vec2::new(707_107, 292_893),
+      Vec2::new(1_000_000, 1_000_000),
+      WIDTH,
+    );
+    let mut shifted = bend;
+
+    shifted.move_by(Vec2::new(0, PITCH));
+
+    let mut chain_p = LineChain::new();
+    let mut chain_n = LineChain::new();
+
+    chain_p.append_arc(&bend, LineChain::ARC_POLYGONIZATION_MAX_ERROR);
+    chain_n.append_arc(&shifted, LineChain::ARC_POLYGONIZATION_MAX_ERROR);
+
+    assert_eq!(chain_p.arc_count(), 1);
+    assert_eq!(chain_n.arc_count(), 1);
+
+    let mut curved = DiffPair::from_chains(chain_p, chain_n, 0);
+
+    curved.set_width(WIDTH);
+    curved.set_gap(GAP);
+
+    assert!(curved.coupled_segment_pairs().is_empty());
+    assert_eq!(curved.coupled_length(), 0);
+
+    // The positive control: the same points with no arc behind them.
+    let mut flat = DiffPair::from_chains(
+      bend.convert_to_polyline(LineChain::ARC_POLYGONIZATION_MAX_ERROR),
+      shifted.convert_to_polyline(LineChain::ARC_POLYGONIZATION_MAX_ERROR),
+      0,
+    );
+
+    flat.set_width(WIDTH);
+    flat.set_gap(GAP);
+
+    assert_eq!(flat.chain_p().arc_count(), 0);
+    assert!(
+      !flat.coupled_segment_pairs().is_empty(),
+      "the chords of the two approximations do couple"
+    );
   }
 
   /// `SEG::ApproxParallel` is direction blind, so a reversed lane couples

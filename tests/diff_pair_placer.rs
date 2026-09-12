@@ -26,12 +26,14 @@
 #![forbid(unsafe_code)]
 
 use pnsrouter::diff_pair::DiffPair;
+use pnsrouter::geometry::arc::ShapeArc;
 use pnsrouter::geometry::line_chain::LineChain;
 use pnsrouter::geometry::seg::Seg;
 use pnsrouter::geometry::shape::Shape;
 use pnsrouter::geometry::vec2::Vec2;
 use pnsrouter::item::{HostId, LayerRange, NetId};
 use pnsrouter::node::World;
+use pnsrouter::placer::diff_pair_placer::DiffPairPlacer;
 use pnsrouter::router::{
   CommitDiff, FixOutcome, NewGeometry, Router, StartError,
 };
@@ -575,4 +577,96 @@ fn a_pair_session_commits_both_lanes_through_the_facade() {
     "the N lane's target is where the fixture put it"
   );
   assert!(START_N == HostId(2) && TARGET_N == HostId(4));
+}
+
+// ---------------------------------------------------------------------
+// getDanglingAnchor's arc arm
+// ---------------------------------------------------------------------
+
+/// `getDanglingAnchor`'s `ARC_T` case,
+/// `pcbnew/router/pns_diff_pair_placer.cpp:479`: an arc answers with
+/// whichever of its two endpoints sits on a joint with exactly one link,
+/// that is, with the end nothing else connects to. An arc joined at both
+/// ends answers nothing, which is what makes the placer tell the user to
+/// click at the end of an existing pair.
+#[test]
+fn a_dangling_arc_answers_with_its_free_end() {
+  // A quarter turn about `(1000000, 0)`, from the origin heading north
+  // round to `(1000000, 1000000)`, with a straight run joined to its
+  // **end** only.
+  let bend = ShapeArc::new(
+    Vec2::new(0, 0),
+    Vec2::new(292_893, 707_107),
+    Vec2::new(1_000_000, 1_000_000),
+    WIDTH,
+  );
+  let free_end = Vec2::new(3_000_000, 1_000_000);
+  let mut snapshot = WorldSnapshot::new(1, World::DEFAULT_MAX_CLEARANCE);
+
+  snapshot.items.push(WorldItem::new(
+    HostId(1),
+    Some(NET_P),
+    LayerRange::single(0),
+    WorldGeometry::Arc {
+      start: bend.start(),
+      mid: bend.arc_mid(),
+      end: bend.end(),
+      width: WIDTH,
+    },
+  ));
+  snapshot.items.push(WorldItem::new(
+    HostId(2),
+    Some(NET_P),
+    LayerRange::single(0),
+    WorldGeometry::Segment {
+      seg: Seg::new(bend.end(), free_end),
+      width: WIDTH,
+    },
+  ));
+
+  let (world, index) = World::from_snapshot(&snapshot);
+  let root = world.root();
+  let resolve = |host: u64| {
+    *index
+      .items_of(HostId(host))
+      .first()
+      .expect("every snapshot item was stored")
+  };
+  let arc = resolve(1);
+  let run = resolve(2);
+
+  // The arc's start is free, its end is shared with the straight run.
+  assert_eq!(
+    DiffPairPlacer::dangling_anchor(&world, root, arc),
+    Some(bend.start())
+  );
+
+  // The straight run's own free end is the other one, which is the
+  // `SEGMENT_T` case the arc arm is the twin of.
+  assert_eq!(
+    DiffPairPlacer::dangling_anchor(&world, root, run),
+    Some(free_end)
+  );
+
+  // An arc joined at both ends answers nothing.
+  let mut closed = snapshot;
+
+  closed.items.push(WorldItem::new(
+    HostId(3),
+    Some(NET_P),
+    LayerRange::single(0),
+    WorldGeometry::Segment {
+      seg: Seg::new(Vec2::new(0, -1_000_000), bend.start()),
+      width: WIDTH,
+    },
+  ));
+
+  let (world, index) = World::from_snapshot(&closed);
+  let root = world.root();
+  let arc = *index
+    .items_of(HostId(1))
+    .first()
+    .expect("every snapshot item was stored");
+
+  assert_eq!(DiffPairPlacer::dangling_anchor(&world, root, arc), None);
 }

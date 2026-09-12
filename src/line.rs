@@ -91,6 +91,17 @@
 //! fixtures are in `src/node.rs`; `src/collide.rs` documents the one
 //! answer that changed.
 //!
+//! # The drag primitives
+//!
+//! All four are here. [`Line::drag_corner`] is `DragCorner` with both of
+//! its private halves, [`Line::drag_segment`] is `DragSegment`,
+//! [`Line::drag_arc`] is `DragArc` (`pcbnew/router/pns_line.cpp:911` to
+//! `:1141`) and the two snappers are `Line::snap_dragged_corner` and
+//! `Line::snap_to_neighbour_segments`, both private. `DragArc` needs
+//! `CIRCLE::ConstructFromTanTanPt` and `CalcArcMid`, neither of which
+//! `src/geometry` has; `CIRCLE` is reached from nowhere else in
+//! `pcbnew/router`, so both live here as private helpers.
+//!
 //! # What is not ported
 //!
 //! - The four output `Walkaround( obstacle, pre, walk, post, cw )`
@@ -99,13 +110,6 @@
 //! - `ShowLinks` (`pcbnew/router/pns_line.h:193` and
 //!   `pcbnew/router/pns_link_holder.h:100`), whose body is `#if 0` in one
 //!   place and missing in the other.
-//! - `DragArc` (`pcbnew/router/pns_line.cpp:911` to `:1141`), which needs
-//!   `SHAPE_ARC`, `CIRCLE::ConstructFromTanTanPt` and `CalcArcMid`, none
-//!   of which this crate has. The rest of the drag primitives are here:
-//!   [`Line::drag_corner`] is `DragCorner` with both of its private
-//!   halves, [`Line::drag_segment`] is `DragSegment`, and the two
-//!   snappers are `Line::snap_dragged_corner` and
-//!   `Line::snap_to_neighbour_segments`, both private.
 //! - `dragSegmentFree` (`pcbnew/router/pns_line.h:265`), declared and
 //!   never defined anywhere in the tree. `DragSegment`'s free angle
 //!   branch is `assert( false )` (`pcbnew/router/pns_line.cpp:900`),
@@ -128,11 +132,16 @@
 //!   `pcbnew/router/pns_node.cpp:1204`), which is
 //!   [`Line::chain_mut`] here.
 
+use crate::geometry::arc::ShapeArc;
 use crate::geometry::box2::Box2;
 use crate::geometry::direction45::{AngleType, CornerMode, Direction45};
 use crate::geometry::hull::hull_intersection;
 use crate::geometry::line_chain::LineChain;
+use crate::geometry::math::{
+  DEGREES_TO_RADIANS, Degrees, euclidean_norm_f64, isqrt, rotate_point,
+};
 use crate::geometry::seg::Seg;
+use crate::geometry::shape::Shape;
 use crate::geometry::vec2::Vec2;
 use crate::item::{
   HostId, Item, ItemBody, ItemId, LayerRange, MarkerFlags, NetId, Segment,
@@ -1079,7 +1088,6 @@ impl Line {
   ) {
     let width = self.chain.width();
     let snapped = self.snap_dragged_corner(at, index);
-    let last = self.chain.point_count() - 1;
 
     // :830
     let mut path = if index == 0 {
@@ -1096,6 +1104,15 @@ impl Line {
       // :834
       drag_corner_internal(&self.chain, snapped, preferred_ending_direction)
     } else {
+      // :840. A corner next to an arc cannot be sliced through: the
+      // slice would cut the arc in half and leave the two pieces sharing
+      // a vertex the drag is about to move. Insert a duplicate of the
+      // next point so the slice lands on a plain vertex instead.
+      if self.chain.is_pt_on_arc(index + 1) {
+        self.chain.insert(index + 1, self.chain.point(index + 1));
+      }
+
+      let last = self.chain.point_count() - 1;
       // :845
       let head = self.chain.slice(0, index).unwrap_or_default();
       let tail = self.chain.slice(index, last).unwrap_or_default().reversed();
@@ -1121,13 +1138,44 @@ impl Line {
   ///
   /// Port of `dragCornerFree`, `pcbnew/router/pns_line.cpp:857`, which is
   /// the whole of the router's free angle mode: set the point and
-  /// simplify. The arc vertex insertion at `:863` to `:878` has nothing
-  /// to do here, because this crate has no arcs.
+  /// simplify.
+  ///
+  /// # A point on an arc is not the point that moves
+  ///
+  /// `:863` to `:878`. A vertex belonging to an arc cannot be dragged, so
+  /// a fresh vertex is inserted next to it and that one is dragged
+  /// instead, leaving the arc whole. Which side the new vertex goes on
+  /// depends on which end of the arc the index names: before it when the
+  /// point before is not on the arc, after it when the point after is not
+  /// on the same arc. A click in the **middle** of an arc reaches neither
+  /// branch, which is KiCad's `wxASSERT_MSG( false )` at `:874` and this
+  /// routine's [`None`]: the line is left alone rather than mangled.
   ///
   /// `Simplify()` and not `Simplify2()`, so this is
   /// [`LineChain::simplify`] with a zero tolerance
   /// (`pcbnew/router/pns_line.cpp:881`).
   fn drag_corner_free(&mut self, at: Vec2, index: usize) {
+    let last = self.chain.point_count() - 1;
+    let mut index = index;
+
+    // :863
+    if self.chain.is_pt_on_arc(index) {
+      if index == 0 || !self.chain.is_pt_on_arc(index - 1) {
+        // :867
+        self.chain.insert(index, self.chain.point(index));
+      } else if index == last
+        || (index < last && !self.chain.is_arc_segment(index))
+      {
+        // :871
+        index += 1;
+        self.chain.insert(index, self.chain.point(index));
+      } else {
+        // :876. The middle of an arc, which KiCad asserts against and
+        // then drags anyway in a release build.
+        return;
+      }
+    }
+
     // :880
     self.chain.set_point(index, at);
     self.chain.simplify(0);
@@ -1299,20 +1347,24 @@ impl Line {
     let target = self.snap_to_neighbour_segments(at, index);
     let mut cursor = index;
 
-    // :1247. Guarantee a previous segment. Without arcs the only reason
-    // to pad is a drag of the very first segment, so the
-    // `index > 0 ? index + 1 : 0` insertion point is always zero.
-    if cursor == 0 {
-      path.insert(0, path.point(0));
+    // :1247. Guarantee a previous segment, and a vertex the drag may
+    // move: neither end of an arc can be dragged away from it, so a
+    // duplicate goes in beside it and the drag works on that.
+    if cursor == 0 || path.is_pt_on_arc(cursor) {
+      let at = if cursor > 0 { cursor + 1 } else { 0 };
+
+      path.insert(at, path.point(cursor));
       cursor += 1;
     }
 
-    // :1253. Guarantee a next segment. The `IsPtOnArc` alternative at
-    // `:1257` has nothing to match without arcs.
+    // :1253. Guarantee a next segment, the same way.
     if cursor + 1 == path.segment_count() {
       let last = path.point(path.point_count() - 1);
 
       path.insert(path.point_count() - 1, last);
+    } else if path.is_pt_on_arc(cursor + 1) {
+      // :1257
+      path.insert(cursor + 1, path.point(cursor + 1));
     }
 
     let drag_direction = Direction45::from_seg(&path.segment(cursor), false);
@@ -1465,6 +1517,371 @@ impl Line {
 
     // :1396
     self.chain.simplify(0);
+  }
+
+  /// Rebuild an arc as the largest circle tangent to its two neighbours
+  /// that passes through the cursor.
+  ///
+  /// Port of `DragArc`, `pcbnew/router/pns_line.cpp:911`, the whole of
+  /// the arc drag gesture and the largest single routine of the arc
+  /// milestone. `index` is a **point** index; a point that belongs to no
+  /// arc leaves the line alone, as KiCad's `arcIdx < 0` return does
+  /// (`:917`).
+  ///
+  /// The shape of it:
+  ///
+  /// 1. Find the arc and its first and last vertex in the chain
+  ///    (`:916` to `:936`).
+  /// 2. Build the tangent line at each of the arc's endpoints (`:941`).
+  ///    Where the neighbouring chain segment is collinear with that
+  ///    tangent to within one degree, use the chain segment instead, so
+  ///    the drag keeps the corner it was joined at (`:971` to `:987`).
+  /// 3. Intersect the two tangents (`:1017`). Parallel tangents have no
+  ///    tangent circle at all, and the drag is refused.
+  /// 4. Build the **largest** circle inscribed in that angle
+  ///    (`Circle::from_tan_tan_pt`, `:1037`) and clamp the cursor into
+  ///    the region where a smaller one exists: inside the triangle the
+  ///    two tangent stubs and the maximal chord cut out, and outside the
+  ///    maximal circle itself (`:1053` to `:1070`).
+  /// 5. Build the real circle through the clamped cursor (`:1073`) and
+  ///    project its centre onto both tangents for the new endpoints
+  ///    (`:1079`).
+  /// 6. If the new chord is shorter than
+  ///    [`MAX_TRACK_LENGTH_TO_KEEP_IU`] the arc is **dropped** and the
+  ///    chain spliced without it (`:1089`); otherwise snap either new
+  ///    endpoint back onto its chain anchor when it is within the same
+  ///    limit (`:1104`) and splice the new arc in (`:1126`).
+  ///
+  /// # The width the new arc carries
+  ///
+  /// `oldArc.GetWidth()`, and a chain's stored arc always carries zero
+  /// (`libs/kimath/src/geometry/shape_line_chain.cpp:1625`), so the arc
+  /// this leaves behind has a zero width too. That is KiCad's behaviour
+  /// and it costs nothing: the width a dragged line is committed at is
+  /// the line's, not the stored arc's.
+  pub fn drag_arc(&mut self, at: Vec2, index: usize) {
+    let point_count = self.chain.point_count();
+
+    // :913
+    if index >= point_count {
+      return;
+    }
+
+    // :916
+    let Some(arc_index) = self.chain.arc_index(index) else {
+      return;
+    };
+
+    // :921 to :933
+    let mut first_arc_pt = None;
+    let mut last_arc_pt = None;
+
+    for walk in 0..point_count {
+      if self.chain.arc_index(walk) == Some(arc_index) {
+        if first_arc_pt.is_none() {
+          first_arc_pt = Some(walk);
+        }
+
+        last_arc_pt = Some(walk);
+      }
+    }
+
+    // :935
+    let (Some(first_arc_pt), Some(last_arc_pt), Some(old_arc)) =
+      (first_arc_pt, last_arc_pt, self.chain.arc(arc_index))
+    else {
+      return;
+    };
+    // :939
+    let width = old_arc.width();
+    let last_point = point_count - 1;
+
+    // :941 to :947
+    let tangent_line_at = |endpoint: Vec2| -> Seg {
+      let radial = endpoint - old_arc.center();
+      let perpendicular = Vec2::new(-radial.y, radial.x);
+
+      Seg::new(endpoint - perpendicular, endpoint + perpendicular)
+    };
+
+    // :966
+    let arc_line_start = tangent_line_at(old_arc.start());
+    let arc_line_end = tangent_line_at(old_arc.end());
+
+    // :971 to :987
+    let mut use_chain_start = false;
+    let mut use_chain_end = false;
+
+    if first_arc_pt > 0 {
+      let candidate = Seg::new(
+        self.chain.point(first_arc_pt - 1),
+        self.chain.point(first_arc_pt),
+      );
+
+      use_chain_start = is_collinear_within(
+        &candidate,
+        &arc_line_start,
+        MAX_TANGENT_ANGLE_DEVIATION_DEGREES,
+      );
+    }
+
+    if last_arc_pt < last_point {
+      let candidate = Seg::new(
+        self.chain.point(last_arc_pt),
+        self.chain.point(last_arc_pt + 1),
+      );
+
+      use_chain_end = is_collinear_within(
+        &candidate,
+        &arc_line_end,
+        MAX_TANGENT_ANGLE_DEVIATION_DEGREES,
+      );
+    }
+
+    // :989
+    let arc_own_tan_intersect = arc_line_start.intersect_lines(&arc_line_end);
+
+    // :993 to :1004
+    let tan_start_seg = if use_chain_start {
+      Seg::new(
+        self.chain.point(first_arc_pt - 1),
+        self.chain.point(first_arc_pt),
+      )
+    } else {
+      let Some(own) = arc_own_tan_intersect else {
+        return;
+      };
+
+      Seg::new(own, old_arc.start())
+    };
+
+    // :1006 to :1015
+    let tan_end_seg = if use_chain_end {
+      Seg::new(
+        self.chain.point(last_arc_pt),
+        self.chain.point(last_arc_pt + 1),
+      )
+    } else {
+      let Some(own) = arc_own_tan_intersect else {
+        return;
+      };
+
+      Seg::new(own, old_arc.end())
+    };
+
+    // :1017. Parallel tangents have no tangent circle solution.
+    let Some(tan_intersect) = tan_start_seg.intersect_lines(&tan_end_seg)
+    else {
+      return;
+    };
+
+    // :1022, :1023. Both tangents redirected to emanate from the
+    // intersection, which is what the clamp below is written against.
+    let tan_start_from_intersect = Seg::new(tan_intersect, old_arc.start());
+    let tan_end_from_intersect = Seg::new(tan_intersect, old_arc.end());
+
+    // :1025 to :1029
+    let furthest = |a: Vec2, b: Vec2| {
+      if (a - tan_intersect).euclidean_norm()
+        > (b - tan_intersect).euclidean_norm()
+      {
+        a
+      } else {
+        b
+      }
+    };
+    let tan_start_far = furthest(tan_start_seg.a, tan_start_seg.b);
+    let tan_end_far = furthest(tan_end_seg.a, tan_end_seg.b);
+    // :1033
+    let temp_tangent_point =
+      if furthest(tan_start_far, tan_end_far) == tan_end_far {
+        tan_start_far
+      } else {
+        tan_end_far
+      };
+
+    // :1036, :1037
+    let Some(max_tan_circle) = Circle::from_tan_tan_pt(
+      &tan_start_from_intersect,
+      &tan_end_from_intersect,
+      temp_tangent_point,
+    ) else {
+      return;
+    };
+
+    // :1039, :1040
+    let max_tan_pt_start =
+      tan_start_from_intersect.line_project(max_tan_circle.center);
+    let max_tan_pt_end =
+      tan_end_from_intersect.line_project(max_tan_circle.center);
+
+    // :1042 to :1044. The triangle the cursor has to stay inside for a
+    // smaller inscribed circle to exist.
+    let c_seg_tan_start = Seg::new(max_tan_pt_start, tan_intersect);
+    let c_seg_tan_end = Seg::new(max_tan_pt_end, tan_intersect);
+    let c_seg_chord = Seg::new(max_tan_pt_start, max_tan_pt_end);
+
+    // :1046 to :1049. The old arc's mid point names the inside.
+    let old_mid = old_arc.arc_mid();
+    let tan_start_side = c_seg_tan_start.side(old_mid);
+    let tan_end_side = c_seg_tan_end.side(old_mid);
+    let chord_side = c_seg_chord.side(old_mid);
+
+    let mut cursor = at;
+
+    // :1053 to :1068
+    if tan_start_side != c_seg_tan_start.side(cursor)
+      || tan_end_side != c_seg_tan_end.side(cursor)
+      || chord_side != c_seg_chord.side(cursor)
+    {
+      let mut best = c_seg_tan_start.nearest_point_to_point(cursor);
+
+      for candidate in [
+        c_seg_tan_end.nearest_point_to_point(cursor),
+        c_seg_chord.nearest_point_to_point(cursor),
+      ] {
+        if (candidate - cursor).squared_euclidean_norm()
+          < (best - cursor).squared_euclidean_norm()
+        {
+          best = candidate;
+        }
+      }
+
+      cursor = best;
+    }
+
+    // :1070
+    if i64::from((cursor - max_tan_circle.center).euclidean_norm())
+      < i64::from(max_tan_circle.radius)
+    {
+      cursor = max_tan_circle.nearest_point(cursor);
+    }
+
+    // :1072, :1073
+    let Some(circle) =
+      Circle::from_tan_tan_pt(&tan_start_seg, &tan_end_seg, cursor)
+    else {
+      return;
+    };
+
+    // :1075
+    if circle.radius <= 0 {
+      return;
+    }
+
+    // :1078 to :1080
+    let new_center = circle.center;
+    let mut new_start = tan_start_seg.line_project(new_center);
+    let mut new_end = tan_end_seg.line_project(new_center);
+
+    // :1086, :1087. The non tangent side keeps the original arc endpoint
+    // in the chain so the corner stays put while a new tangent stub grows
+    // out to the new one.
+    let mut prefix_cutoff: i64 = if use_chain_start {
+      first_arc_pt as i64 - 1
+    } else {
+      first_arc_pt as i64
+    };
+    let mut suffix_cutoff: usize = if use_chain_end {
+      last_arc_pt + 1
+    } else {
+      last_arc_pt
+    };
+
+    // :1089. A collapsed drag drops the arc altogether and splices the
+    // chain without it, which is the intended outcome the dragger's
+    // comment at `pns_dragger.cpp:426` records.
+    if (new_end - new_start).euclidean_norm() <= MAX_TRACK_LENGTH_TO_KEEP_IU {
+      self.chain =
+        self.splice_around(prefix_cutoff, suffix_cutoff, last_point, None);
+
+      return;
+    }
+
+    // :1104 to :1113
+    if first_arc_pt > 0 {
+      let anchor = if use_chain_start {
+        self.chain.point(first_arc_pt - 1)
+      } else {
+        self.chain.point(first_arc_pt)
+      };
+
+      if (anchor - new_start).euclidean_norm() <= MAX_TRACK_LENGTH_TO_KEEP_IU {
+        new_start = anchor;
+        prefix_cutoff = if use_chain_start {
+          first_arc_pt as i64 - 2
+        } else {
+          first_arc_pt as i64 - 1
+        };
+      }
+    }
+
+    // :1115 to :1124
+    if last_arc_pt < last_point {
+      let anchor = if use_chain_end {
+        self.chain.point(last_arc_pt + 1)
+      } else {
+        self.chain.point(last_arc_pt)
+      };
+
+      if (anchor - new_end).euclidean_norm() <= MAX_TRACK_LENGTH_TO_KEEP_IU {
+        new_end = anchor;
+        suffix_cutoff = if use_chain_end {
+          last_arc_pt + 2
+        } else {
+          last_arc_pt + 1
+        };
+      }
+    }
+
+    // :1126, :1127
+    let new_mid = calc_arc_mid(new_start, new_end, new_center, true);
+    let new_arc = ShapeArc::new(new_start, new_mid, new_end, width);
+
+    // :1129 to :1140
+    self.chain = self.splice_around(
+      prefix_cutoff,
+      suffix_cutoff,
+      last_point,
+      Some(&new_arc),
+    );
+  }
+
+  /// Rebuild the chain out of its prefix, an optional arc and its suffix.
+  ///
+  /// The two rebuild blocks of `DragArc`
+  /// (`pcbnew/router/pns_line.cpp:1091` to `:1102` and `:1129` to
+  /// `:1140`), which differ only in whether an arc goes between the two
+  /// slices. A negative prefix cutoff means there is no prefix, which is
+  /// KiCad's `if( prefixCutoff >= 0 )`.
+  fn splice_around(
+    &self,
+    prefix_cutoff: i64,
+    suffix_cutoff: usize,
+    last_point: usize,
+    arc: Option<&ShapeArc>,
+  ) -> LineChain {
+    let mut rebuilt = LineChain::new();
+
+    rebuilt.set_width(self.chain.width());
+
+    if let Ok(prefix) = usize::try_from(prefix_cutoff)
+      && let Ok(chain) = self.chain.slice(0, prefix)
+    {
+      rebuilt.append_chain(&chain);
+    }
+
+    if let Some(arc) = arc {
+      rebuilt.append_arc(arc, LineChain::ARC_POLYGONIZATION_MAX_ERROR);
+    }
+
+    if suffix_cutoff <= last_point
+      && let Ok(suffix) = self.chain.slice(suffix_cutoff, last_point)
+    {
+      rebuilt.append_chain(&suffix);
+    }
+
+    rebuilt
   }
 
   /// How many corners of the given kinds the line turns.
@@ -1980,6 +2397,295 @@ const fn are_neighbours(x: i32, y: i32, max: i32) -> bool {
   }
 
   false
+}
+
+// ---------------------------------------------------------------------
+// The arc drag's geometry
+// ---------------------------------------------------------------------
+
+/// How far a chain segment may deviate from an arc's tangent and still
+/// count as continuing it, in degrees.
+///
+/// `ADVANCED_CFG::m_MaxTangentAngleDeviation`, whose default is 1.0
+/// (`common/advanced_config.cpp:243`). [`Line::drag_arc`] uses it to
+/// decide whether to constrain the new arc to the neighbouring chain
+/// segments rather than to the old arc's own tangents, and the dragger
+/// uses it to refuse an arc of half a turn or more.
+pub const MAX_TANGENT_ANGLE_DEVIATION_DEGREES: f64 = 1.0;
+
+/// The longest stub an arc drag will swallow rather than keep, in
+/// nanometres.
+///
+/// `KiROUND( ADVANCED_CFG::m_MaxTrackLengthToKeep * IU_PER_MM )`, whose
+/// default is 0.0005 mm (`common/advanced_config.cpp:244`), so 500 nm.
+/// [`Line::drag_arc`] drops an arc whose new chord is shorter than this
+/// and snaps a new endpoint onto its chain anchor when it comes within
+/// it; `startDragArc` builds its tangent stubs half this long.
+pub const MAX_TRACK_LENGTH_TO_KEEP_IU: i32 = 500;
+
+/// Whether two segments point the same way to within an angle.
+///
+/// The `isCollinearTo` lambda of `DragArc`,
+/// `pcbnew/router/pns_line.cpp:949`: the arcsine of the normalised cross
+/// product, in degrees, against the deviation limit. Direction blind, as
+/// an arcsine of an absolute value is, so a neighbour that runs back
+/// along the tangent counts as collinear with it.
+fn is_collinear_within(a: &Seg, b: &Seg, max_deviation_degrees: f64) -> bool {
+  let direction_a = a.b.widening_sub(a.a);
+  let direction_b = b.b.widening_sub(b.a);
+  let magnitude_a =
+    euclidean_norm_f64(direction_a.x as f64, direction_a.y as f64);
+  let magnitude_b =
+    euclidean_norm_f64(direction_b.x as f64, direction_b.y as f64);
+
+  // :955
+  if magnitude_a <= 0.0 || magnitude_b <= 0.0 {
+    return false;
+  }
+
+  // :958 to :962
+  let cross = (direction_a.x as f64).mul_add(
+    direction_b.y as f64,
+    -((direction_a.y as f64) * (direction_b.x as f64)),
+  );
+  let sine = cross.abs() / (magnitude_a * magnitude_b);
+  let angle_degrees = sine.clamp(0.0, 1.0).asin() / DEGREES_TO_RADIANS;
+
+  angle_degrees <= max_deviation_degrees
+}
+
+/// A point on the arc through two endpoints about a centre.
+///
+/// Port of `CalcArcMid`, `libs/kimath/src/trigo.cpp:205`: rotate the
+/// start point about the centre by half the signed angle between the two
+/// radii, normalised into `(-180, 180]`. With `min_arc_angle` false the
+/// half turn is added, which picks the point on the **other** side and so
+/// names the major arc instead.
+fn calc_arc_mid(
+  start: Vec2,
+  end: Vec2,
+  center: Vec2,
+  min_arc_angle: bool,
+) -> Vec2 {
+  let start_vector = start.widening_sub(center);
+  let end_vector = end.widening_sub(center);
+  let start_angle =
+    Degrees::from_vector(start_vector.x as f64, start_vector.y as f64);
+  let end_angle =
+    Degrees::from_vector(end_vector.x as f64, end_vector.y as f64);
+  let mut rotation = (start_angle - end_angle).normalized_180() / 2.0;
+
+  // :212
+  if !min_arc_angle {
+    rotation = rotation + Degrees::HALF_TURN;
+  }
+
+  // :215, :216
+  rotate_point(start, center, rotation)
+}
+
+/// A segment parallel to another through a point.
+///
+/// Port of `SEG::ParallelSeg`, `libs/kimath/src/geometry/seg.cpp:529`.
+/// Only [`Circle::from_tan_tan_pt`] needs it, so it lives here rather
+/// than on [`Seg`], where note 01 section 3 records it as unported.
+fn parallel_seg(seg: &Seg, point: Vec2) -> Seg {
+  Seg::new(point, (seg.b - seg.a) + point)
+}
+
+/// Which of two points is further from a third.
+///
+/// The `furthestFromIntersect` lambda of `ConstructFromTanTanPt`,
+/// `libs/kimath/src/geometry/circle.cpp:58`. Ties go to the second point,
+/// where [`closest_to`] gives them to the first, which is how KiCad's two
+/// lambdas differ.
+fn furthest_from(reference: Vec2, first: Vec2, second: Vec2) -> Vec2 {
+  if (first - reference).euclidean_norm()
+    > (second - reference).euclidean_norm()
+  {
+    first
+  } else {
+    second
+  }
+}
+
+/// Which of two points is nearer a third.
+///
+/// The `closestToIntersect` lambda of `ConstructFromTanTanPt`,
+/// `libs/kimath/src/geometry/circle.cpp:71`.
+fn closest_to(reference: Vec2, first: Vec2, second: Vec2) -> Vec2 {
+  if (first - reference).euclidean_norm()
+    <= (second - reference).euclidean_norm()
+  {
+    first
+  } else {
+    second
+  }
+}
+
+/// A circle, for the arc drag's tangent construction.
+///
+/// Port of `CIRCLE`, `libs/kimath/include/geometry/circle.h:36`, reduced
+/// to the three members `LINE::DragArc` reaches. `CIRCLE` is used nowhere
+/// else in `pcbnew/router`, so it lives here as a private type rather
+/// than in `src/geometry`.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+struct Circle {
+  /// `Center` (`circle.h:107`).
+  center: Vec2,
+  /// `Radius` (`circle.h:110`).
+  radius: i32,
+}
+
+impl Circle {
+  /// The circle inscribed in the angle between two lines that passes
+  /// through a point.
+  ///
+  /// Port of `ConstructFromTanTanPt`,
+  /// `libs/kimath/src/geometry/circle.cpp:51`. Two branches: two parallel
+  /// lines have no vertex, so the centre lies on the line halfway between
+  /// them and the radius is half their separation (`:85` to `:106`);
+  /// otherwise every circle inscribed in the angle is a homothety of
+  /// every other about the vertex, so an arbitrary inscribed circle is
+  /// built on the bisector, the point is projected into it, and the
+  /// projection is mapped back out (`:108` to `:175`).
+  ///
+  /// KiCad's five `wxCHECK_MSG`s return a half built circle and log; each
+  /// is a [`None`] here, and [`Line::drag_arc`] abandons the drag on any
+  /// of them rather than moving the arc to a place the construction never
+  /// found.
+  fn from_tan_tan_pt(line_a: &Seg, line_b: &Seg, p: Vec2) -> Option<Self> {
+    // :85
+    if line_a.approx_parallel(line_b, 1) {
+      // :91 to :93
+      let perpendicular = Seg::new(line_a.a, line_b.line_project(line_a.a));
+      let mid = perpendicular.center();
+      let radius = (mid - line_a.a).euclidean_norm();
+      // :95
+      let bisector = parallel_seg(line_a, mid);
+      // :97, :98. The point is used as a construction centre to find the
+      // two candidates on the bisector.
+      let construction = Self { center: p, radius };
+      let candidates = construction.intersect_line(&bisector);
+      let first = *candidates.first()?;
+      let last = *candidates.last()?;
+
+      // :105. The tie breaker is the first line's own start point.
+      return Some(Self {
+        center: closest_to(line_a.a, first, last),
+        radius,
+      });
+    }
+
+    // :114, :115
+    let intersect_point = line_a.intersect_lines(line_b)?;
+
+    // :118 to :124
+    if p == intersect_point {
+      return Some(Self {
+        center: p,
+        radius: 0,
+      });
+    }
+
+    // :127 to :132
+    let line_a_pt = furthest_from(intersect_point, line_a.a, line_a.b);
+    let line_b_pt = furthest_from(intersect_point, line_b.a, line_b.b);
+    let bisector_pt = calc_arc_mid(line_a_pt, line_b_pt, intersect_point, true);
+    let bisector = Seg::new(intersect_point, bisector_pt);
+
+    // :135 to :137. An arbitrary circle tangent to both lines.
+    let construction = Self {
+      center: bisector.line_project(p),
+      radius: line_a.line_distance(bisector.line_project(p)),
+    };
+
+    // :140 to :142
+    let through_p = Seg::new(intersect_point, p);
+    let projections = construction.intersect_line(&through_p);
+    let first = *projections.first()?;
+    let last = *projections.last()?;
+
+    // :146. A fillet wants the projection nearest the vertex.
+    let selected = closest_to(intersect_point, first, last);
+    let tangent_a = line_a.line_project(construction.center);
+    let tangent_b = line_b.line_project(construction.center);
+
+    // :152. Invert about whichever tangent point is further from the
+    // cursor, which is the better conditioned of the two.
+    let (line, tangent) = if (tangent_a - p).squared_euclidean_norm()
+      > (tangent_b - p).squared_euclidean_norm()
+    {
+      (line_a, tangent_a)
+    } else {
+      (line_b, tangent_b)
+    };
+    // :155 to :158
+    let homothety = Seg::new(tangent, selected);
+    let actual_tangent = parallel_seg(&homothety, p).intersect_lines(line)?;
+    // :161, :162
+    let perpendicular = line.perpendicular_seg(actual_tangent);
+    let center = perpendicular.intersect_lines(&bisector)?;
+
+    // :164, :165
+    Some(Self {
+      center,
+      radius: line.line_distance(center),
+    })
+  }
+
+  /// The point of the circumference nearest a point.
+  ///
+  /// Port of `NearestPoint( const VECTOR2I& )`,
+  /// `libs/kimath/src/geometry/circle.cpp:194`, including the arbitrary
+  /// nudge that keeps the answer on the circumference when the point is
+  /// the centre.
+  fn nearest_point(&self, point: Vec2) -> Vec2 {
+    let mut vector = point - self.center;
+
+    // :199
+    if vector.x == 0 && vector.y == 0 {
+      vector.x = 1;
+    }
+
+    vector.resize(self.radius) + self.center
+  }
+
+  /// Where an infinite line crosses the circumference.
+  ///
+  /// Port of `IntersectLine`,
+  /// `libs/kimath/src/geometry/circle.cpp:322`: project the centre onto
+  /// the line, and the half chord is the other leg of the right triangle
+  /// whose hypotenuse is the radius. A line within
+  /// [`Shape::MIN_PRECISION_IU`] of tangency answers with the projection
+  /// alone.
+  fn intersect_line(&self, line: &Seg) -> Vec<Vec2> {
+    let midpoint = line.line_project(self.center);
+    let center_distance = i64::from((midpoint - self.center).euclidean_norm());
+    let radius = i64::from(self.radius);
+    let tolerance = i64::from(Shape::MIN_PRECISION_IU);
+
+    // :350
+    if center_distance > radius + tolerance {
+      return Vec::new();
+    }
+
+    // :355
+    if center_distance >= radius - tolerance {
+      return vec![midpoint];
+    }
+
+    // :361 to :365
+    let half_chord = isqrt(
+      (radius * radius - center_distance * center_distance).unsigned_abs(),
+    );
+    // KiCad truncates the `sqrt` into an `int` (`:363`); a board sized
+    // chord never reaches the clamp.
+    let half_chord = i32::try_from(half_chord).unwrap_or(i32::MAX);
+    let along = (line.b - line.a).resize(half_chord);
+
+    vec![along + midpoint, -along + midpoint]
+  }
 }
 
 /// The first vertex at a position.

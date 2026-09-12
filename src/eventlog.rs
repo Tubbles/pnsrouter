@@ -1198,6 +1198,7 @@ fn length_target_text(target: Option<LengthTarget>) -> String {
 /// and they are numbered from zero in the order those events appear.
 fn meander_lines(out: &mut String, block: usize, settings: &MeanderSettings) {
   let corner_style = match settings.corner_style() {
+    CornerStyle::Round => "round",
     CornerStyle::Chamfer => "chamfer",
   };
   let initial_side = match settings.initial_side() {
@@ -2293,10 +2294,6 @@ fn parse_meander_key(
     "corner-style" => {
       settings.corner_style = match tokens.word("a corner style")? {
         "chamfer" => MeanderStyle::Chamfer,
-        // Written by no writer here, and read so that a host bridging
-        // from KiCad's stored `rounded` flag gets the refusal
-        // [`MeanderSettings::new`] makes rather than a parse error with
-        // no explanation.
         "round" => MeanderStyle::Round,
         other => {
           return Err(tokens.error(format!("`{other}` is not a corner style")));
