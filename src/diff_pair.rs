@@ -2218,8 +2218,9 @@ impl DpGateways {
         )
       }
       // :499, `wxFAIL_MSG( "Unsupported starting primitive" )`, after
-      // which KiCad carries on with both distances at zero.
-      Shape::LineChain(_) => (0, 0),
+      // which KiCad carries on with both distances at zero. `SH_ARC`
+      // lands here too: the switch has no arc case.
+      Shape::LineChain(_) | Shape::Arc(_) => (0, 0),
     };
 
     // :506

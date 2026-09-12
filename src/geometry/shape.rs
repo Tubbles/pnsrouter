@@ -22,8 +22,6 @@
 //! Only the variants the router's world model can contain are here. Left
 //! out on purpose:
 //!
-//! - `SHAPE_ARC` (`shape_arc.h:35`): milestone 1 routes straight segments
-//!   only, see `DESIGN.md` section 3 and note 01 section 14.3.
 //! - `SHAPE_POLY_SET` and `SHAPE_ELLIPSE`: the router's world contains
 //!   neither (note 01 sections 11 and 7.5). `SH_ELLIPSE` reaches the
 //!   router only in the hull dispatcher, where it degrades to its bounding
@@ -41,6 +39,7 @@
 //! (`shape_collisions.cpp:70`, `:472`, `shape_rect.cpp:28`) and the branch
 //! is part of the ported behaviour.
 
+use crate::geometry::arc::ShapeArc;
 use crate::geometry::box2::Box2;
 use crate::geometry::line_chain::LineChain;
 use crate::geometry::seg::Seg;
@@ -67,6 +66,8 @@ pub enum ShapeKind {
   Circle,
   /// A closed polygon assumed convex. KiCad's `SH_SIMPLE`.
   Simple,
+  /// A circular arc of a given width. KiCad's `SH_ARC`.
+  Arc,
   /// Several shapes acting as one. KiCad's `SH_COMPOUND`.
   Compound,
 }
@@ -184,10 +185,13 @@ impl SimplePolygon {
 ///
 /// The width folded into [`Shape::Segment`] is a full width: the capsule
 /// reaches `width / 2` on each side of the segment, with a round cap at
-/// each end (`shape_segment.h:33`). The width carried by the chain inside
+/// each end (`shape_segment.h:33`). [`Shape::Arc`] carries a full width
+/// the same way. The width carried by the chain inside
 /// [`Shape::LineChain`] and [`Shape::Simple`] is **ignored** by every
 /// collision routine, which is why `PNS::ITEM::collideSimple` folds line
 /// widths into the clearance instead (`pcbnew/router/pns_item.cpp:159`).
+/// An arc a chain **stores** has width zero, which the collision code
+/// asserts (`shape_collisions.cpp:686`).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Shape {
   /// A circle.
@@ -251,6 +255,18 @@ pub enum Shape {
   /// (`pcbnew/router/pns_line.h:138`), so the router really does collide
   /// bare open chains as shapes.
   LineChain(LineChain),
+  /// A circular arc of a given width.
+  ///
+  /// Port of `SHAPE_ARC`,
+  /// `libs/kimath/include/geometry/shape_arc.h:35`. `PNS::ARC` holds one
+  /// by value (`pcbnew/router/pns_arc.h:96`) and hands it to the
+  /// collision code with the track width still on it, which is why the
+  /// arc rows in [`crate::geometry::collision`] apply the half width and
+  /// the polyline rows do not.
+  ///
+  /// The width is a full width, like [`Shape::Segment`]'s: the copper
+  /// reaches `width / 2` on each side of the curve.
+  Arc(ShapeArc),
   /// Several shapes acting as one.
   ///
   /// Port of `SHAPE_COMPOUND`,
@@ -338,6 +354,15 @@ impl Shape {
     Self::LineChain(chain)
   }
 
+  /// A circular arc shape.
+  ///
+  /// Port of `SHAPE_ARC( const SHAPE_ARC& )`,
+  /// `libs/kimath/include/geometry/shape_arc.h:44`. The width travels
+  /// with the arc, so there is nothing to pass beside it.
+  pub const fn arc(arc: ShapeArc) -> Self {
+    Self::Arc(arc)
+  }
+
   /// Several shapes acting as one.
   ///
   /// Port of `SHAPE_COMPOUND( const std::vector<SHAPE*>& )`,
@@ -361,6 +386,7 @@ impl Shape {
       Self::Segment { .. } => ShapeKind::Segment,
       Self::Simple(_) => ShapeKind::Simple,
       Self::LineChain(_) => ShapeKind::LineChain,
+      Self::Arc(_) => ShapeKind::Arc,
       Self::Compound(_) => ShapeKind::Compound,
     }
   }
@@ -370,7 +396,7 @@ impl Shape {
   /// Port of the `SHAPE::IsSolid` virtual,
   /// `libs/kimath/include/geometry/shape.h:292`. Every ported variant
   /// returns true (`shape_rect.h:228`, `shape_circle.h:139`,
-  /// `shape_segment.h:159`, `shape_simple.h:163`,
+  /// `shape_segment.h:159`, `shape_simple.h:163`, `shape_arc.h:216`,
   /// `shape_compound.cpp:105`) except [`Shape::LineChain`], which returns
   /// false (`shape_line_chain.h:808`), even when the chain is closed.
   ///
@@ -397,6 +423,10 @@ impl Shape {
   /// - polyline and polygon: the chain's own box, which grows by the
   ///   clearance plus the whole nominal width
   ///   (`shape_line_chain.h:457`, `shape_simple.h:74`);
+  /// - arc: the box over the three points and every axis quadrant point
+  ///   the sweep crosses, inflated by `kiround(width / 2) + 1` when the
+  ///   width is non zero and then by the clearance
+  ///   (`shape_arc.cpp:462`). See [`ShapeArc::bbox`];
   /// - compound: the union of the children's boxes
   ///   (`shape_compound.cpp:71`).
   ///
@@ -438,6 +468,7 @@ impl Shape {
       }
       Self::Simple(polygon) => polygon.bbox(saturate_i32(clearance)),
       Self::LineChain(chain) => chain.bbox(saturate_i32(clearance)),
+      Self::Arc(arc) => Some(arc.bbox(saturate_i32(clearance))),
       Self::Compound(shapes) => shapes
         .iter()
         .filter_map(|shape| shape.bbox(saturate_i32(clearance)))
@@ -466,7 +497,8 @@ impl Shape {
   /// Port of the `SHAPE::Move` virtual,
   /// `libs/kimath/include/geometry/shape.h:290` (`shape_circle.h:129`,
   /// `shape_rect.h:206`, `shape_segment.h:170`, `shape_simple.h:161`,
-  /// `shape_line_chain.cpp:1128`, `shape_compound.cpp:85`).
+  /// `shape_line_chain.cpp:1128`, `shape_arc.cpp:1079`,
+  /// `shape_compound.cpp:85`).
   ///
   /// # Panics
   ///
@@ -482,6 +514,7 @@ impl Shape {
       }
       Self::Simple(polygon) => polygon.move_by(delta),
       Self::LineChain(chain) => chain.move_by(delta),
+      Self::Arc(arc) => arc.move_by(delta),
       Self::Compound(shapes) => {
         for shape in shapes {
           shape.move_by(delta);
@@ -584,6 +617,7 @@ fn saturate_i32(value: i64) -> i32 {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::geometry::math::Degrees;
 
   /// Shorthand for a point.
   fn point(x: i32, y: i32) -> Vec2 {
@@ -622,6 +656,11 @@ mod tests {
       .kind(),
       ShapeKind::LineChain
     );
+    assert_eq!(
+      Shape::arc(ShapeArc::new(point(0, 0), point(5, 5), point(10, 0), 4))
+        .kind(),
+      ShapeKind::Arc
+    );
     assert_eq!(Shape::compound(Vec::new()).kind(), ShapeKind::Compound);
   }
 
@@ -638,6 +677,10 @@ mod tests {
       .is_solid()
     );
     assert!(Shape::compound(Vec::new()).is_solid());
+    assert!(
+      Shape::arc(ShapeArc::new(point(0, 0), point(5, 5), point(10, 0), 4))
+        .is_solid()
+    );
 
     let mut closed = LineChain::from_slice(&[point(0, 0), point(10, 0)], true);
     closed.set_closed(true);
@@ -784,6 +827,74 @@ mod tests {
       compound,
       Shape::compound(vec![Shape::circle(point(10, -20), 5)])
     );
+
+    let mut arc =
+      Shape::arc(ShapeArc::new(point(0, 0), point(5, 5), point(10, 0), 4));
+    arc.move_by(delta);
+    assert_eq!(
+      arc,
+      Shape::arc(ShapeArc::new(
+        point(10, -20),
+        point(15, -15),
+        point(20, -20),
+        4
+      ))
+    );
+  }
+
+  /// The port's own: [`Shape::Arc`] answers the three queries the router
+  /// asks of every shape, and they agree with the ones
+  /// [`ShapeArc`] answers directly.
+  ///
+  /// `SHAPE_ARC::BBox` inflates by `kiround( width / 2 ) + 1` whenever
+  /// the width is non zero (`shape_arc.cpp:466`), so the box of a wide
+  /// arc is one nanometre larger than the copper on every side, and
+  /// `SHAPE::Centre` is the truncating centre of that box.
+  #[test]
+  fn arc_round_trips_through_bbox_center_and_move_by() {
+    let quarter = ShapeArc::from_center_start_angle(
+      point(0, 0),
+      point(1_000_000, 0),
+      Degrees::new(90.0),
+      200_000,
+    );
+    let shape = Shape::arc(quarter);
+
+    assert_eq!(shape.bbox(0), Some(quarter.bbox(0)));
+    assert_eq!(shape.bbox(50_000), Some(quarter.bbox(50_000)));
+
+    // The quarter crosses no axis quadrant point between its ends, so
+    // the box is the three points plus the half width and the `+ 1`.
+    let plain = shape.bbox(0).unwrap();
+    assert_eq!(plain.origin(), long(-100_001, -100_001));
+    assert_eq!(plain.end(), long(1_100_001, 1_100_001));
+    assert_eq!(shape.center(), Some(point(500_000, 500_000)));
+
+    // A clearance grows the box by exactly the clearance on each side,
+    // and the centre does not move.
+    let grown = shape.bbox(50_000).unwrap();
+    assert_eq!(grown.origin(), long(-150_001, -150_001));
+    assert_eq!(grown.end(), long(1_150_001, 1_150_001));
+
+    // Moving is exact in all three points, and the box follows.
+    let delta = point(-250_000, 750_000);
+    let mut moved = shape.clone();
+    moved.move_by(delta);
+
+    assert_eq!(
+      moved,
+      Shape::arc(ShapeArc::new(
+        quarter.start() + delta,
+        quarter.arc_mid() + delta,
+        quarter.end() + delta,
+        quarter.width()
+      ))
+    );
+    assert_eq!(moved.center(), shape.center().map(|center| center + delta));
+
+    let moved_box = moved.bbox(0).unwrap();
+    assert_eq!(moved_box.origin(), plain.origin() + Vec2L::from(delta));
+    assert_eq!(moved_box.end(), plain.end() + Vec2L::from(delta));
   }
 
   /// The deliberate extension over `shape_collisions.cpp:1337`.

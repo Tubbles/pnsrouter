@@ -94,6 +94,7 @@
 use std::fmt;
 
 use crate::collide::CollisionSearchOptions;
+use crate::geometry::arc::ShapeArc;
 use crate::geometry::direction45::CornerMode;
 use crate::geometry::line_chain::LineChain;
 use crate::geometry::seg::Seg;
@@ -859,10 +860,17 @@ fn chain_text(chain: &LineChain) -> String {
 
 /// One shape, in prefix form so that it parses out of a token stream.
 ///
-/// The six variants of [`Shape`] against the three
+/// The seven variants of [`Shape`] against the three
 /// `formatShapeAsJSON` writes (`pcbnew/router/pns_logger.cpp:231`), which
 /// emits `null` for everything else. A snapshot is the engine's input and
 /// not a debug dump, so nothing may be dropped here.
+///
+/// The arc form is KiCad's log form, `{ start, mid, end, width }`
+/// (`pcbnew/router/pns_logger.cpp:245`), and not
+/// `SHAPE_LINE_CHAIN::Format`'s, which drops arcs (erratum E15). A chain
+/// that carries arcs still loses them here, because [`chain_text`] writes
+/// points only. Nothing in the world model can build one until
+/// `doc/work/012-arcs.md` slice 5 adds `ItemBody::Arc`.
 fn shape_text(shape: &Shape) -> String {
   match shape {
     Shape::Circle { center, radius } => {
@@ -880,6 +888,13 @@ fn shape_text(shape: &Shape) -> String {
       format!("simple {}", chain_text(polygon.vertices()))
     }
     Shape::LineChain(chain) => format!("line-chain {}", chain_text(chain)),
+    Shape::Arc(arc) => format!(
+      "arc {} {} {} {}",
+      vec2_text(arc.start()),
+      vec2_text(arc.arc_mid()),
+      vec2_text(arc.end()),
+      arc.width()
+    ),
     Shape::Compound(shapes) => {
       let mut text = format!("compound {}", shapes.len());
 
@@ -1835,6 +1850,18 @@ impl<'a> Tokens<'a> {
       }
       "simple" => Ok(Shape::Simple(SimplePolygon::new(self.chain()?))),
       "line-chain" => Ok(Shape::line_chain(self.chain()?)),
+      "arc" => {
+        let start = self.vec2("an arc start")?;
+        let mid = self.vec2("an arc mid point")?;
+        let end = self.vec2("an arc end")?;
+
+        Ok(Shape::arc(ShapeArc::new(
+          start,
+          mid,
+          end,
+          self.number("a width")?,
+        )))
+      }
       "compound" => {
         let count = self.count("a shape count", 2)?;
         let mut shapes = Vec::with_capacity(count);

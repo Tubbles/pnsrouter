@@ -113,16 +113,24 @@
 //!
 //! - Every ellipse cell, and the polygon set short circuit
 //!   (`shape_collisions.cpp:1050`), because [`Shape`] has no such
-//!   variants. The arc rescue block inside the polyline versus polyline
-//!   cell (`:426`) is likewise dead here.
-//! - The two arc rows that walk a polyline, `SHAPE_LINE_CHAIN` (`:636`)
-//!   and `SHAPE_LINE_CHAIN_BASE` (`:786`). Both need a [`LineChain`] that
-//!   can carry arcs, which is slice 3 of `doc/work/012-arcs.md`. The
-//!   other four arc rows are here as the `collide_arc_*` free functions,
-//!   which nothing dispatches to yet because [`Shape`] gains its arc
-//!   variant in slice 4.
+//!   variants.
 //! - `SHAPE_NULL`, which the router never builds. See the
 //!   [`crate::geometry::shape`] module documentation.
+//!
+//! # Arcs
+//!
+//! All six arc rows are dispatched, and two of them look inside a
+//! [`LineChain`] for the arcs it stores rather than at its polyline: the
+//! arc against polyline row (`:636`) and the arc rescue block of the
+//! polyline against polyline row (`:427`). Both walk
+//! [`LineChain::live_arcs`] where KiCad walks `ArcCount` and `Arc( i )`
+//! raw, so an arc no vertex refers to any more cannot collide here; that
+//! is erratum E13, fixed in slice 3 of `doc/work/012-arcs.md`.
+//!
+//! Only three arc rows produce a translation vector, against a circle, a
+//! rectangle and another arc, each with the `+ 3` bias of `:626`. The
+//! other three answer the zero vector, matching the assertion KiCad
+//! raises when one is asked for (`:639`, `:766`, `:796`).
 
 use crate::geometry::arc::ShapeArc;
 use crate::geometry::box2::Box2;
@@ -230,6 +238,43 @@ struct RectRef {
   size: Vec2,
   /// The corner radius, which the collision cells branch on.
   radius: i32,
+}
+
+/// A [`Shape::LineChain`] or the outline of a [`Shape::Simple`], with the
+/// runtime type test the polyline versus polyline cell performs on it.
+///
+/// `SHAPE_SIMPLE` holds a `SHAPE_LINE_CHAIN` but does not derive from
+/// one, so `aA.Type() != SH_LINE_CHAIN`
+/// (`libs/kimath/src/geometry/shape_collisions.cpp:378`) is true for a
+/// polygon and the arc handling of that cell skips it in both
+/// directions: a polygon contributes every segment, arc segments
+/// included, and its stored arcs never reach the rescue block, whose
+/// `dynamic_cast` yields null (`:430`).
+#[derive(Copy, Clone, Debug)]
+struct ChainRef<'a> {
+  /// The vertices.
+  chain: &'a LineChain,
+  /// Whether KiCad would see a `SH_LINE_CHAIN` here rather than a
+  /// `SH_SIMPLE`.
+  is_line_chain: bool,
+}
+
+impl<'a> ChainRef<'a> {
+  /// A [`Shape::LineChain`] operand.
+  fn line_chain(chain: &'a LineChain) -> Self {
+    Self {
+      chain,
+      is_line_chain: true,
+    }
+  }
+
+  /// A [`Shape::Simple`] operand, seen through its outline.
+  fn simple(chain: &'a LineChain) -> Self {
+    Self {
+      chain,
+      is_line_chain: false,
+    }
+  }
 }
 
 /// A [`Shape::Segment`] taken apart.
@@ -565,7 +610,7 @@ fn collide_single(
         size: *size,
         radius: *radius,
       },
-      chain,
+      ChainRef::line_chain(chain),
       clearance,
       request,
     ),
@@ -606,7 +651,7 @@ fn collide_single(
         size: *size,
         radius: *radius,
       },
-      polygon.vertices(),
+      ChainRef::simple(polygon.vertices()),
       clearance,
       request,
     ),
@@ -717,7 +762,7 @@ fn collide_single(
         size: *size,
         radius: *radius,
       },
-      chain,
+      ChainRef::line_chain(chain),
       clearance,
       request,
     ),
@@ -739,9 +784,12 @@ fn collide_single(
     }
 
     // shape_collisions.cpp:1146
-    (Shape::LineChain(a_chain), Shape::LineChain(b_chain)) => {
-      chain_chain(a_chain, b_chain, clearance, request)
-    }
+    (Shape::LineChain(a_chain), Shape::LineChain(b_chain)) => chain_chain(
+      ChainRef::line_chain(a_chain),
+      ChainRef::line_chain(b_chain),
+      clearance,
+      request,
+    ),
 
     // shape_collisions.cpp:1149
     (Shape::LineChain(chain), Shape::Segment { seg, width }) => chain_segment(
@@ -755,9 +803,12 @@ fn collide_single(
     ),
 
     // shape_collisions.cpp:1153
-    (Shape::LineChain(chain), Shape::Simple(polygon)) => {
-      chain_chain(chain, polygon.vertices(), clearance, request)
-    }
+    (Shape::LineChain(chain), Shape::Simple(polygon)) => chain_chain(
+      ChainRef::line_chain(chain),
+      ChainRef::simple(polygon.vertices()),
+      clearance,
+      request,
+    ),
 
     // shape_collisions.cpp:1173, operands swapped without a negation.
     (
@@ -857,7 +908,7 @@ fn collide_single(
         size: *size,
         radius: *radius,
       },
-      polygon.vertices(),
+      ChainRef::simple(polygon.vertices()),
       clearance,
       request,
     ),
@@ -877,9 +928,12 @@ fn collide_single(
     // shape_collisions.cpp:1213, operands swapped: the polyline takes the
     // first role and the polygon the second, which decides the order of
     // the two containment shortcuts.
-    (Shape::Simple(polygon), Shape::LineChain(chain)) => {
-      chain_chain(chain, polygon.vertices(), clearance, request)
-    }
+    (Shape::Simple(polygon), Shape::LineChain(chain)) => chain_chain(
+      ChainRef::line_chain(chain),
+      ChainRef::simple(polygon.vertices()),
+      clearance,
+      request,
+    ),
 
     // shape_collisions.cpp:1216
     (Shape::Simple(polygon), Shape::Segment { seg, width }) => chain_segment(
@@ -894,11 +948,125 @@ fn collide_single(
 
     // shape_collisions.cpp:1220
     (Shape::Simple(a_polygon), Shape::Simple(b_polygon)) => chain_chain(
-      a_polygon.vertices(),
-      b_polygon.vertices(),
+      ChainRef::simple(a_polygon.vertices()),
+      ChainRef::simple(b_polygon.vertices()),
       clearance,
       request,
     ),
+
+    // shape_collisions.cpp:1090, reversed operands with the vector
+    // negated, which lands it on the arc, which is `b` here.
+    (
+      Shape::Rect {
+        origin,
+        size,
+        radius,
+      },
+      Shape::Arc(arc),
+    ) => negated_mtv(arc_rect(
+      *arc,
+      RectRef {
+        origin: *origin,
+        size: *size,
+        radius: *radius,
+      },
+      clearance,
+      request,
+    )),
+
+    // shape_collisions.cpp:1123, reversed operands with the vector
+    // negated.
+    (Shape::Circle { center, radius }, Shape::Arc(arc)) => {
+      negated_mtv(arc_circle(
+        *arc,
+        CircleRef {
+          center: *center,
+          radius: *radius,
+        },
+        clearance,
+        request,
+      ))
+    }
+
+    // shape_collisions.cpp:1156, reversed operands. The cell produces no
+    // vector, so the negation `CollCaseReversed` performs is a no op.
+    (Shape::LineChain(chain), Shape::Arc(arc)) => {
+      negated_mtv(arc_chain(*arc, chain, clearance, request))
+    }
+
+    // shape_collisions.cpp:1189, reversed operands, no vector either.
+    (Shape::Segment { seg, width }, Shape::Arc(arc)) => {
+      negated_mtv(arc_segment(
+        *arc,
+        SegmentRef {
+          seg: *seg,
+          width: *width,
+        },
+        clearance,
+        request,
+      ))
+    }
+
+    // shape_collisions.cpp:1223, reversed operands, no vector either.
+    (Shape::Simple(polygon), Shape::Arc(arc)) => {
+      negated_mtv(arc_chain_base(*arc, polygon.vertices(), clearance, request))
+    }
+
+    // shape_collisions.cpp:1241
+    (
+      Shape::Arc(arc),
+      Shape::Rect {
+        origin,
+        size,
+        radius,
+      },
+    ) => arc_rect(
+      *arc,
+      RectRef {
+        origin: *origin,
+        size: *size,
+        radius: *radius,
+      },
+      clearance,
+      request,
+    ),
+
+    // shape_collisions.cpp:1244
+    (Shape::Arc(arc), Shape::Circle { center, radius }) => arc_circle(
+      *arc,
+      CircleRef {
+        center: *center,
+        radius: *radius,
+      },
+      clearance,
+      request,
+    ),
+
+    // shape_collisions.cpp:1247
+    (Shape::Arc(arc), Shape::LineChain(chain)) => {
+      arc_chain(*arc, chain, clearance, request)
+    }
+
+    // shape_collisions.cpp:1250
+    (Shape::Arc(arc), Shape::Segment { seg, width }) => arc_segment(
+      *arc,
+      SegmentRef {
+        seg: *seg,
+        width: *width,
+      },
+      clearance,
+      request,
+    ),
+
+    // shape_collisions.cpp:1254
+    (Shape::Arc(arc), Shape::Simple(polygon)) => {
+      arc_chain_base(*arc, polygon.vertices(), clearance, request)
+    }
+
+    // shape_collisions.cpp:1257
+    (Shape::Arc(a_arc), Shape::Arc(b_arc)) => {
+      arc_arc(*a_arc, *b_arc, clearance, request)
+    }
   }
 }
 
@@ -966,8 +1134,57 @@ fn shape_collide_seg(
     Shape::LineChain(chain) => {
       chain_collide_seg(chain, seg, clearance, request)
     }
+    Shape::Arc(arc) => arc_collide_seg(*arc, seg, clearance, request),
     Shape::Compound(_) => compound_collide_seg(shape, seg, clearance, request),
   }
+}
+
+/// An arc against a segment of no width.
+///
+/// Port of `SHAPE_ARC::Collide( const SEG&, ... )`,
+/// `libs/kimath/src/geometry/shape_arc.cpp:317`, which
+/// [`ShapeArc::collide_seg`] carries. Note that it reports the gap and
+/// the location of the **last** candidate that collided rather than the
+/// nearest one, which is erratum E2, reproduced.
+fn arc_collide_seg(
+  arc: ShapeArc,
+  seg: &Seg,
+  clearance: i32,
+  request: Request,
+) -> Option<Outcome> {
+  arc.collide_seg(seg, clearance).map(|hit| Outcome {
+    actual: if request.wants_actual() {
+      hit.actual
+    } else {
+      0
+    },
+    location: hit.location,
+    mtv: Vec2::new(0, 0),
+  })
+}
+
+/// An arc against a point.
+///
+/// Port of `SHAPE_ARC::Collide( const VECTOR2I&, ... )`,
+/// `libs/kimath/src/geometry/shape_arc.cpp:854`, which
+/// [`ShapeArc::collide_point`] carries. Unlike the default body it does
+/// not wrap the point in a degenerate segment, so the arc's half width
+/// is applied once and not twice.
+fn arc_collide_point(
+  arc: ShapeArc,
+  point: Vec2,
+  clearance: i32,
+  request: Request,
+) -> Option<Outcome> {
+  arc.collide_point(point, clearance).map(|hit| Outcome {
+    actual: if request.wants_actual() {
+      hit.actual
+    } else {
+      0
+    },
+    location: hit.location,
+    mtv: Vec2::new(0, 0),
+  })
 }
 
 /// A shape against a point.
@@ -975,8 +1192,9 @@ fn shape_collide_seg(
 /// Port of `SHAPE::Collide( const VECTOR2I&, ... )`,
 /// `libs/kimath/include/geometry/shape.h:179`. The default body wraps the
 /// point in a degenerate segment; a capsule
-/// (`geometry/shape_segment.h:100`) and a polyline or polygon
-/// (`geometry/shape.h:324`) override it with a direct measurement.
+/// (`geometry/shape_segment.h:100`), a polyline or polygon
+/// (`geometry/shape.h:324`) and an arc (`geometry/shape_arc.h:165`)
+/// override it with a direct measurement.
 fn shape_collide_point(
   shape: &Shape,
   point: Vec2,
@@ -999,6 +1217,7 @@ fn shape_collide_point(
     Shape::LineChain(chain) => {
       chain_collide_point(chain, point, clearance, request)
     }
+    Shape::Arc(arc) => arc_collide_point(*arc, point, clearance, request),
     _ => shape_collide_seg(shape, &Seg::new(point, point), clearance, request),
   }
 }
@@ -1711,29 +1930,41 @@ fn circle_segment(
 /// (`:396`), and the inner `break`s exit only the inner loop (`:412` to
 /// `:419`), both of which are reproduced.
 ///
+/// # Arcs
+///
+/// A segment that lies on a stored arc is left out of both lists
+/// (`:378`, `:387`) and the arcs are collided whole afterwards, in the
+/// rescue block at `:427`, which answers straight from the arc row and
+/// never merges into the running minimum. The gate in front of it is
+/// KiCad's: the block runs when no gap was asked for at all, or when the
+/// segments found no overlap (`:427`).
+///
 /// Deviations: KiCad's `std::sort` is not stable, so its order among
 /// segments sharing a start point is unspecified; this uses a stable sort
 /// so the answer is deterministic, as `DESIGN.md` section 8 requires. The
-/// arc rescue block at `:426` is not ported, because a [`LineChain`] here
-/// carries no arcs.
+/// rescue block walks [`LineChain::live_arcs`] rather than the raw arc
+/// vector, which is erratum E13.
 fn chain_chain(
-  a: &LineChain,
-  b: &LineChain,
+  a: ChainRef,
+  b: ChainRef,
   clearance: i32,
   request: Request,
 ) -> Option<Outcome> {
   let mut closest = i32::MAX;
   let mut nearest = Vec2::new(0, 0);
 
-  if b.is_closed() && a.point_count() > 0 && b.point_inside(a.point(0), 0) {
-    closest = 0;
-    nearest = a.point(0);
-  } else if a.is_closed()
-    && b.point_count() > 0
-    && a.point_inside(b.point(0), 0)
+  if b.chain.is_closed()
+    && a.chain.point_count() > 0
+    && b.chain.point_inside(a.chain.point(0), 0)
   {
     closest = 0;
-    nearest = b.point(0);
+    nearest = a.chain.point(0);
+  } else if a.chain.is_closed()
+    && b.chain.point_count() > 0
+    && a.chain.point_inside(b.chain.point(0), 0)
+  {
+    closest = 0;
+    nearest = b.chain.point(0);
   } else {
     let a_segments = sorted_segments(a);
     let b_segments = sorted_segments(b);
@@ -1764,6 +1995,31 @@ fn chain_chain(
     }
   }
 
+  // :427. KiCad passes the caller's `aActual` and `aLocation` straight
+  // through and no vector at all, so a translation vector request
+  // reaches the arc row as the bare boolean one.
+  if !request.wants_actual() || closest > 0 {
+    let arc_request = if request.wants_actual() {
+      Request::Actual
+    } else {
+      Request::Boolean
+    };
+
+    for (chain, other) in [(a, b), (b, a)] {
+      if !chain.is_line_chain {
+        continue;
+      }
+
+      for (_, arc) in chain.chain.live_arcs() {
+        if let Some(outcome) =
+          arc_against_chain(*arc, other, clearance, arc_request)
+        {
+          return Some(outcome);
+        }
+      }
+    }
+  }
+
   if closest != 0 && closest >= clearance {
     return None;
   }
@@ -1775,13 +2031,18 @@ fn chain_chain(
   })
 }
 
-/// The segments of a chain, sorted by start point.
+/// The straight segments of a chain, sorted by start point.
 ///
-/// Port of the `seg_sort` lambda and the two `std::sort` calls,
-/// `libs/kimath/src/geometry/shape_collisions.cpp:390` to `:397`.
-fn sorted_segments(chain: &LineChain) -> Vec<Seg> {
-  let mut segments: Vec<Seg> = (0..chain.segment_count())
-    .map(|i| chain.segment(i))
+/// Port of the two collection loops and the `seg_sort` lambda,
+/// `libs/kimath/src/geometry/shape_collisions.cpp:376` to `:400`. A
+/// segment that lies on one of the chain's stored arcs is left out, so
+/// that the rescue block can collide that arc whole instead, and only
+/// when KiCad would see a `SH_LINE_CHAIN` rather than a `SH_SIMPLE`
+/// (`:378`).
+fn sorted_segments(chain: ChainRef) -> Vec<Seg> {
+  let mut segments: Vec<Seg> = (0..chain.chain.segment_count())
+    .filter(|index| !chain.is_line_chain || !chain.chain.is_arc_segment(*index))
+    .map(|index| chain.chain.segment(index))
     .collect();
 
   segments.sort_by_key(|segment| (segment.a.x, segment.a.y));
@@ -1801,19 +2062,20 @@ fn sorted_segments(chain: &LineChain) -> Vec<Seg> {
 /// sits outside a chain it swallows is only caught by the side scan.
 fn rect_chain(
   rect: RectRef,
-  chain: &LineChain,
+  operand: ChainRef,
   clearance: i32,
   request: Request,
 ) -> Option<Outcome> {
   if rect.radius > 0 {
     return chain_chain(
-      &rect_outline(rect.origin, rect.size),
-      chain,
+      ChainRef::line_chain(&rect_outline(rect.origin, rect.size)),
+      operand,
       clearance,
       request,
     );
   }
 
+  let chain = operand.chain;
   let mut closest = i32::MAX;
   let mut nearest = Vec2::new(0, 0);
   let center = rect_center(rect);
@@ -1952,8 +2214,8 @@ fn rect_rect(
     || b.radius > 0
   {
     return chain_chain(
-      &rect_outline(a.origin, a.size),
-      &rect_outline(b.origin, b.size),
+      ChainRef::line_chain(&rect_outline(a.origin, a.size)),
+      ChainRef::line_chain(&rect_outline(b.origin, b.size)),
       clearance,
       request,
     );
@@ -1983,8 +2245,9 @@ fn rect_rect(
 /// [`ShapeArc::nearest_points_to_circle`], so both the arc's half width
 /// and the circle's radius are already in the distance.
 ///
-/// This row is **not** wired into [`collide`]: the [`Shape`] enum has no
-/// arc variant until slice 4 of `doc/work/012-arcs.md`.
+/// [`collide`] dispatches here for a [`Shape::Arc`] against a
+/// [`Shape::Circle`] in either order; this is the direct form the
+/// mirrored KiCad tables call.
 pub fn collide_arc_circle(
   arc: ShapeArc,
   center: Vec2,
@@ -2021,25 +2284,34 @@ pub fn collide_arc_circle_mtv(
 /// than a clearance.
 ///
 /// Port of `Collide( const SHAPE_ARC&, const SHAPE_RECT&, ... )`,
-/// `libs/kimath/src/geometry/shape_collisions.cpp:721`, for a rectangle
-/// with square corners. The rounded corner branch (`:723`) delegates to
-/// the arc against line chain row, which is slice 4 of
-/// `doc/work/012-arcs.md`, so this takes no corner radius.
+/// `libs/kimath/src/geometry/shape_collisions.cpp:721`. A non zero
+/// `radius` sends the whole query to the rectangle's outline and so to
+/// the arc against polyline row (`:723`); the router never builds such a
+/// rectangle (`pcbnew/router/pns_utils.cpp:356`).
 ///
 /// The gap this reports is under-stated for a wide arc, because
 /// [`ShapeArc::nearest_points_to_rect`] loses the half width clamp its
 /// three sibling overloads apply. That is erratum E3 and it is
 /// reproduced; the erratum is on the `nearest_points` method, which is
 /// where the test naming it lives.
-///
-/// Not wired into [`collide`], see [`collide_arc_circle`].
 pub fn collide_arc_rect(
   arc: ShapeArc,
   origin: Vec2,
   size: Vec2,
+  radius: i32,
   clearance: i32,
 ) -> Option<ShapeCollision> {
-  arc_rect(arc, origin, size, clearance, Request::Actual).map(shape_collision)
+  arc_rect(
+    arc,
+    RectRef {
+      origin,
+      size,
+      radius,
+    },
+    clearance,
+    Request::Actual,
+  )
+  .map(shape_collision)
 }
 
 /// The translation that separates a rectangle from an arc.
@@ -2050,15 +2322,25 @@ pub fn collide_arc_rect(
 /// The effective line branch answers zero, because the rectangle against
 /// capsule row it hands off to has no translation vector of its own
 /// (`shape_collisions.cpp:563`). KiCad negates the zero it finds there
-/// and reaches the same answer.
+/// and reaches the same answer, and so does the rounded corner branch.
 pub fn collide_arc_rect_mtv(
   arc: ShapeArc,
   origin: Vec2,
   size: Vec2,
+  radius: i32,
   clearance: i32,
 ) -> Option<Vec2> {
-  arc_rect(arc, origin, size, clearance, Request::Mtv)
-    .map(|outcome| outcome.mtv)
+  arc_rect(
+    arc,
+    RectRef {
+      origin,
+      size,
+      radius,
+    },
+    clearance,
+    Request::Mtv,
+  )
+  .map(|outcome| outcome.mtv)
 }
 
 /// Whether an arc and a capsule come closer to each other than a
@@ -2075,8 +2357,7 @@ pub fn collide_arc_rect_mtv(
 /// No translation vector: KiCad asserts the request away (`:766`).
 ///
 /// This is the row the router actually reaches for an arc against a
-/// straight track (note 09 section 6). Not wired into [`collide`], see
-/// [`collide_arc_circle`].
+/// straight track (note 09 section 6).
 pub fn collide_arc_segment(
   arc: ShapeArc,
   seg: &Seg,
@@ -2092,6 +2373,47 @@ pub fn collide_arc_segment(
   .map(shape_collision)
 }
 
+/// Whether an arc and a polyline come closer to each other than a
+/// clearance.
+///
+/// Port of `Collide( const SHAPE_ARC&, const SHAPE_LINE_CHAIN&, ... )`,
+/// `libs/kimath/src/geometry/shape_collisions.cpp:636`, the row a
+/// `PNS::LINE` reaches when it is collided as an item rather than
+/// through its segments. It looks past the chain's polyline at the arcs
+/// it stores: the segments that lie on one are skipped and the arcs are
+/// collided whole.
+///
+/// The chain's stored arcs carry no width, which KiCad asserts (`:686`);
+/// a caller that wants a width folded in has to add it to the clearance,
+/// as `CollideArc` does (`qa/tests/libs/kimath/geometry/test_shape_arc.cpp:973`).
+///
+/// No translation vector: KiCad asserts the request away (`:639`).
+pub fn collide_arc_chain(
+  arc: ShapeArc,
+  chain: &LineChain,
+  clearance: i32,
+) -> Option<ShapeCollision> {
+  arc_chain(arc, chain, clearance, Request::Actual).map(shape_collision)
+}
+
+/// Whether an arc and a polygon come closer to each other than a
+/// clearance.
+///
+/// Port of
+/// `Collide( const SHAPE_ARC&, const SHAPE_LINE_CHAIN_BASE&, ... )`,
+/// `libs/kimath/src/geometry/shape_collisions.cpp:786`, the row a
+/// `SHAPE_SIMPLE` pad outline reaches. Unlike [`collide_arc_chain`] it
+/// sees the polyline only, whatever the chain stores.
+///
+/// No translation vector: KiCad asserts the request away (`:796`).
+pub fn collide_arc_chain_base(
+  arc: ShapeArc,
+  chain: &LineChain,
+  clearance: i32,
+) -> Option<ShapeCollision> {
+  arc_chain_base(arc, chain, clearance, Request::Actual).map(shape_collision)
+}
+
 /// Whether two arcs come closer to each other than a clearance.
 ///
 /// Port of `Collide( const SHAPE_ARC&, const SHAPE_ARC&, ... )`,
@@ -2100,8 +2422,6 @@ pub fn collide_arc_segment(
 /// negating the translation vector and the second not (`:853`, `:864`);
 /// otherwise the answer comes from [`ShapeArc::nearest_points_to_arc`]
 /// with both half widths already applied.
-///
-/// Not wired into [`collide`], see [`collide_arc_circle`].
 pub fn collide_arc_arc(
   a: ShapeArc,
   b: ShapeArc,
@@ -2151,24 +2471,32 @@ fn arc_circle(
   )
 }
 
-/// Arc against a rectangle with square corners.
+/// Arc against a rectangle.
 ///
 /// `libs/kimath/src/geometry/shape_collisions.cpp:721`, the cell behind
-/// [`collide_arc_rect`].
+/// [`collide_arc_rect`]. A rectangle with a corner radius hands the whole
+/// query to its outline and so to [`arc_chain`] (`:723`), before the
+/// effective line guard rather than after it.
 fn arc_rect(
   arc: ShapeArc,
-  origin: Vec2,
-  size: Vec2,
+  rect: RectRef,
   clearance: i32,
   request: Request,
 ) -> Option<Outcome> {
+  // :723. `SHAPE_RECT::Outline` is a `SHAPE_LINE_CHAIN`, so this is the
+  // arc against polyline row and not the base one.
+  if rect.radius > 0 {
+    return arc_chain(
+      arc,
+      &rect_outline(rect.origin, rect.size),
+      clearance,
+      request,
+    );
+  }
+
   if arc.is_effective_line() {
     return negated_mtv(rect_segment(
-      RectRef {
-        origin,
-        size,
-        radius: 0,
-      },
+      rect,
       effective_line(arc),
       clearance,
       request,
@@ -2176,10 +2504,206 @@ fn arc_rect(
   }
 
   nearest_points_outcome(
-    arc.nearest_points_to_rect(origin, size),
+    arc.nearest_points_to_rect(rect.origin, rect.size),
     clearance,
     request,
   )
+}
+
+/// Arc against a polyline that can carry arcs.
+///
+/// `libs/kimath/src/geometry/shape_collisions.cpp:636`, the cell behind
+/// [`collide_arc_chain`]. This is the one arc row that does **not** open
+/// with the `is_effective_line` hand off: it walks the chain itself.
+///
+/// The order is KiCad's. A closed chain containing the arc's start point
+/// answers a gap of zero at that point (`:650`), otherwise every
+/// **straight** segment is measured with [`ShapeArc::collide_seg`]
+/// (`:659`) and then every stored arc with
+/// [`ShapeArc::nearest_points_to_arc`] through [`arc_arc`] (`:683`). The
+/// two loops share one running minimum and each breaks on a gap of zero
+/// or, when no gap was asked for, on the first hit.
+///
+/// No translation vector: KiCad asserts the request away (`:639`).
+///
+/// Deviation: the arcs come from [`LineChain::live_arcs`], not from the
+/// raw arc vector KiCad indexes, so an orphaned arc cannot collide.
+/// Erratum E13, fixed in slice 3.
+fn arc_chain(
+  arc: ShapeArc,
+  chain: &LineChain,
+  clearance: i32,
+  request: Request,
+) -> Option<Outcome> {
+  // The inner calls take the caller's `aActual` and `aLocation`
+  // pointers, so a translation vector request reaches them as the bare
+  // boolean one (`:659`, `:683`).
+  let inner = if request.wants_actual() {
+    Request::Actual
+  } else {
+    Request::Boolean
+  };
+  let mut closest = i32::MAX;
+  let mut nearest = Vec2::new(0, 0);
+
+  if chain.is_closed()
+    && chain.point_count() > 0
+    && chain.point_inside(arc.start(), 0)
+  {
+    closest = 0;
+    nearest = arc.start();
+  } else {
+    // :657. The segments that lie on a stored arc are skipped here and
+    // collided whole below.
+    for index in 0..chain.segment_count() {
+      if chain.is_arc_segment(index) {
+        continue;
+      }
+
+      let Some(collision) = arc.collide_seg(&chain.segment(index), clearance)
+      else {
+        continue;
+      };
+
+      let distance = if request.wants_actual() {
+        collision.actual
+      } else {
+        0
+      };
+
+      if distance < closest {
+        nearest = collision.location;
+        closest = distance;
+      }
+
+      if closest == 0 || !request.wants_actual() {
+        break;
+      }
+    }
+
+    // :681, entered whatever the segment loop found, as KiCad's is. The
+    // stored arcs carry no width (`:686`), so the clearance is the whole
+    // separation.
+    for (_, stored) in chain.live_arcs() {
+      let Some(outcome) = arc_arc(arc, *stored, clearance, inner) else {
+        continue;
+      };
+
+      let distance = if request.wants_actual() {
+        outcome.actual
+      } else {
+        0
+      };
+
+      if distance < closest {
+        nearest = outcome.location;
+        closest = distance;
+      }
+
+      if closest == 0 || !request.wants_actual() {
+        break;
+      }
+    }
+  }
+
+  if closest != 0 && closest >= clearance {
+    return None;
+  }
+
+  Some(Outcome {
+    actual: closest,
+    location: nearest,
+    mtv: Vec2::new(0, 0),
+  })
+}
+
+/// Arc against a polyline or polygon, ignoring any arc it stores.
+///
+/// `libs/kimath/src/geometry/shape_collisions.cpp:786`, the cell behind
+/// [`collide_arc_chain_base`]. This is the row a `SHAPE_SIMPLE` pad
+/// outline reaches, and the one the router meets whenever a pad is
+/// collided against an arc track (note 09 section 6).
+///
+/// Unlike [`arc_chain`] it opens with the `is_effective_line` hand off
+/// (`:790`) and it measures the chain's polyline only: a stored arc
+/// contributes its approximation segments and nothing else.
+///
+/// No translation vector: KiCad asserts the request away (`:796`).
+fn arc_chain_base(
+  arc: ShapeArc,
+  chain: &LineChain,
+  clearance: i32,
+  request: Request,
+) -> Option<Outcome> {
+  if arc.is_effective_line() {
+    return chain_segment(chain, effective_line(arc), clearance, request);
+  }
+
+  let mut closest = i32::MAX;
+  let mut nearest = Vec2::new(0, 0);
+
+  if chain.is_closed()
+    && chain.point_count() > 0
+    && chain.point_inside(arc.start(), 0)
+  {
+    closest = 0;
+    nearest = arc.start();
+  } else {
+    for index in 0..chain.segment_count() {
+      let Some(collision) = arc.collide_seg(&chain.segment(index), clearance)
+      else {
+        continue;
+      };
+
+      let distance = if request.wants_actual() {
+        collision.actual
+      } else {
+        0
+      };
+
+      if distance < closest {
+        nearest = collision.location;
+        closest = distance;
+      }
+
+      if closest == 0 || !request.wants_actual() {
+        break;
+      }
+    }
+  }
+
+  if closest != 0 && closest >= clearance {
+    return None;
+  }
+
+  Some(Outcome {
+    actual: closest,
+    location: nearest,
+    mtv: Vec2::new(0, 0),
+  })
+}
+
+/// An arc against whichever polyline row its operand's runtime type
+/// selects.
+///
+/// The rescue block of the polyline versus polyline cell calls
+/// `arc.Collide( other, .. )` on the whole shape
+/// (`libs/kimath/src/geometry/shape_collisions.cpp:448`), which re enters
+/// the dispatcher and lands in the arc against `SH_LINE_CHAIN` row
+/// (`:1246`) or the arc against `SH_SIMPLE` row (`:1254`). This is that
+/// two way choice, without the round trip through [`collide_single`] that
+/// would need a [`Shape`] to borrow from.
+fn arc_against_chain(
+  arc: ShapeArc,
+  other: ChainRef,
+  clearance: i32,
+  request: Request,
+) -> Option<Outcome> {
+  if other.is_line_chain {
+    arc_chain(arc, other.chain, clearance, request)
+  } else {
+    arc_chain_base(arc, other.chain, clearance, request)
+  }
 }
 
 /// Arc against capsule.
@@ -2437,6 +2961,7 @@ fn saturate_i32(value: i64) -> i32 {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::geometry::arc::arc_to_segment_count;
   use crate::geometry::math::Degrees;
   use crate::geometry::shape::ShapeKind;
 
@@ -2543,14 +3068,29 @@ mod tests {
     )
   }
 
+  /// KiCad's `SHAPE_LINE_CHAIN( const SHAPE_ARC& )`,
+  /// `libs/kimath/src/geometry/shape_line_chain.cpp:90`, followed by the
+  /// `SetWidth( 0 )` the chain quarters of `CollideArc` apply
+  /// (`test_shape_arc.cpp:955`). The stored arc already has width zero,
+  /// so the call only clears the chain's own nominal width.
+  fn chain_of_arc(arc: ShapeArc) -> LineChain {
+    let mut chain = LineChain::new();
+
+    chain.set_width(arc.width());
+    chain.append_arc(&arc, LineChain::ARC_POLYGONIZATION_MAX_ERROR);
+    chain.set_width(0);
+
+    chain
+  }
+
   /// `CollideArc`, `test_shape_arc.cpp:948`, over the fifteen row table
   /// at `:869`.
   ///
-  /// KiCad's body checks the same expectation four ways: arc against arc,
-  /// arc against a chain, chain against arc and chain against chain. Only
-  /// the first is mirrored here, because the other three need a
-  /// [`LineChain`] that carries arcs, which is slice 3 of
-  /// `doc/work/012-arcs.md`.
+  /// KiCad's body checks the same expectation four ways: arc against arc
+  /// (`:968`), arc against a chain (`:975`), chain against arc (`:978`)
+  /// and chain against chain (`:981`). All four are mirrored. The three
+  /// chain quarters re-derive the clearance, because a chain carries no
+  /// width, exactly as `:973`, `:977` and `:980` do.
   #[test]
   fn collide_arc() {
     let cases = [
@@ -2809,14 +3349,237 @@ mod tests {
     for case in &cases {
       let first = arc_from_millimetres(&case.first);
       let second = arc_from_millimetres(&case.second);
+      let clearance = mm_to_iu(case.clearance);
+      let first_shape = Shape::arc(first);
+      let second_shape = Shape::arc(second);
+      let first_chain = Shape::line_chain(chain_of_arc(first));
+      let second_chain = Shape::line_chain(chain_of_arc(second));
 
       assert_eq!(
-        collide_arc_arc(first, second, mm_to_iu(case.clearance)).is_some(),
+        collide_arc_arc(first, second, clearance).is_some(),
         case.collides,
-        "{}",
+        "{}, arc against arc",
+        case.name
+      );
+
+      // :973, :975.
+      assert_eq!(
+        collide(&first_shape, &second_chain, clearance + second.width() / 2)
+          .is_some(),
+        case.collides,
+        "{}, arc against chain",
+        case.name
+      );
+
+      // :977, :978.
+      assert_eq!(
+        collide(&first_chain, &second_shape, clearance + first.width() / 2)
+          .is_some(),
+        case.collides,
+        "{}, chain against arc",
+        case.name
+      );
+
+      // :980, :981.
+      assert_eq!(
+        collide(
+          &first_chain,
+          &second_chain,
+          first.width() / 2 + second.width() / 2
+        )
+        .is_some(),
+        case.collides,
+        "{}, chain against chain",
         case.name
       );
     }
+  }
+
+  /// `CollideArcToShapeLineChain`, `test_shape_arc.cpp:990`.
+  ///
+  /// The arc against polyline row in both operand orders, then the bare
+  /// segment the chain's eighth segment is, which is the one that
+  /// actually touches the arc.
+  #[test]
+  fn collide_arc_to_shape_line_chain() {
+    let arc = ShapeArc::new(
+      point(206_000_000, 140_110_000),
+      point(201_574_617, 139_229_737),
+      point(197_822_958, 136_722_959),
+      250_000,
+    );
+
+    let chain = open_chain(&[
+      point(159_600_000, 142_500_000),
+      point(159_600_000, 142_600_000),
+      point(166_400_000, 135_800_000),
+      point(166_400_000, 111_600_000),
+      point(190_576_804, 111_600_000),
+      point(192_242_284, 113_265_480),
+      point(192_255_720, 113_265_480),
+      point(203_682_188, 124_691_948),
+      point(203_682_188, 140_332_188),
+      point(206_000_000, 142_650_000),
+    ]);
+
+    let arc_shape = Shape::arc(arc);
+
+    // :1007, :1008.
+    assert!(collides(&arc_shape, &chain, 100_000));
+    assert!(collides(&chain, &arc_shape, 100_000));
+
+    // :1010, :1011.
+    let seg = Seg::new(
+      point(203_682_188, 124_691_948),
+      point(203_682_188, 140_332_188),
+    );
+
+    assert!(collide_seg(&arc_shape, &seg, 0).is_some());
+  }
+
+  /// One circular edge of an arc's buffer outline, as a polyline.
+  ///
+  /// Stands in for `ConvertArcToPolyline`,
+  /// `libs/kimath/src/convert_basic_shapes_to_polygon.cpp:736`, at the
+  /// only two error locations `TransformArcToPolygon` asks it for. With
+  /// `circumscribe` the vertices are pushed out to `radius / cos(step /
+  /// 2)`, so every chord is tangent to the true circle and the polyline
+  /// lies outside it, which is `ERROR_OUTSIDE`; without it the vertices
+  /// sit on the circle and the chords cut inside, which is
+  /// `ERROR_INSIDE`.
+  fn buffer_edge(
+    center: Vec2,
+    radius: f64,
+    start: Degrees,
+    sweep: Degrees,
+    max_error: i32,
+    circumscribe: bool,
+  ) -> Vec<Vec2> {
+    let count = arc_to_segment_count(radius as i32, max_error, sweep);
+    let step = sweep / f64::from(count);
+    let scale = if circumscribe {
+      1.0 / (step.as_radians() / 2.0).cos()
+    } else {
+      1.0
+    };
+
+    (0..=count)
+      .map(|index| {
+        let angle = start + step * f64::from(index);
+
+        Vec2::new(
+          kiround(f64::from(center.x) + radius * scale * angle.cos()),
+          kiround(f64::from(center.y) + radius * scale * angle.sin()),
+        )
+      })
+      .collect()
+  }
+
+  /// The outline of an arc stroked to `arc.width() + 2 * clearance`, in
+  /// the order `TransformArcToPolygon` walks it
+  /// (`convert_basic_shapes_to_polygon.cpp:730` to `:746`): the outer
+  /// edge, the cap at the far end, the inner edge walked back, and the
+  /// cap at the near end.
+  ///
+  /// The chain is left **open**, with the first vertex repeated at the
+  /// end so that every edge is present. A closed one would swallow the
+  /// arc's start point through the containment shortcut of the arc
+  /// against polyline row (`shape_collisions.cpp:650`), where KiCad's
+  /// zone fill holds this outline as a **hole** and so lies entirely
+  /// outside it.
+  fn arc_buffer_outline(
+    arc: ShapeArc,
+    clearance: i32,
+    max_error: i32,
+  ) -> LineChain {
+    let center = arc.center();
+    let radius = arc.radius();
+    let offset = f64::from(arc.width()) / 2.0 + f64::from(clearance);
+    let sweep = arc.central_angle();
+    let start = arc.start_angle();
+    let end = arc.end_angle();
+    let half_turn = Degrees::new(180.0_f64.copysign(sweep.as_degrees()));
+
+    let mut points =
+      buffer_edge(center, radius + offset, start, sweep, max_error, true);
+
+    points.extend(buffer_edge(
+      arc.end(),
+      offset,
+      end,
+      half_turn,
+      max_error,
+      true,
+    ));
+    points.extend(buffer_edge(
+      center,
+      radius - offset,
+      end,
+      -sweep,
+      max_error,
+      false,
+    ));
+    points.extend(buffer_edge(
+      arc.start(),
+      offset,
+      start + Degrees::new(180.0),
+      half_turn,
+      max_error,
+      true,
+    ));
+
+    let first = points[0];
+    points.push(first);
+
+    LineChain::from_points(points, false)
+  }
+
+  /// `CollideArcToPolygonApproximation`, `test_shape_arc.cpp:1015`.
+  ///
+  /// Not a literal mirror, and this is the one case of the slice that is
+  /// not. KiCad builds the obstacle out of `SHAPE_POLY_SET`,
+  /// `TransformArcToPolygon` and a cached triangulation, none of which
+  /// this crate has or needs: the router's world model contains no
+  /// polygon set (note 01 section 11). What the case pins is that the
+  /// arc rows measure an arc against a polygonal approximation of its
+  /// own buffer to within a tenth of the polygonisation error, and that
+  /// survives the substitution: [`arc_buffer_outline`] builds the same
+  /// boundary `TransformArcToPolygon` would, at the same accuracy and
+  /// with the same error locations, and the arc is collided against it
+  /// at the same two clearances.
+  ///
+  /// The arc, the clearance, the accuracy and the epsilon are KiCad's
+  /// (`:1017` to `:1050`).
+  #[test]
+  fn collide_arc_to_polygon_approximation() {
+    let arc = ShapeArc::from_center_start_angle(
+      point(73_843_527, 74_355_869),
+      point(71_713_528, 72_965_869),
+      Degrees::new(-76.36664803),
+      1_000_000,
+    );
+
+    // :1022, :1023, :1050.
+    let clearance = (arc.width() * 3) / 2;
+    let accuracy = ShapeArc::DEFAULT_ACCURACY_FOR_PCB;
+    let epsilon = accuracy / 10;
+
+    let buffer =
+      Shape::line_chain(arc_buffer_outline(arc, clearance, accuracy));
+    let arc_shape = Shape::arc(arc);
+
+    // :1052.
+    assert!(collide(&buffer, &arc_shape, clearance + epsilon).is_some());
+
+    // :1054.
+    assert!(collide(&buffer, &arc_shape, clearance - epsilon).is_none());
+
+    // The port's own, recorded because it says how tight the mirror is:
+    // the boundary this builds sits at exactly the clearance from the
+    // arc's copper edge, so the two assertions above straddle the answer
+    // by the epsilon and not by more.
+    assert!(collide(&buffer, &arc_shape, clearance).is_some());
+    assert!(collide(&buffer, &arc_shape, clearance - 1).is_none());
   }
 
   // -----------------------------------------------------------------
@@ -2854,7 +3617,8 @@ mod tests {
     let rect_origin = point(400_000, 120_000);
     let rect_size = point(200_000, 200_000);
     let rect = Shape::rect(rect_origin, rect_size);
-    let against_rect = collide_arc_rect(arc, rect_origin, rect_size, clearance);
+    let against_rect =
+      collide_arc_rect(arc, rect_origin, rect_size, 0, clearance);
 
     assert!(against_rect.is_some());
     assert_eq!(against_rect, collide(&rect, &as_capsule, clearance));

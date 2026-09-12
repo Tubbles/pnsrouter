@@ -445,6 +445,7 @@ Note what is **not** there: nothing in the shove, the walkaround or the optimize
 - `int x = (int)( 2.0 / ( 1.0 + M_SQRT2 ) * d ) / 2;` at `:86` truncates, then integer divides. `SegmentHull` computes the same quantity as `KiROUND( x / 2.0 )` (`:190`). The two differ by up to 1 nm, which matters because the shove's termination depends on hulls and collisions agreeing to the nanometre (note 01 section 14.6).
 - The mitre loop dereferences `sa_out.IntersectLines( sb_out )` and `sa_in.IntersectLines( sb_in )` without checking the optionals (`:131`, `:132`). Two exactly collinear consecutive approximation segments return `nullopt` and the dereference is undefined. `ConvertToPolyline` at `ARC_LOW_DEF` produces at least four points for any non degenerate arc (`GetArcToSegmentCount` floors at 2, then the doubling at `shape_arc.cpp:1053`), and consecutive points on a circle are never collinear, so it is not reachable today. Erratum E21.
 - The reversal test at `:150` uses `line.Segment( 0 ).A`, which is `m_start` exactly.
+- The whole circle branch (`:76` to `:83`) inflates the arc's centre line circle by `cl` alone; the arc's own half width, which the mitred branch adds at `:85`, is missing. Erratum E39 (found in slice 4, 2026-09-12).
 
 ### 4.3 `NODE`
 
@@ -1055,6 +1056,12 @@ Measured by reimplementing `IO_UTILS::fileHashMMH3` (`common/io/io_utils.cpp:86`
 ### E38. `ArcHull` and `SegmentHull` round the same octagon quantity differently
 
 `pcbnew/router/pns_utils.cpp:86` computes `int x = (int)( 2.0 / ( 1.0 + M_SQRT2 ) * d ) / 2;`, a truncation followed by an integer divide. `SegmentHull` computes the same quantity as `KiROUND( x / 2.0 )` (`:190`). The two can differ by 1 nm. Combined with the half width inconsistency note 01 section 12.2 records (`( t + 1 ) / 2` in `ArcHull` at `:73` versus `t / 2` in `SegmentHull` at `:186`), an arc's hull and a segment's hull of the same width and clearance are not built to the same tolerance. Port both verbatim; the walkaround's termination depends on hulls and collisions agreeing to the nanometre (note 01 section 14.6).
+
+---
+
+### E39. `ArcHull`'s whole circle branch leaves the arc's width out
+
+`pcbnew/router/pns_utils.cpp:76` to `:83`. When the arc sweeps more than half a turn through an opening narrower than the combined clearance, the hull is `OctagonalHull` around the centre line circle of radius `r` inflated by `cl`, where `cl` is the clearance plus half the walkaround thickness (`:73`). The mitred branch below it offsets by `GetWidth() / 2 + cl + DefaultAccuracyForPCB()` (`:85`). So in the circle branch doubling the arc's width changes the hull not at all, and once the width passes twice the clearance the hull cuts inside the copper. Defined behaviour and reachable only for such an arc, so the port reproduces it behind `arc_hull_of_a_whole_turn_leaves_the_arc_width_out` in `src/geometry/hull.rs` (slice 4, 2026-09-12). Worth a look in slice 6, where the placer first produces hulls the walkaround has to respect.
 
 ---
 

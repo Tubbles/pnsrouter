@@ -20,6 +20,7 @@ use pnsrouter::eventlog::{
   ParseError, Recorder, SessionEvent, SessionRecording,
   assert_replay_is_collision_free, assert_replay_matches, replay,
 };
+use pnsrouter::geometry::arc::ShapeArc;
 use pnsrouter::geometry::direction45::CornerMode;
 use pnsrouter::geometry::line_chain::LineChain;
 use pnsrouter::geometry::seg::Seg;
@@ -682,6 +683,12 @@ fn every_geometry_and_shape_variant_survives_the_trip_through_text() {
       Vec2::new(100, 100),
     ])),
     Shape::line_chain(chain),
+    Shape::arc(ShapeArc::new(
+      Vec2::new(14, 15),
+      Vec2::new(16, 17),
+      Vec2::new(18, 15),
+      19,
+    )),
     Shape::Compound(vec![
       Shape::circle(Vec2::new(0, 0), 1),
       Shape::Compound(vec![Shape::circle(Vec2::new(2, 2), 3)]),

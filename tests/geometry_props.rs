@@ -254,6 +254,10 @@ fn boundary_samples(shape: &Shape) -> Vec<Vec2> {
       *origin + Vec2::new(0, size.y),
     ],
     Shape::Segment { seg, .. } => vec![seg.a, seg.b],
+    // The three defining points, which are on the curve by
+    // construction. Nothing in this file builds an arc yet. The arm is
+    // here because the match is exhaustive.
+    Shape::Arc(arc) => vec![arc.start(), arc.arc_mid(), arc.end()],
     Shape::Simple(polygon) => polygon.vertices().points().to_vec(),
     Shape::LineChain(chain) => chain.points().to_vec(),
     Shape::Compound(parts) => parts.iter().flat_map(boundary_samples).collect(),

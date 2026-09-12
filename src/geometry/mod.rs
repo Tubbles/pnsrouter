@@ -36,10 +36,10 @@
 //!   segment and nearest point primitives the arc collision rows in
 //!   [`collision`] are built from.
 //! - [`hull`]: the octagons the walkaround and the shove walk around,
-//!   built around a rectangle, a capsule or a polygon assumed convex,
-//!   always clockwise, the monotone chain the item model uses in place of
-//!   KiCad's one polygon boolean, plus the filter that turns a raw chain
-//!   intersection into the crossings the walkaround can use.
+//!   built around a rectangle, a capsule, an arc or a polygon assumed
+//!   convex, always clockwise, the monotone chain the item model uses in
+//!   place of KiCad's one polygon boolean, plus the filter that turns a
+//!   raw chain intersection into the crossings the walkaround can use.
 
 pub mod arc;
 pub mod box2;
@@ -60,15 +60,15 @@ pub use arc::{
 pub use box2::Box2;
 pub use collision::{
   ShapeCollision, collide, collide_arc_arc, collide_arc_arc_mtv,
-  collide_arc_circle, collide_arc_circle_mtv, collide_arc_rect,
-  collide_arc_rect_mtv, collide_arc_segment, collide_mtv, collide_point,
-  collide_seg, collides,
+  collide_arc_chain, collide_arc_chain_base, collide_arc_circle,
+  collide_arc_circle_mtv, collide_arc_rect, collide_arc_rect_mtv,
+  collide_arc_segment, collide_mtv, collide_point, collide_seg, collides,
 };
 pub use direction45::{AngleType, CornerMode, Direction45, Octant};
 pub use hull::{
-  HULL_MARGIN, approximate_segment_as_rect, build_hull_for_primitive_shape,
-  convex_hull, hull_intersection, monotone_chain_hull, octagonal_hull,
-  segment_hull,
+  ArcHullError, HULL_MARGIN, approximate_segment_as_rect, arc_hull,
+  build_hull_for_primitive_shape, convex_hull, hull_intersection,
+  monotone_chain_hull, octagonal_hull, segment_hull,
 };
 pub use line_chain::{
   ArcRef, Collision, Hit, Intersection, LineChain, PointRole, SliceError,

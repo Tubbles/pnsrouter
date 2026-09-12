@@ -20,16 +20,12 @@
 //! counter clockwise winding by reversing the hull rather than by walking
 //! it differently (`pcbnew/router/pns_line.cpp:397`), so a hull that came
 //! out the other way round would silently reverse the meaning of the
-//! walkaround's `cw` flag. [`segment_hull`] normalises the winding
-//! explicitly, the other two get it from the order they append their
-//! vertices in.
+//! walkaround's `cw` flag. [`segment_hull`] and [`arc_hull`] normalise
+//! the winding explicitly, the other two get it from the order they
+//! append their vertices in.
 //!
 //! # What is not here
 //!
-//! - `ArcHull` (`pns_utils.cpp:71`): milestone 1 routes straight segments
-//!   only, so there is no `Shape::Arc` to feed it. It is the one builder
-//!   that miters offset lines rather than resizing a direction vector,
-//!   and it brings `SHAPE_ARC::ConvertToPolyline` with it.
 //! - `ChangedArea` (`pns_utils.cpp:369`, `:389`): a dispatch over item
 //!   kinds that forwards to `VIA::ChangedArea` and `LINE::ChangedArea`,
 //!   so it belongs to the item model.
@@ -44,12 +40,14 @@
 //!   (`libs/kimath/include/geometry/geometry_utils.h:238`), which the
 //!   router never calls.
 
+use crate::geometry::arc::ShapeArc;
 use crate::geometry::line_chain::{Hit, Intersection, LineChain};
 use crate::geometry::math::{kiround, sign};
 use crate::geometry::seg::Seg;
 use crate::geometry::shape::{Shape, SimplePolygon};
 use crate::geometry::vec2::{Vec2, Vec2L};
 use std::f64::consts::{FRAC_1_SQRT_2, SQRT_2};
+use std::fmt;
 
 /// The slack the router leaves around a joint hull, in nanometres.
 ///
@@ -329,6 +327,225 @@ pub fn segment_hull(
   }
 }
 
+/// The polyline accuracy `ArcHull` approximates an arc at, in
+/// nanometres.
+///
+/// `ARC_LOW_DEF`, `pcbIUScale.mmToIU( ARC_LOW_DEF_MM )` with
+/// `ARC_LOW_DEF_MM = 0.02` (`include/base_units.h:136`, `:127`), which is
+/// what `pcbnew/router/pns_utils.cpp:88` passes. Four times coarser than
+/// the accuracy a chain stores an arc at, and four times coarser again
+/// than `SHAPE_ARC::DefaultAccuracyForPCB`, which is why
+/// [`arc_hull`] adds that accuracy back into the offset at `:85`.
+const ARC_LOW_DEF: i32 = 20000;
+
+/// Why [`arc_hull`] could not build a hull.
+///
+/// KiCad's `ArcHull` has no failure path: it dereferences the two mitre
+/// intersections without checking (`pcbnew/router/pns_utils.cpp:131`,
+/// `:132`) and indexes the arc's polyline without checking that it has a
+/// segment (`:94`). Both are undefined behaviour rather than a defined
+/// answer, so the milestone rule says fix them; erratum E21 is the first
+/// of the two.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum ArcHullError {
+  /// The arc's polyline has no segment to offset.
+  ///
+  /// Only a fully degenerate arc, whose three points collapse onto one,
+  /// reaches this: [`ShapeArc::convert_to_polyline`] always emits the
+  /// start and the end point, and [`LineChain::append`] suppresses the
+  /// second when it repeats the first. KiCad reads
+  /// `line.Segment( 0 )` regardless (`pns_utils.cpp:94`).
+  DegenerateArc,
+  /// Two consecutive polyline segments are collinear, so the offset
+  /// lines the mitre is cut from never meet.
+  ///
+  /// Erratum E21. KiCad dereferences the empty optional
+  /// (`pns_utils.cpp:131`, `:132`). It cannot be reached from an arc
+  /// polygonised at `ARC_LOW_DEF`, consecutive points of a circle
+  /// never being collinear, but the polygonisation accuracy is an
+  /// argument to `ConvertToPolyline` and a future caller may lower it.
+  CollinearMitre {
+    /// The index of the second of the two segments.
+    segment: usize,
+  },
+}
+
+impl fmt::Display for ArcHullError {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match self {
+      ArcHullError::DegenerateArc => {
+        write!(formatter, "the arc's polyline has no segment")
+      }
+      ArcHullError::CollinearMitre { segment } => write!(
+        formatter,
+        "polyline segments {} and {segment} are collinear, \
+         so the offset lines do not meet",
+        segment - 1
+      ),
+    }
+  }
+}
+
+impl std::error::Error for ArcHullError {}
+
+/// The octagon ended polygon around an arc of the given full width.
+///
+/// Port of `PNS::ArcHull`,
+/// `pcbnew/router/pns_utils.cpp:71`. `walkaround_thickness` is the width
+/// of the **moving** line, never of the obstacle, as it is for
+/// [`segment_hull`].
+///
+/// The shape is the arc's `ARC_LOW_DEF` polyline offset by `d` on each
+/// side, with the two offset polylines mitred at every interior vertex
+/// and capped at each end by the same corner cut [`segment_hull`] uses.
+/// An arc that sweeps more than half a turn and whose chord is shorter
+/// than the combined clearance is treated as a whole circle instead
+/// (`:76`), because a line cannot be routed through the opening.
+///
+/// # The two roundings of erratum E38
+///
+/// Both are reproduced verbatim, because the walkaround's termination
+/// depends on hulls and the collision predicates agreeing to the
+/// nanometre (note 01 section 14.6, note 09 erratum E38):
+///
+/// - the half width of the moving line is `(t + 1) / 2`, rounded **up**
+///   (`:73`), where [`segment_hull`] takes `t / 2`, rounded **down**
+///   (`:186`);
+/// - the corner cut is `(int)( OCTAGON_SIDE_RATIO * d ) / 2`, a
+///   truncation followed by an integer divide (`:86`), where
+///   [`segment_hull`] takes `kiround( OCTAGON_SIDE_RATIO * d / 2.0 )`
+///   (`:190`). The two differ by up to one nanometre.
+///
+/// The offset itself is `width / 2 + cl + DefaultAccuracyForPCB` in
+/// integers (`:85`), the accuracy term paying for the sagitta the coarse
+/// `ARC_LOW_DEF` polyline cuts off the true curve.
+///
+/// # Errors
+///
+/// [`ArcHullError::CollinearMitre`] where KiCad dereferences an empty
+/// optional (erratum E21), and [`ArcHullError::DegenerateArc`] where it
+/// indexes a polyline with no segment. See [`ArcHullError`].
+///
+/// # Panics
+///
+/// In a debug build when a vertex coordinate leaves `i32`, which a radius
+/// near `i32::MAX` reaches through the `2 * r` of the circle branch.
+/// KiCad computes these in wrapping `int`.
+pub fn arc_hull(
+  arc: &ShapeArc,
+  clearance: i32,
+  walkaround_thickness: i32,
+) -> Result<LineChain, ArcHullError> {
+  // :73, the half width rounded up. `segment_hull` rounds it down.
+  let cl = clearance + (walkaround_thickness + 1) / 2;
+
+  // :76. A sweep of more than half a turn whose chord no line fits
+  // through is hulled as the whole circle.
+  if arc.central_angle().as_degrees() > 180.0 && arc.chord().length() < cl {
+    // :78, a `double` radius truncated into an `int`.
+    let radius = arc.radius() as i32;
+    // :82, a `double` chamfer truncated by the implicit conversion to
+    // the `int` parameter, where `segment_hull` rounds it (`:252`).
+    let chamfer = (OCTAGON_CHAMFER_FACTOR * f64::from(radius + cl)) as i32;
+
+    return Ok(octagonal_hull(
+      arc.center() - Vec2::new(radius, radius),
+      Vec2::new(2 * radius, 2 * radius),
+      cl,
+      chamfer,
+    ));
+  }
+
+  // :85, all in integers, unlike `segment_hull`'s `double` d.
+  let d = arc.width() / 2 + cl + ShapeArc::DEFAULT_ACCURACY_FOR_PCB;
+  // :86, the truncation of erratum E38.
+  let x = (OCTAGON_SIDE_RATIO * f64::from(d)) as i32 / 2;
+
+  let line = arc.convert_to_polyline(ARC_LOW_DEF);
+
+  if line.segment_count() == 0 {
+    return Err(ArcHullError::DegenerateArc);
+  }
+
+  let mut hull = LineChain::new();
+  hull.set_closed(true);
+  let mut reverse_line = Vec::new();
+
+  // :94 to :105, the cap at the first point.
+  let first = line.segment(0);
+  let direction = first.b - first.a;
+  let p0 = -direction.perpendicular().resize(d);
+  let ds = -direction.perpendicular().resize(x);
+  let pd = direction.resize(x);
+  let dp = direction.resize(d);
+
+  hull.append(first.a + p0 - pd);
+  hull.append(first.a - dp + ds);
+  hull.append(first.a - dp - ds);
+  hull.append(first.a - p0 - pd);
+
+  // :107 to :133, the mitre at every interior vertex. KiCad's comment
+  // calls the offset a vertex normal, but the point it appends is the
+  // intersection of the two offset lines, not an averaged normal.
+  for index in 1..line.segment_count() {
+    let previous = line.segment(index - 1);
+    let current = line.segment(index);
+    let previous_offset = (previous.b - previous.a).perpendicular().resize(d);
+    let current_offset = (current.b - current.a).perpendicular().resize(d);
+
+    let outer_previous = offset_seg(&previous, previous_offset);
+    let outer_current = offset_seg(&current, current_offset);
+    let inner_previous = offset_seg(&previous, -previous_offset);
+    let inner_current = offset_seg(&current, -current_offset);
+
+    // :127, :128. KiCad dereferences both without checking, erratum
+    // E21.
+    let outer = outer_previous
+      .intersect_lines(&outer_current)
+      .ok_or(ArcHullError::CollinearMitre { segment: index })?;
+    let inner = inner_previous
+      .intersect_lines(&inner_current)
+      .ok_or(ArcHullError::CollinearMitre { segment: index })?;
+
+    hull.append(outer);
+    reverse_line.push(inner);
+  }
+
+  // :135 to :144, the cap at the last point.
+  let last = line.segment(line.segment_count() - 1);
+  let direction = last.b - last.a;
+  let p0 = -direction.perpendicular().resize(d);
+  let ds = -direction.perpendicular().resize(x);
+  let pd = direction.resize(x);
+  let dp = direction.resize(d);
+
+  hull.append(last.b - p0 + pd);
+  hull.append(last.b + dp - ds);
+  hull.append(last.b + dp + ds);
+  hull.append(last.b + p0 + pd);
+
+  // :146, the inner offset walked back.
+  for point in reverse_line.iter().rev() {
+    hull.append(*point);
+  }
+
+  // :150. `line.Segment( 0 ).A` is the arc's start point exactly.
+  if hull.segment(0).side(first.a) < 0 {
+    Ok(hull.reversed())
+  } else {
+    Ok(hull)
+  }
+}
+
+/// A segment translated by a vector.
+///
+/// The four `sa_out.A += pp` style pairs of `PNS::ArcHull`,
+/// `pcbnew/router/pns_utils.cpp:117` to `:125`, which offset a copy of a
+/// polyline segment onto one side of the hull.
+fn offset_seg(seg: &Seg, offset: Vec2) -> Seg {
+  Seg::new(seg.a + offset, seg.b + offset)
+}
+
 /// Slide a diagonal of [`convex_hull`] sideways until it is exactly
 /// `clearance` away from the polygon vertex nearest to it.
 ///
@@ -605,6 +822,7 @@ pub fn approximate_segment_as_rect(seg: &Seg, width: i32) -> Shape {
 /// | [`Shape::Rect`] | [`octagonal_hull`] with no chamfer | `:488` |
 /// | [`Shape::Circle`] | [`octagonal_hull`] around the `2r` square, chamfered | `:498` |
 /// | [`Shape::Segment`] | [`segment_hull`] with the **raw** arguments | `:507` |
+/// | [`Shape::Arc`] | [`arc_hull`] with the **raw** arguments | `:513` |
 /// | [`Shape::Simple`] | [`convex_hull`] with the combined clearance | `:520` |
 /// | [`Shape::LineChain`], [`Shape::Compound`] | `None` | `:531` |
 ///
@@ -617,7 +835,10 @@ pub fn approximate_segment_as_rect(seg: &Seg, width: i32) -> Shape {
 /// rounded **down** (`:186`). For an odd line width the hull of a track
 /// segment is therefore one nanometre tighter than the hull of a via or a
 /// pad at the same clearance. That is note 03 section 9.6 item 9, and it
-/// is reproduced rather than fixed.
+/// is reproduced rather than fixed. The arc branch forwards the raw
+/// arguments too, and [`arc_hull`] rounds the half width **up** again
+/// (`:73`), so an arc's hull agrees with a via's and not with a
+/// segment's. That half is erratum E38.
 ///
 /// The circle's chamfer is `OCTAGON_CHAMFER_FACTOR * (radius + cl)`
 /// **truncated** by C++'s implicit `double` to `int` conversion at the
@@ -668,6 +889,11 @@ pub fn build_hull_for_primitive_shape(
     Shape::Segment { seg, width } => {
       Some(segment_hull(seg, *width, clearance, walkaround_thickness))
     }
+    // :513. A degenerate arc answers `None`, which is what every other
+    // shape this dispatcher cannot hull answers; KiCad has no such case
+    // and would read past the end of the arc's polyline. See
+    // [`ArcHullError`].
+    Shape::Arc(arc) => arc_hull(arc, clearance, walkaround_thickness).ok(),
     Shape::Simple(convex) => convex_hull(convex, cl),
     Shape::LineChain(_) | Shape::Compound(_) => None,
   }
@@ -823,6 +1049,7 @@ pub fn hull_intersection(
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::geometry::math::Degrees;
 
   /// A chain built from a flat list of coordinates, closed.
   fn closed_chain(coordinates: &[i32]) -> LineChain {
@@ -1138,6 +1365,399 @@ mod tests {
   // -----------------------------------------------------------------
   // MoveDiagonal
   // -----------------------------------------------------------------
+
+  // -----------------------------------------------------------------
+  // ArcHull
+  // -----------------------------------------------------------------
+
+  /// One row of the port's own `ArcHull` table. KiCad has no test for
+  /// this builder at all (note 09 section 8.4 item 6).
+  struct ArcHullCase {
+    /// What the row is for.
+    name: &'static str,
+    /// The arc to hull.
+    arc: ShapeArc,
+    /// Whether the row takes the whole circle branch of `:76`, which
+    /// grows the **centre line** circle and so leaves the arc's own half
+    /// width out of the offset. See
+    /// [`arc_hull_of_a_whole_turn_leaves_the_arc_width_out`].
+    circle_branch: bool,
+  }
+
+  /// The five shapes the table covers, one per branch of
+  /// `pcbnew/router/pns_utils.cpp:71`.
+  fn arc_hull_cases() -> Vec<ArcHullCase> {
+    vec![
+      ArcHullCase {
+        name: "quarter circle",
+        arc: ShapeArc::from_center_start_angle(
+          Vec2::new(0, 0),
+          Vec2::new(2_000_000, 0),
+          Degrees::new(90.0),
+          250_000,
+        ),
+        circle_branch: false,
+      },
+      ArcHullCase {
+        name: "semicircle",
+        arc: ShapeArc::from_center_start_angle(
+          Vec2::new(0, 0),
+          Vec2::new(2_000_000, 0),
+          Degrees::new(180.0),
+          250_000,
+        ),
+        circle_branch: false,
+      },
+      ArcHullCase {
+        name: "short arc",
+        arc: ShapeArc::from_center_start_angle(
+          Vec2::new(1_000_000, -500_000),
+          Vec2::new(6_000_000, -500_000),
+          Degrees::new(-15.0),
+          250_000,
+        ),
+        circle_branch: false,
+      },
+      ArcHullCase {
+        name: "nearly whole turn, the circle branch of :76",
+        arc: ShapeArc::from_center_start_angle(
+          Vec2::new(0, 0),
+          Vec2::new(1_000_000, 0),
+          Degrees::new(355.0),
+          250_000,
+        ),
+        circle_branch: true,
+      },
+      ArcHullCase {
+        name: "effective line",
+        arc: ShapeArc::new(
+          Vec2::new(0, 0),
+          Vec2::new(1_500_000, 0),
+          Vec2::new(3_000_000, 0),
+          250_000,
+        ),
+        circle_branch: false,
+      },
+    ]
+  }
+
+  /// The eight directions a point is pushed in to check that the hull
+  /// still holds it.
+  const ENCLOSURE_DIRECTIONS: [Vec2; 8] = [
+    Vec2::new(1, 0),
+    Vec2::new(1, 1),
+    Vec2::new(0, 1),
+    Vec2::new(-1, 1),
+    Vec2::new(-1, 0),
+    Vec2::new(-1, -1),
+    Vec2::new(0, -1),
+    Vec2::new(1, -1),
+  ];
+
+  /// The port's own: every hull is clockwise, as the module invariant
+  /// requires, and holds a disc of `width / 2 + clearance` around every
+  /// point of the arc's own `ARC_LOW_DEF` polyline.
+  ///
+  /// The margin is not tight: the offset the builder uses is
+  /// `width / 2 + clearance + (t + 1) / 2 + DefaultAccuracyForPCB`
+  /// (`pns_utils.cpp:85`), the accuracy term paying for the sagitta the
+  /// coarse polyline cuts off. What the check pins is the direction of
+  /// the error, that the hull never falls inside the copper plus the
+  /// clearance.
+  #[test]
+  fn arc_hull_is_clockwise_and_encloses_the_arc() {
+    for case in arc_hull_cases() {
+      for (clearance, thickness) in [(200_000, 250_000), (50_000, 150_000)] {
+        let hull = arc_hull(&case.arc, clearance, thickness)
+          .unwrap_or_else(|error| panic!("{}: {error}", case.name));
+
+        assert!(
+          hull.area(false) > 0.0,
+          "{} at clearance {clearance} is not clockwise, area {}",
+          case.name,
+          hull.area(false)
+        );
+
+        // The circle branch grows the centre line circle by `cl`
+        // alone, so it has no room for the arc's own half width.
+        let reach = if case.circle_branch {
+          clearance
+        } else {
+          case.arc.width() / 2 + clearance
+        };
+        let polyline = case.arc.convert_to_polyline(ARC_LOW_DEF);
+
+        for point in polyline.points() {
+          for direction in ENCLOSURE_DIRECTIONS {
+            let probe = *point + direction.resize(reach);
+
+            assert!(
+              hull.point_inside(probe, 0),
+              "{} at clearance {clearance}: {probe:?} is outside the hull",
+              case.name
+            );
+          }
+        }
+      }
+    }
+  }
+
+  /// The port's own, and a defect note 09 does not list: the whole
+  /// circle branch of `pns_utils.cpp:76` grows the arc's **centre line**
+  /// circle by `cl`, where the mitred branch offsets by
+  /// `width / 2 + cl + DefaultAccuracyForPCB` (`:85`). The hull is
+  /// therefore half a track width short on the outside, and cuts inside
+  /// the arc's own copper when the width exceeds twice the clearance.
+  ///
+  /// Reproduced, the behaviour being defined and the branch being
+  /// reachable only for an arc that sweeps more than half a turn through
+  /// an opening no line fits through, which the router will not route
+  /// past anyway.
+  #[test]
+  fn arc_hull_of_a_whole_turn_leaves_the_arc_width_out() {
+    let radius = 1_000_000;
+    let arc = ShapeArc::from_center_start_angle(
+      Vec2::new(0, 0),
+      Vec2::new(radius, 0),
+      Degrees::new(355.0),
+      250_000,
+    );
+    let clearance = 200_000;
+    let thickness = 250_000;
+    let cl = clearance + (thickness + 1) / 2;
+
+    let hull = arc_hull(&arc, clearance, thickness).unwrap();
+    let widened = {
+      let mut wide = arc;
+      wide.set_width(arc.width() * 2);
+      arc_hull(&wide, clearance, thickness).unwrap()
+    };
+
+    // Doubling the width changes nothing, which is the defect.
+    assert_eq!(hull, widened);
+
+    // And the hull's right edge is at `radius + cl`, half a track width
+    // inside where the mitred branch would have put it.
+    assert_eq!(
+      hull.points().iter().map(|point| point.x).max(),
+      Some(radius + cl)
+    );
+  }
+
+  /// The port's own: the corner cut of `pns_utils.cpp:86` is a
+  /// truncation followed by an integer divide, and the hull's vertices
+  /// carry the truncated value rather than the rounded one.
+  ///
+  /// The arc is an effective line with a horizontal chord, so the four
+  /// `Resize` calls are exact and every vertex is an integer combination
+  /// of `d` and `x`. `d` is 355000 here, where
+  /// `(int)( OCTAGON_SIDE_RATIO * d ) / 2` is 147045 and
+  /// `KiROUND( OCTAGON_SIDE_RATIO * d / 2.0 )` is 147046.
+  #[test]
+  fn arc_hull_truncates_the_corner_cut() {
+    let arc = ShapeArc::new(
+      Vec2::new(0, 0),
+      Vec2::new(1_500_000, 0),
+      Vec2::new(3_000_000, 0),
+      200_000,
+    );
+    let clearance = 150_000;
+    let thickness = 200_000;
+
+    // :73, :85.
+    let d = arc.width() / 2
+      + clearance
+      + (thickness + 1) / 2
+      + ShapeArc::DEFAULT_ACCURACY_FOR_PCB;
+    assert_eq!(d, 355_000);
+
+    let truncated = (OCTAGON_SIDE_RATIO * f64::from(d)) as i32 / 2;
+    let rounded = kiround(OCTAGON_SIDE_RATIO * f64::from(d) / 2.0);
+
+    assert_eq!(truncated, 147_045);
+    assert_eq!(rounded, 147_046);
+
+    let hull = arc_hull(&arc, clearance, thickness).unwrap();
+    let length = 3_000_000;
+    let x = truncated;
+
+    // The eight vertices in the order `:102` to `:144` appends them: the
+    // cap at the chord's start, then the cap at its end. `Resize` is
+    // exact here because the chord is horizontal.
+    let appended = [
+      (-x, -d),
+      (-d, -x),
+      (-d, x),
+      (-x, d),
+      (length + x, d),
+      (length + d, x),
+      (length + d, -x),
+      (length + x, -d),
+    ];
+
+    // :150, the winding fix. The first segment of that order leaves the
+    // chord's start point on its left, so the chain comes back reversed.
+    let expected: Vec<i32> =
+      appended.iter().rev().flat_map(|(x, y)| [*x, *y]).collect();
+
+    assert_eq!(flatten(&hull), expected);
+    assert!(hull.area(false) > 0.0);
+  }
+
+  /// The port's own, naming erratum E38: `arc_hull` and [`segment_hull`]
+  /// round the same two quantities differently, and the difference is
+  /// one nanometre in each.
+  ///
+  /// Both are reproduced verbatim, so this test is the record of the
+  /// divergence rather than a complaint about it. It compares the hulls
+  /// of the **same chord**, an effective line arc against the capsule it
+  /// degenerates to, because that is the one input for which the two
+  /// builders emit the same eight vertices in the same order up to a
+  /// rotation.
+  #[test]
+  fn arc_hull_and_segment_hull_round_the_octagon_differently_erratum_e38() {
+    let width = 200_000;
+    let length = 3_000_000;
+    let arc = ShapeArc::new(
+      Vec2::new(0, 0),
+      Vec2::new(length / 2, 0),
+      Vec2::new(length, 0),
+      width,
+    );
+    let chord = arc.chord();
+
+    // Half one, `( t + 1 ) / 2` at `:73` against `t / 2` at `:186`. An
+    // odd thickness rounds **up** for the arc, so its hull is the one
+    // the next even thickness gives, and **down** for the capsule, so
+    // its hull is the one the previous even thickness gives.
+    let clearance = 150_000;
+    let odd = 150_001;
+
+    assert_eq!(
+      arc_hull(&arc, clearance, odd),
+      arc_hull(&arc, clearance, odd + 1)
+    );
+    assert_ne!(
+      arc_hull(&arc, clearance, odd),
+      arc_hull(&arc, clearance, odd - 1)
+    );
+    assert_eq!(
+      segment_hull(&chord, width, clearance, odd),
+      segment_hull(&chord, width, clearance, odd - 1)
+    );
+    assert_ne!(
+      segment_hull(&chord, width, clearance, odd),
+      segment_hull(&chord, width, clearance, odd + 1)
+    );
+
+    // Half two, the corner cut of `:86` against `:190`. The clearances
+    // are chosen so that both builders work at the same offset of
+    // 355000, `arc_hull` paying the `DefaultAccuracyForPCB` of `:85` and
+    // `segment_hull` being handed it in the clearance instead, and the
+    // thickness is even so that half one cancels.
+    let even = 200_000;
+    let from_arc = arc_hull(&arc, clearance, even).unwrap();
+    let from_segment = segment_hull(&chord, width, clearance + 5_000, even);
+
+    assert_eq!(from_arc.point_count(), 8);
+    assert_eq!(from_segment.point_count(), 8);
+
+    // The two emit the same eight vertices in the same order, four
+    // apart: `arc_hull` starts its appends at the chord's first point
+    // (`:102`) and `segment_hull` at its second (`:270`).
+    let differences: Vec<Vec2> = (0..8)
+      .map(|index| from_arc.point(index) - from_segment.point((index + 4) % 8))
+      .collect();
+
+    assert!(
+      differences
+        .iter()
+        .all(|delta| delta.x.abs() <= 1 && delta.y.abs() <= 1),
+      "{differences:?}"
+    );
+    assert!(
+      differences.iter().any(|delta| *delta != Vec2::new(0, 0)),
+      "the two builders agreed, so the corner cut case is not sharp"
+    );
+  }
+
+  /// The port's own, naming erratum E21: [`arc_hull`] answers an error
+  /// where KiCad dereferences an empty optional or reads past the end of
+  /// the arc's polyline.
+  ///
+  /// The mitre half of the erratum is not reachable through this entry
+  /// point, which is what note 09 section 4.2 says and what the second
+  /// half of this test checks: at `ARC_LOW_DEF` no arc produces two
+  /// consecutive collinear approximation segments, because the
+  /// polygonisation only adds a vertex once the sagitta is worth one.
+  /// The guard is there for a caller that lowers the accuracy.
+  #[test]
+  fn arc_hull_answers_an_error_instead_of_reading_past_the_end_erratum_e21() {
+    let degenerate = ShapeArc::new(
+      Vec2::new(1_000, 2_000),
+      Vec2::new(1_000, 2_000),
+      Vec2::new(1_000, 2_000),
+      250_000,
+    );
+
+    // A clearance and a thickness of zero are what it takes to get
+    // past the whole circle branch of `:76`, whose `chord < cl` test a
+    // degenerate arc otherwise satisfies with a chord of zero.
+    assert_eq!(
+      arc_hull(&degenerate, 0, 0),
+      Err(ArcHullError::DegenerateArc)
+    );
+
+    for radius in [100_000, 1_000_000, 10_000_000, 100_000_000] {
+      for sweep in [0.5, 5.0, 45.0, 90.0, 179.0, 270.0, 359.5] {
+        let arc = ShapeArc::from_center_start_angle(
+          Vec2::new(0, 0),
+          Vec2::new(radius, 0),
+          Degrees::new(sweep),
+          250_000,
+        );
+
+        assert!(
+          arc_hull(&arc, 100_000, 200_000).is_ok(),
+          "radius {radius} sweep {sweep} reached the mitre guard"
+        );
+      }
+    }
+  }
+
+  /// The port's own: a hull this dispatcher cannot build answers `None`
+  /// rather than panicking, which is the one behaviour `SOLID::Hull` and
+  /// `HOLE::Hull` depend on when they map over a compound's leaves.
+  #[test]
+  fn primitive_hull_of_a_degenerate_arc_is_none() {
+    let degenerate = Shape::arc(ShapeArc::new(
+      Vec2::new(0, 0),
+      Vec2::new(0, 0),
+      Vec2::new(0, 0),
+      250_000,
+    ));
+
+    assert!(build_hull_for_primitive_shape(&degenerate, 0, 0).is_none());
+  }
+
+  /// The port's own: the `SH_ARC` row of
+  /// `BuildHullForPrimitiveShape` (`pns_utils.cpp:513`) forwards the raw
+  /// clearance and thickness, so it agrees with [`arc_hull`] and not
+  /// with the combined clearance every other branch uses.
+  #[test]
+  fn primitive_hull_of_an_arc_gets_the_raw_arguments() {
+    let arc = ShapeArc::from_center_start_angle(
+      Vec2::new(0, 0),
+      Vec2::new(2_000_000, 0),
+      Degrees::new(90.0),
+      250_000,
+    );
+
+    assert_eq!(
+      build_hull_for_primitive_shape(&Shape::arc(arc), 100_000, 51).unwrap(),
+      arc_hull(&arc, 100_000, 51).unwrap()
+    );
+  }
 
   #[test]
   fn move_diagonal_slides_inwards_to_the_clearance() {
