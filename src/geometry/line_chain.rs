@@ -23,23 +23,34 @@
 //!   unchecked. Callers here use [`LineChain::last_point`],
 //!   [`LineChain::segment`] and, where they are transcribing a KiCad call
 //!   site that passes a negative index, [`LineChain::normalize_index`].
-//! - Milestone 1 has no arcs, so the chain is a plain point vector.
+//! - A chain carries arcs. [`ArcRef`] replaces KiCad's
+//!   `(ssize_t, ssize_t)` pair of arc indices with its `-1` sentinel
+//!   (`slc.h:989`), and it carries the vertex's [`PointRole`] so that
+//!   [`LineChain::is_arc_start`], [`LineChain::is_arc_end`] and
+//!   [`LineChain::is_pt_on_arc`] are field reads rather than point
+//!   comparisons against an arc that `amend_arc` and [`LineChain::slice`]
+//!   can rebuild. Note 09 section 11.1.
 //!
-//! KiCad carries two more vectors that are not here yet. `m_shapes`
-//! (`slc.h:989`) is parallel to `m_points` and says, per vertex, which arc
-//! that vertex belongs to; `m_arcs` (`slc.h:991`) holds the arcs
-//! themselves. Note 01 section 14.3 plans them as a `Vec<ArcRef>` parallel
-//! to the points plus a `Vec<ShapeArc>`, where `ArcRef` is an enum rather
-//! than KiCad's `(ssize_t, ssize_t)` pair with its `-1` sentinel. Every
-//! signature in this module is chosen so that adding those two fields is a
-//! body change and not an API change: nothing returns or takes a point
-//! index that would have to grow an arc companion, [`LineChain::points`]
-//! is the only view into the storage, and the members whose KiCad
-//! counterparts branch on arcs ([`LineChain::set_closed`],
-//! [`LineChain::remove_range`], [`LineChain::slice`],
-//! [`LineChain::split`], [`LineChain::simplify`],
-//! [`LineChain::simplify2`], [`LineChain::length`]) keep KiCad's control
-//! flow so the arc branches can be filled in where KiCad has them.
+//! The arc model, and the four places it departs from KiCad's, all from
+//! `doc/reference/kicad/09-arcs.md` section 11.1.
+//!
+//! - `shapes` is parallel to `points` and `arcs` holds the arcs in **chain
+//!   order**. KiCad relies on that order in `Reverse` (`slc.cpp:926`) and
+//!   breaks it in `Replace( int, int, const SHAPE_LINE_CHAIN& )`
+//!   (`:1071`, erratum E7); [`LineChain::replace_with_chain`] splices the
+//!   incoming arcs into position instead, and the private
+//!   `check_invariants` asserts the order after every mutator in a debug
+//!   build.
+//! - The arcs are only reachable through [`LineChain::live_arcs`], which
+//!   walks the shape entries, so an arc that lost its last reference
+//!   cannot collide and cannot be drawn. KiCad iterates `ArcCount()`
+//!   directly in `Collide` (`:480`, `:873`) and in the preview, which is
+//!   erratum E13.
+//! - [`LineChain::arc`] and [`LineChain::arc_index`] return [`Option`]
+//!   where KiCad's are unchecked (`slc.h:856`, `:864`, erratum E14).
+//! - The role in [`ArcRef::On`] removes the geometric point comparison
+//!   from the predicates, which is what makes erratum E35's unconditional
+//!   wrap in `IsArcEnd( 0 )` (`slc.cpp:3286`) moot.
 //!
 //! `m_accuracy` (`slc.h:994`) is not ported: every constructor sets it to
 //! zero and nothing ever reads it.
@@ -59,8 +70,9 @@
 //! - An editing member, so it belongs with part 1's mutators rather than
 //!   with these queries: `RemoveDuplicatePoints` (`slc.cpp:2720`, called
 //!   from `pcbnew/router/pns_node.cpp:1204`).
-//! - Waiting for the arc vectors: `SelfIntersectingWithArcs`
-//!   (`slc.cpp:2234`) and every member that reads `m_arcs`.
+//! - An arc only path with no router caller, so note 09 section 12 leaves
+//!   it out of the milestone: `SelfIntersectingWithArcs` (`slc.cpp:2234`,
+//!   erratum E16) and `reversedArcIndex` (`slc.h:941`).
 //! - Dead or deliberately dropped: `m_accuracy` (`slc.h:994`), which
 //!   every constructor sets to zero and nothing reads, and the bounding
 //!   box cache with `GenerateBBoxCache` (`slc.h:468`), for the reason
@@ -71,10 +83,175 @@
 
 use std::fmt;
 
+use crate::geometry::arc::ShapeArc;
 use crate::geometry::box2::Box2;
-use crate::geometry::math::rescale;
+use crate::geometry::math::{isqrt, rescale};
 use crate::geometry::seg::{Seg, distance_from_squared};
 use crate::geometry::vec2::{Vec2, Vec2L};
+
+/// Where a vertex sits within the arc it belongs to.
+///
+/// Change 1 of `doc/reference/kicad/09-arcs.md` section 11.1. KiCad has no
+/// counterpart: it answers "is this the arc's first point" by comparing
+/// `arc.GetP0()` with the stored point
+/// (`libs/kimath/src/geometry/shape_line_chain.cpp:3278`) and "is it the
+/// last" by the same against `GetP1()` (`:3299`). Those comparisons are
+/// against a value `amendArc` (`:275`) and `Slice`'s re-cut (`:1456`) can
+/// move, and they are why `IsArcEnd( 0 )` has to wrap unconditionally
+/// (erratum E35). Carrying the role instead makes the three predicates
+/// field reads.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum PointRole {
+  /// The first vertex of the arc's approximation.
+  Start,
+  /// A vertex strictly between the arc's two endpoints.
+  Interior,
+  /// The last vertex of the arc's approximation.
+  End,
+}
+
+/// What one vertex of a chain belongs to.
+///
+/// Replaces the `std::pair<ssize_t, ssize_t>` entries of `m_shapes`,
+/// `libs/kimath/include/geometry/shape_line_chain.h:989`, with their
+/// `SHAPE_IS_PT == -1` sentinel (`:968`). KiCad documents the pair's
+/// invariant in prose, "the second element must always be `SHAPE_IS_PT` if
+/// the first element is `SHAPE_IS_PT`" (`:987`), and `convertArc` has to
+/// re-establish it by hand (`shape_line_chain.cpp:267`). Here it is
+/// unrepresentable.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
+pub enum ArcRef {
+  /// An ordinary polyline vertex, KiCad's `SHAPES_ARE_PT` (`slc.h:970`).
+  #[default]
+  Plain,
+  /// A vertex of exactly one arc's approximation.
+  ///
+  /// KiCad's `{ N, SHAPE_IS_PT }`.
+  On {
+    /// The index into the chain's arcs.
+    arc: usize,
+    /// Where the vertex sits in that arc.
+    role: PointRole,
+  },
+  /// A vertex that ends one arc and starts the next.
+  ///
+  /// KiCad's `{ N, N + 1 }`, the "shared point" of `slc.h:975`.
+  Shared {
+    /// The arc that ends at this vertex, KiCad's `.first`.
+    ends: usize,
+    /// The arc that starts at this vertex, KiCad's `.second`.
+    starts: usize,
+  },
+}
+
+impl ArcRef {
+  /// The arc the segment leaving this vertex lies on.
+  ///
+  /// `None` at a plain vertex and at an arc's last point, where nothing
+  /// continues. KiCad has no such accessor: `ArcIndex` (`slc.h:856`)
+  /// answers with the arc **ending** here instead, which is erratum E11's
+  /// whole class of bug.
+  const fn leaving_arc(self) -> Option<usize> {
+    match self {
+      ArcRef::Plain
+      | ArcRef::On {
+        role: PointRole::End,
+        ..
+      } => None,
+      ArcRef::On { arc, .. } => Some(arc),
+      ArcRef::Shared { starts, .. } => Some(starts),
+    }
+  }
+
+  /// The arc the segment arriving at this vertex lies on.
+  ///
+  /// Port of reading `m_shapes[i].first` directly, which is what
+  /// `IsArcSegment` compares against
+  /// (`libs/kimath/src/geometry/shape_line_chain.cpp:3263`).
+  const fn entering_arc(self) -> Option<usize> {
+    match self {
+      ArcRef::Plain => None,
+      ArcRef::On { arc, .. } => Some(arc),
+      ArcRef::Shared { ends, .. } => Some(ends),
+    }
+  }
+
+  /// KiCad's `ArcIndex`, `libs/kimath/include/geometry/shape_line_chain.h:856`:
+  /// the second half of a shared entry, the first half otherwise.
+  const fn arc_index(self) -> Option<usize> {
+    match self {
+      ArcRef::Plain => None,
+      ArcRef::On { arc, .. } => Some(arc),
+      ArcRef::Shared { starts, .. } => Some(starts),
+    }
+  }
+
+  /// Whether this vertex is the first point of an arc.
+  const fn starts_an_arc(self) -> bool {
+    matches!(
+      self,
+      ArcRef::Shared { .. }
+        | ArcRef::On {
+          role: PointRole::Start,
+          ..
+        }
+    )
+  }
+
+  /// Whether this vertex is the last point of an arc.
+  const fn ends_an_arc(self) -> bool {
+    matches!(
+      self,
+      ArcRef::Shared { .. }
+        | ArcRef::On {
+          role: PointRole::End,
+          ..
+        }
+    )
+  }
+
+  /// The entry with every arc index at or above `first` shifted up by
+  /// `count`.
+  ///
+  /// Port of the renumbering loops KiCad writes inline with
+  /// `alg::run_on_pair`, for instance
+  /// `libs/kimath/src/geometry/shape_line_chain.cpp:1690`.
+  const fn shifted_up_by(self, first: usize, count: usize) -> Self {
+    const fn shift(index: usize, first: usize, count: usize) -> usize {
+      if index >= first { index + count } else { index }
+    }
+
+    match self {
+      ArcRef::Plain => ArcRef::Plain,
+      ArcRef::On { arc, role } => ArcRef::On {
+        arc: shift(arc, first, count),
+        role,
+      },
+      ArcRef::Shared { ends, starts } => ArcRef::Shared {
+        ends: shift(ends, first, count),
+        starts: shift(starts, first, count),
+      },
+    }
+  }
+
+  /// The entry with every arc index shifted up by `offset`.
+  ///
+  /// Port of `fixShapeIndices` in `Append( const SHAPE_LINE_CHAIN& )`,
+  /// `libs/kimath/src/geometry/shape_line_chain.cpp:1558`.
+  const fn offset_by(self, offset: usize) -> Self {
+    match self {
+      ArcRef::Plain => ArcRef::Plain,
+      ArcRef::On { arc, role } => ArcRef::On {
+        arc: arc + offset,
+        role,
+      },
+      ArcRef::Shared { ends, starts } => ArcRef::Shared {
+        ends: ends + offset,
+        starts: starts + offset,
+      },
+    }
+  }
+}
 
 /// Why [`LineChain::slice`] could not produce a subchain.
 ///
@@ -255,14 +432,33 @@ pub struct Collision {
 /// [`LineChain::bbox`] inflates by and what the router copies onto the
 /// segments it commits, and it takes no part in equality.
 ///
-/// The arc vectors described in the module documentation are not here yet.
-/// Milestone 1 routes straight segments only.
+/// Equality compares the points, the shape entries, the arcs, the closed
+/// flag and the width. KiCad has no `operator==` at all and its
+/// `operator!=` ignores arcs, closedness and width (`slc.h:749`, note 01
+/// section 6.8 item 15); nothing in the crate transcribes that comparison.
+/// Two chains over the same points with no arcs compare exactly as they
+/// did before arcs existed, because every shape entry is then
+/// [`ArcRef::Plain`] and both arc vectors are empty.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct LineChain {
   /// The vertices, in chain order.
   ///
   /// Port of `m_points`, `libs/kimath/include/geometry/shape_line_chain.h:973`.
   points: Vec<Vec2>,
+  /// What each vertex belongs to, parallel to `points`.
+  ///
+  /// Port of `m_shapes`,
+  /// `libs/kimath/include/geometry/shape_line_chain.h:989`. The lengths
+  /// are equal at every observable point, which KiCad asserts in a dozen
+  /// places and this module keeps by mutating the two together.
+  shapes: Vec<ArcRef>,
+  /// The arcs, in chain order.
+  ///
+  /// Port of `m_arcs`,
+  /// `libs/kimath/include/geometry/shape_line_chain.h:991`. Chain order is
+  /// an invariant here rather than an accident; see the module
+  /// documentation and erratum E7.
+  arcs: Vec<ShapeArc>,
   /// Whether a closing segment joins the last point back to the first.
   ///
   /// Port of `m_closed`, `libs/kimath/include/geometry/shape_line_chain.h:997`.
@@ -293,6 +489,18 @@ impl LineChain {
   /// why both simplifiers exist (note 01 section 6.5).
   pub const SIMPLIFY2_TOLERANCE: i32 = 1;
 
+  /// The accuracy an arc is approximated at when a chain stores it, in
+  /// nanometres.
+  ///
+  /// Port of `getArcPolygonizationMaxError`,
+  /// `libs/kimath/src/geometry/shape_line_chain.cpp:57`, which is
+  /// `SHAPE_ARC::DefaultAccuracyForPCB() / 5`. It is the default
+  /// [`LineChain::append_arc`] and [`LineChain::slice`] use, matching
+  /// KiCad's `Append( SHAPE_ARC )` (`:1614`) and two argument `Slice`
+  /// (`:1414`).
+  pub const ARC_POLYGONIZATION_MAX_ERROR: i32 =
+    ShapeArc::DEFAULT_ACCURACY_FOR_PCB / 5;
+
   // ---------------------------------------------------------------
   // Construction
   // ---------------------------------------------------------------
@@ -304,6 +512,8 @@ impl LineChain {
   pub const fn new() -> Self {
     Self {
       points: Vec::new(),
+      shapes: Vec::new(),
+      arcs: Vec::new(),
       closed: false,
       width: 0,
     }
@@ -317,8 +527,11 @@ impl LineChain {
   /// trailing point equal to the first, exactly as
   /// [`LineChain::set_closed`] does. The width starts at zero.
   pub fn from_points(points: Vec<Vec2>, closed: bool) -> Self {
+    let shapes = vec![ArcRef::Plain; points.len()];
     let mut chain = Self {
       points,
+      shapes,
+      arcs: Vec::new(),
       closed: false,
       width: 0,
     };
@@ -529,6 +742,320 @@ impl LineChain {
   }
 
   // ---------------------------------------------------------------
+  // Arcs
+  // ---------------------------------------------------------------
+
+  /// The number of arcs the chain stores.
+  ///
+  /// Port of `ArcCount`,
+  /// `libs/kimath/include/geometry/shape_line_chain.h:846`. This counts
+  /// the storage, so it can exceed the number of arcs any vertex still
+  /// refers to; [`LineChain::live_arcs`] is the one that cannot.
+  pub fn arc_count(&self) -> usize {
+    self.arcs.len()
+  }
+
+  /// One stored arc.
+  ///
+  /// Port of `Arc`,
+  /// `libs/kimath/include/geometry/shape_line_chain.h:864`, which is
+  /// unchecked and is the second half of erratum E14. Change 4 of note 09
+  /// section 11.1 asks for the [`Option`].
+  pub fn arc(&self, index: usize) -> Option<ShapeArc> {
+    self.arcs.get(index).copied()
+  }
+
+  /// The arc the shape leaving a vertex belongs to.
+  ///
+  /// Port of `ArcIndex`,
+  /// `libs/kimath/include/geometry/shape_line_chain.h:856`: the second
+  /// half of a shared entry, the first half otherwise. KiCad's is
+  /// unchecked, which is the first half of erratum E14.
+  ///
+  /// Note what this answers at an arc's last point: the arc that **ends**
+  /// there, even when the segment leaving it is straight. That is the
+  /// reading erratum E11 catches the placer relying on; ask
+  /// [`LineChain::is_arc_segment`] instead when the question is "does the
+  /// shape leaving this vertex curve".
+  pub fn arc_index(&self, index: usize) -> Option<usize> {
+    self.shapes.get(index).copied().and_then(ArcRef::arc_index)
+  }
+
+  /// Whether a vertex belongs to any arc.
+  ///
+  /// Port of `IsPtOnArc`,
+  /// `libs/kimath/src/geometry/shape_line_chain.cpp:3240`. True for an
+  /// arc's last point even when the segment leaving that point is
+  /// straight, and bound checked, both as KiCad's is.
+  pub fn is_pt_on_arc(&self, index: usize) -> bool {
+    self
+      .shapes
+      .get(index)
+      .is_some_and(|entry| *entry != ArcRef::Plain)
+  }
+
+  /// Whether a vertex ends one arc and starts the next.
+  ///
+  /// Port of `IsSharedPt`,
+  /// `libs/kimath/src/geometry/shape_line_chain.cpp:3232`.
+  pub fn is_shared_pt(&self, index: usize) -> bool {
+    self
+      .shapes
+      .get(index)
+      .is_some_and(|entry| matches!(entry, ArcRef::Shared { .. }))
+  }
+
+  /// Whether the segment from a vertex to the next one lies on an arc.
+  ///
+  /// Port of `IsArcSegment`,
+  /// `libs/kimath/src/geometry/shape_line_chain.cpp:3246`. Two adjacent
+  /// arcs that do not share a vertex have a genuine straight segment
+  /// between them, which is why the question cannot be answered by
+  /// [`LineChain::is_pt_on_arc`] alone (the comment at `:3248`).
+  ///
+  /// KiCad compares `ArcIndex( s )` with `m_shapes[s + 1].first`. This
+  /// compares the arc leaving this vertex with the arc arriving at the
+  /// next one, which is the same answer without the sentinel. Note 09
+  /// section 11.1 writes the predicate as a bare equality of those two,
+  /// which by itself reports an arc's last point followed by a plain
+  /// point as an arc segment, both sides being absent; the comparison has
+  /// to require an arc on both sides.
+  ///
+  /// The wrap onto index 0 for the closing segment of a closed chain is
+  /// kept with KiCad's guard (`:3257`), because the role decides what the
+  /// next vertex holds but not which vertex is next.
+  pub fn is_arc_segment(&self, segment: usize) -> bool {
+    let Some(entry) = self.shapes.get(segment) else {
+      return false;
+    };
+    let next = segment + 1;
+    let next = if next < self.shapes.len() {
+      next
+    } else if next == self.shapes.len() && self.closed && self.is_shared_pt(0) {
+      0
+    } else {
+      return false;
+    };
+
+    match entry.leaving_arc() {
+      None => false,
+      Some(arc) => self.shapes[next].entering_arc() == Some(arc),
+    }
+  }
+
+  /// Whether a vertex is the first point of an arc.
+  ///
+  /// Port of `IsArcStart`,
+  /// `libs/kimath/src/geometry/shape_line_chain.cpp:3268`, which is
+  /// `IsArcSegment` (and so bound checked through it), then shared, then
+  /// `arc.GetP0() == m_points[i]`. The last test is the role here.
+  pub fn is_arc_start(&self, index: usize) -> bool {
+    self.is_arc_segment(index) && self.shapes[index].starts_an_arc()
+  }
+
+  /// Whether a vertex is the last point of an arc.
+  ///
+  /// Port of `IsArcEnd`,
+  /// `libs/kimath/src/geometry/shape_line_chain.cpp:3282`. The look back
+  /// from index 0 to the last point is unconditional in KiCad, open chain
+  /// or not, which is erratum E35. It is reproduced because it cannot
+  /// change an answer: `is_arc_segment` of the last point of an open chain
+  /// is always false, there being no segment there.
+  pub fn is_arc_end(&self, index: usize) -> bool {
+    let previous = if index == 0 {
+      match self.points.len().checked_sub(1) {
+        Some(last) => last,
+        None => return false,
+      }
+    } else if index > self.points.len() - 1 {
+      return false;
+    } else {
+      index - 1
+    };
+
+    self.is_arc_segment(previous) && self.shapes[index].ends_an_arc()
+  }
+
+  /// Every arc a vertex still refers to, once each, in chain order.
+  ///
+  /// Change 3 of note 09 section 11.1, and the answer to erratum E13:
+  /// neither `Simplify` nor `Simplify2` nor `RemoveDuplicatePoints` ever
+  /// erases from KiCad's `m_arcs`, so an arc that lost every reference
+  /// still collides (`shape_line_chain.cpp:480`, `:873`) and still draws
+  /// (`pcbnew/router/router_preview_item.cpp:278`). Everything in this
+  /// module that consumes arcs goes through here instead.
+  pub fn live_arcs(&self) -> impl Iterator<Item = (usize, &ShapeArc)> {
+    let mut seen: Option<usize> = None;
+
+    self.shapes.iter().filter_map(move |entry| {
+      let index = match entry {
+        ArcRef::Plain => return None,
+        ArcRef::On { arc, .. } => *arc,
+        ArcRef::Shared { ends, starts } => {
+          // The arc ending here was opened by an earlier vertex, so only
+          // the one starting here can be new.
+          let _ = ends;
+          *starts
+        }
+      };
+
+      if seen == Some(index) {
+        return None;
+      }
+
+      seen = Some(index);
+      self.arcs.get(index).map(|arc| (index, arc))
+    })
+  }
+
+  /// The first vertex of the shape after the one starting at a vertex.
+  ///
+  /// Port of `NextShape`,
+  /// `libs/kimath/src/geometry/shape_line_chain.cpp:1302`. A shape is one
+  /// straight segment or one whole arc. `None` is KiCad's `-1`, "no shape
+  /// follows"; the walk never wraps past the last point except for the
+  /// hidden closing segment of a closed chain (`:1350`).
+  ///
+  /// KiCad accepts a negative index and adds `PointCount()` to it once;
+  /// transcribe that with [`LineChain::normalize_index`].
+  pub fn next_shape(&self, index: usize) -> Option<usize> {
+    let last_index = self.points.len().checked_sub(1)?;
+
+    // :1305
+    if index >= last_index {
+      return None;
+    }
+
+    let mut walk = index;
+
+    // :1315
+    if self.shapes[walk] == ArcRef::Plain {
+      if walk == last_index - 1 {
+        return if self.closed { Some(last_index) } else { None };
+      }
+
+      return Some(walk + 1);
+    }
+
+    let arc_start = walk;
+    let current = self.shapes[walk].arc_index()?;
+
+    // :1338, skip the rest of the arc
+    while walk < last_index && self.arc_index(walk) == Some(current) {
+      walk += 1;
+    }
+
+    let still_on_arc = match self.shapes[walk] {
+      ArcRef::Plain => false,
+      ArcRef::On { arc, .. } => arc == current,
+      ArcRef::Shared { ends, starts } => ends == current || starts == current,
+    };
+
+    // :1345, we want the last vertex of the arc if we started at its first
+    if walk - arc_start > 1 && !still_on_arc {
+      walk -= 1;
+    }
+
+    // :1350
+    if walk == last_index {
+      if !self.closed || self.is_arc_segment(walk) {
+        return None;
+      }
+
+      return Some(last_index);
+    }
+
+    Some(walk)
+  }
+
+  /// The number of shapes, counting a whole arc as one.
+  ///
+  /// Port of `ShapeCount`,
+  /// `libs/kimath/src/geometry/shape_line_chain.cpp:1269`, a walk of
+  /// [`LineChain::next_shape`] from vertex zero. A chain of fewer than two
+  /// points has no shapes.
+  pub fn shape_count(&self) -> usize {
+    if self.points.len() < 2 {
+      return 0;
+    }
+
+    let mut count = 1;
+    let mut index = self.next_shape(0);
+
+    while let Some(current) = index {
+      count += 1;
+      index = self.next_shape(current);
+    }
+
+    count
+  }
+
+  /// Remove the whole shape a vertex belongs to.
+  ///
+  /// Port of `RemoveShape`,
+  /// `libs/kimath/src/geometry/shape_line_chain.cpp:1380`. On a plain
+  /// vertex this is [`LineChain::remove`]; on a vertex of an arc it walks
+  /// back to the arc's start and forward through
+  /// [`LineChain::next_shape`], so the whole arc goes. That is why the
+  /// placer's pullback, `tail.RemoveShape( -1 )`
+  /// (`pcbnew/router/pns_line_placer.cpp:244`), drops a whole arc rather
+  /// than one approximation segment.
+  ///
+  /// An index that is not a vertex of the chain is a silent no operation,
+  /// as it is in KiCad (`:1385`). Transcribe KiCad's negative indices with
+  /// [`LineChain::normalize_index`].
+  pub fn remove_shape(&mut self, index: usize) {
+    if index >= self.points.len() {
+      return;
+    }
+
+    if self.shapes[index] == ArcRef::Plain {
+      self.remove(index);
+      return;
+    }
+
+    let mut start = index;
+    let mut end = index;
+    let Some(arc) = self.arc_index(index) else {
+      return;
+    };
+
+    // :1398
+    if !self.is_arc_start(start) {
+      while start > 0 && self.arc_index(start - 1) == Some(arc) {
+        start -= 1;
+      }
+    }
+
+    // :1404
+    if !self.is_arc_end(end) || start == end {
+      end = match self.next_shape(end) {
+        Some(next) => next,
+        // KiCad's `-1` here becomes the last point through `Remove`'s
+        // negative index normalisation (`:1086`).
+        None => self.points.len() - 1,
+      };
+    }
+
+    self.remove_range(start, end);
+  }
+
+  /// Degrade every arc to its polyline.
+  ///
+  /// Port of `ClearArcs`,
+  /// `libs/kimath/src/geometry/shape_line_chain.cpp:949`, which is
+  /// `convertArc` back to front, the one order that needs no renumbering.
+  /// The points stay exactly where they are; only the arc references and
+  /// the arcs go. No caller in `pcbnew/router/`.
+  pub fn clear_arcs(&mut self) {
+    for index in (0..self.arcs.len()).rev() {
+      self.convert_arc(index);
+    }
+
+    self.check_invariants();
+  }
+
+  // ---------------------------------------------------------------
   // Editing
   // ---------------------------------------------------------------
 
@@ -542,6 +1069,8 @@ impl LineChain {
   /// between mouse moves and expects to keep the track width it set.
   pub fn clear(&mut self) {
     self.points.clear();
+    self.shapes.clear();
+    self.arcs.clear();
     self.closed = false;
   }
 
@@ -556,6 +1085,7 @@ impl LineChain {
   pub fn append(&mut self, point: Vec2) {
     if self.points.last() != Some(&point) {
       self.points.push(point);
+      self.shapes.push(ArcRef::Plain);
     }
   }
 
@@ -569,6 +1099,7 @@ impl LineChain {
   /// degenerate two point chain out of one position.
   pub fn append_allow_duplicate(&mut self, point: Vec2) {
     self.points.push(point);
+    self.shapes.push(ArcRef::Plain);
   }
 
   /// Append another chain's points at the end.
@@ -581,17 +1112,194 @@ impl LineChain {
   /// width are ignored, and the merge of a trailing point equal to the
   /// first runs afterwards (`:1606`), which matters when this chain is
   /// closed.
+  ///
+  /// The other chain's arcs are taken over and its arc indices shifted by
+  /// the current arc count (`:1558`). The special case at `:1579` matters:
+  /// when the joining point is dropped as a duplicate and the other
+  /// chain's first segment is an arc segment, the arc reference is grafted
+  /// onto the surviving vertex, which is how two arcs come to share one
+  /// point.
   pub fn append_chain(&mut self, other: &LineChain) {
     if other.points.is_empty() {
       return;
     }
 
+    // :1556
+    let arc_offset = self.arcs.len();
+
+    self.arcs.extend_from_slice(&other.arcs);
+
+    // :1571
     if self.points.is_empty() || self.points.last() != Some(&other.points[0]) {
       self.points.push(other.points[0]);
+      self.shapes.push(other.shapes[0].offset_by(arc_offset));
+    } else if other.is_arc_segment(0) {
+      // :1579, associate the incoming arc with our existing last point.
+      let Some(incoming) = other.shapes[0].entering_arc() else {
+        unreachable!("an arc segment has an entering arc");
+      };
+      let incoming = incoming + arc_offset;
+      let last = self.shapes.len() - 1;
+
+      self.shapes[last] = match self.shapes[last] {
+        ArcRef::Plain => ArcRef::On {
+          arc: incoming,
+          role: PointRole::Start,
+        },
+        ArcRef::On { arc, .. } => ArcRef::Shared {
+          ends: arc,
+          starts: incoming,
+        },
+        // KiCad writes `m_shapes.back().second` unconditionally here, so a
+        // last point that was already shared silently loses the arc that
+        // started at it. That cannot happen: a shared last point means an
+        // arc starts here and has no further vertices.
+        ArcRef::Shared { ends, .. } => ArcRef::Shared {
+          ends,
+          starts: incoming,
+        },
+      };
     }
 
-    self.points.extend_from_slice(&other.points[1..]);
+    // :1588
+    for index in 1..other.points.len() {
+      self.points.push(other.points[index]);
+      self.shapes.push(other.shapes[index].offset_by(arc_offset));
+    }
+
     self.merge_first_last_point_if_needed();
+    self.check_invariants();
+  }
+
+  /// Append an arc, approximated to a given accuracy.
+  ///
+  /// Port of `Append( const SHAPE_ARC&, int aMaxError )`,
+  /// `libs/kimath/src/geometry/shape_line_chain.cpp:1618`. The arc is
+  /// polygonised, and the result is only **tagged** as an arc when it has
+  /// more than two points (`:1620`): a degenerate or nearly flat arc
+  /// silently becomes a plain segment with no entry in the chain's arcs.
+  /// The stored copy always has width zero (`:1624`), which the collision
+  /// members assert.
+  ///
+  /// The points then go through [`LineChain::append_chain`], so the
+  /// duplicate suppression of `Append` applies to the arc's first point
+  /// and the shared point graft at `:1579` applies when this chain already
+  /// ends there.
+  ///
+  /// Pass [`LineChain::ARC_POLYGONIZATION_MAX_ERROR`] for KiCad's one
+  /// argument `Append( const SHAPE_ARC& )` (`:1612`).
+  pub fn append_arc(&mut self, arc: &ShapeArc, max_error: i32) {
+    let mut chain = arc.convert_to_polyline(max_error);
+
+    // :1620
+    if chain.points.len() > 2 {
+      let mut stored = *arc;
+
+      stored.set_width(0);
+      chain.arcs.push(stored);
+
+      let last = chain.points.len() - 1;
+
+      for (index, entry) in chain.shapes.iter_mut().enumerate() {
+        *entry = ArcRef::On {
+          arc: 0,
+          role: if index == 0 {
+            PointRole::Start
+          } else if index == last {
+            PointRole::End
+          } else {
+            PointRole::Interior
+          },
+        };
+      }
+    }
+
+    self.append_chain(&chain);
+  }
+
+  /// Insert an arc before the vertex at an index.
+  ///
+  /// Port of `Insert( size_t aVertex, const SHAPE_ARC&, int aMaxError )`,
+  /// `libs/kimath/src/geometry/shape_line_chain.cpp:1664`. An insertion
+  /// inside an arc splits that arc first, exactly as [`LineChain::insert`]
+  /// does, and the new arc takes its place in the arc vector so that chain
+  /// order holds.
+  ///
+  /// Two deviations from KiCad, both erratum E5.
+  ///
+  /// - KiCad finds the insertion position by walking `m_shapes.rbegin()`
+  ///   to `m_shapes.rend() + aVertex` (`:1674`), which is past the reverse
+  ///   end for any non zero vertex and reads out of bounds. That is an out
+  ///   of bounds read rather than a defined behaviour, so the milestone
+  ///   rule says fix it: this scans the vertices from the insertion point
+  ///   forward and takes the first arc they still refer to, which is the
+  ///   position chain order asks for.
+  /// - KiCad skips the "more than two points" demotion that
+  ///   [`LineChain::append_arc`] applies (`:1620`), so an arc whose
+  ///   polyline is a bare chord still gets an entry and the two arc entry
+  ///   points disagree about what counts as an arc. This applies the rule
+  ///   in both.
+  ///
+  /// # Panics
+  ///
+  /// When `index` is not less than [`LineChain::point_count`], which is
+  /// KiCad's `wxCHECK` at `:1666`.
+  pub fn insert_arc(&mut self, index: usize, arc: &ShapeArc, max_error: i32) {
+    assert!(
+      index < self.points.len(),
+      "insert index {index} is out of range for a chain of {} points",
+      self.points.len()
+    );
+
+    let polyline = arc.convert_to_polyline(max_error);
+
+    // :1620's rule, applied here too.
+    if polyline.points.len() <= 2 {
+      for (offset, point) in polyline.points.iter().enumerate() {
+        self.insert(index + offset, *point);
+      }
+
+      return;
+    }
+
+    // :1671
+    if index > 0 && self.is_pt_on_arc(index) {
+      self.split_arc(index, false);
+    }
+
+    let position = (index..self.shapes.len())
+      .find_map(|vertex| self.shapes[vertex].entering_arc())
+      .unwrap_or(self.arcs.len());
+
+    for entry in &mut self.shapes {
+      *entry = entry.shifted_up_by(position, 1);
+    }
+
+    let mut stored = *arc;
+
+    stored.set_width(0);
+    self.arcs.insert(position, stored);
+
+    let last = polyline.points.len() - 1;
+
+    for (offset, point) in polyline.points.iter().enumerate() {
+      self.points.insert(index + offset, *point);
+      self.shapes.insert(
+        index + offset,
+        ArcRef::On {
+          arc: position,
+          role: if offset == 0 {
+            PointRole::Start
+          } else if offset == last {
+            PointRole::End
+          } else {
+            PointRole::Interior
+          },
+        },
+      );
+    }
+
+    self.check_invariants();
   }
 
   /// Insert a point before the point at an index.
@@ -602,6 +1310,10 @@ impl LineChain {
   /// which means appending through `insert` suppresses a duplicate while
   /// inserting anywhere else does not. That asymmetry is KiCad's, and it
   /// carries a `todo` at `shape_line_chain.cpp:1650` saying so.
+  ///
+  /// An insertion inside an arc splits that arc first (`:1647`), leaving a
+  /// short straight segment between the arc's new end and the inserted
+  /// point, and the inserted vertex itself is always plain.
   ///
   /// # Panics
   ///
@@ -618,7 +1330,14 @@ impl LineChain {
       self.points.len()
     );
 
+    // :1647
+    if index > 0 && self.is_pt_on_arc(index) {
+      self.split_arc(index, false);
+    }
+
     self.points.insert(index, point);
+    self.shapes.insert(index, ArcRef::Plain);
+    self.check_invariants();
   }
 
   /// Remove the point at an index.
@@ -643,9 +1362,15 @@ impl LineChain {
   /// that a trick, because in the arc case it can add a trailing point and
   /// then remove it again. What is observable is the restore: removing
   /// from a closed chain until its last point coincides with its first
-  /// drops that last point. This reproduces the observable result, and
-  /// keeps the open-restore-close shape so that the arc branches have
-  /// somewhere to go.
+  /// drops that last point.
+  ///
+  /// Arcs are handled before any point is erased. An arc the range only
+  /// partially covers is split at the boundary so the surviving half keeps
+  /// its curvature, a boundary index that lands on a shared point is
+  /// pulled in by one so the shared point survives, and every arc fully
+  /// inside the range is degraded to its polyline before the points go.
+  /// Erratum E6 lives in that last step and is reproduced; the comment on
+  /// the loop says what it costs.
   pub fn remove_range(&mut self, start: usize, end: usize) {
     let closed_state = self.closed;
 
@@ -658,8 +1383,80 @@ impl LineChain {
       return;
     }
 
+    let mut start = start;
+    let mut end = end;
+
+    // :1100, cut a partially covered arc free at each end, and step past a
+    // shared point rather than deleting it.
+    if !self.is_arc_start(start) && self.is_pt_on_arc(start) {
+      self.split_arc(start, false);
+    }
+
+    if self.is_shared_pt(start) {
+      start += 1;
+    }
+
+    if !self.is_arc_end(end)
+      && self.is_pt_on_arc(end)
+      && end < self.points.len() - 1
+    {
+      self.split_arc(end + 1, true);
+    }
+
+    if self.is_shared_pt(end) {
+      if end == 0 {
+        self.set_closed(closed_state);
+        return;
+      }
+
+      end -= 1;
+    }
+
+    if start > end {
+      self.set_closed(closed_state);
+      return;
+    }
+
+    // :1118, every arc fully inside the range goes. KiCad collects the
+    // indices into a `std::set<size_t>` and `convertArc`s them in
+    // increasing order while `convertArc` renumbers everything above the
+    // one it erased, so the second call works on a renumbered vector with
+    // a stale index (erratum E6). The removed point range is contiguous,
+    // so the doomed indices are contiguous too, and the net effect is that
+    // every other arc of the range is erased and the ones between are left
+    // behind with every reference to them gone. That is defined behaviour,
+    // so the milestone rule says reproduce it; the ascending order and the
+    // stale indices are KiCad's and the test naming the erratum pins them.
+    let mut doomed: Vec<usize> = Vec::new();
+
+    for index in start..=end {
+      match self.shapes[index] {
+        ArcRef::Plain => {}
+        ArcRef::On { arc, .. } => doomed.push(arc),
+        ArcRef::Shared { ends, starts } => {
+          if index == start {
+            doomed.push(starts);
+          } else if index == end {
+            doomed.push(ends);
+          } else {
+            doomed.push(ends);
+            doomed.push(starts);
+          }
+        }
+      }
+    }
+
+    doomed.sort_unstable();
+    doomed.dedup();
+
+    for arc in doomed {
+      self.convert_arc(arc);
+    }
+
     self.points.drain(start..=end);
+    self.shapes.drain(start..=end);
     self.set_closed(closed_state);
+    self.check_invariants();
   }
 
   /// Replace the inclusive range of points `[start, end]` with one point.
@@ -721,35 +1518,60 @@ impl LineChain {
 
     let mut start = start;
     let mut end = end;
-    let mut new_points = other.points.clone();
+    let mut incoming = other.clone();
 
-    if new_points.is_empty() {
+    if incoming.points.is_empty() {
       self.remove_range(start, end);
       return;
     }
 
-    if new_points[0] == self.points[start] {
+    if incoming.points[0] == self.points[start] {
       start += 1;
-      new_points.remove(0);
+      incoming.remove(0);
 
-      if new_points.is_empty() {
+      if incoming.points.is_empty() {
         self.remove_range(start, end);
         return;
       }
     }
 
-    if new_points[new_points.len() - 1] == self.points[end] && end > 0 {
+    if incoming.points[incoming.points.len() - 1] == self.points[end] && end > 0
+    {
       end -= 1;
-      new_points.pop();
+      incoming.remove(incoming.points.len() - 1);
     }
 
     self.remove_range(start, end);
 
-    if new_points.is_empty() {
+    if incoming.points.is_empty() {
       return;
     }
 
-    self.points.splice(start..start, new_points);
+    // Change 2 of note 09 section 11.1. KiCad appends the incoming arcs at
+    // the end of `m_arcs` whatever position their points took (`:1071`),
+    // which breaks the chain order `Reverse` depends on (erratum E7). The
+    // splice position is the number of arcs whose points end up before the
+    // insertion point, which is the first arc index any surviving vertex
+    // at or after `start` still refers to, or the whole vector when none
+    // does.
+    let splice_at = (start..self.shapes.len())
+      .find_map(|index| self.shapes[index].entering_arc())
+      .unwrap_or(self.arcs.len());
+    let incoming_count = incoming.arcs.len();
+
+    for entry in &mut self.shapes {
+      *entry = entry.shifted_up_by(splice_at, incoming_count);
+    }
+
+    let spliced = incoming
+      .shapes
+      .iter()
+      .map(|entry| entry.offset_by(splice_at));
+
+    self.shapes.splice(start..start, spliced);
+    self.points.splice(start..start, incoming.points);
+    self.arcs.splice(splice_at..splice_at, incoming.arcs);
+    self.check_invariants();
   }
 
   /// The inclusive range of points `[start, end]` as a new chain.
@@ -768,6 +1590,22 @@ impl LineChain {
   /// cannot tell from an empty result; this returns [`SliceError`].
   /// Negative KiCad indices go through [`LineChain::normalize_index`].
   ///
+  /// Arcs survive, and three of KiCad's behaviours around them are worth
+  /// stating because a caller cannot guess them.
+  ///
+  /// - A slice that **starts** inside an arc copies points forward while
+  ///   they belong to that arc, with no `end` bound, and rebuilds the arc
+  ///   from the new start to the parent's own end point (`:1444`,
+  ///   `:1456`). So a range whose two ends are both interior to one arc
+  ///   comes back running past `end` to that arc's end. That is erratum
+  ///   E10 and it is reproduced.
+  /// - A slice that **ends** inside an arc is bounded correctly (`:1491`).
+  /// - A whole arc that fits is re-polygonised through
+  ///   [`LineChain::append_arc`] (`:1519`), so the interior points of the
+  ///   result are not the interior points of the original unless the two
+  ///   accuracies agree. Use [`LineChain::slice_with_max_error`] to say
+  ///   which accuracy.
+  ///
   /// # Errors
   ///
   /// [`SliceError::IndexOutOfRange`] when either endpoint is not a point
@@ -777,6 +1615,28 @@ impl LineChain {
     &self,
     start: usize,
     end: usize,
+  ) -> Result<LineChain, SliceError> {
+    self.slice_with_max_error(start, end, Self::ARC_POLYGONIZATION_MAX_ERROR)
+  }
+
+  /// The inclusive range of points `[start, end]` as a new chain, naming
+  /// the accuracy a whole arc is re-polygonised at.
+  ///
+  /// Port of `Slice( int, int, int aMaxError )`,
+  /// `libs/kimath/src/geometry/shape_line_chain.cpp:1417`.
+  /// [`LineChain::slice`] is the two argument form, which passes
+  /// [`LineChain::ARC_POLYGONIZATION_MAX_ERROR`] as KiCad's does
+  /// (`:1414`). Everything else about the two is identical; see
+  /// [`LineChain::slice`] for the arc behaviour.
+  ///
+  /// # Errors
+  ///
+  /// As [`LineChain::slice`].
+  pub fn slice_with_max_error(
+    &self,
+    start: usize,
+    end: usize,
+    max_error: i32,
   ) -> Result<LineChain, SliceError> {
     let point_count = self.points.len();
 
@@ -798,11 +1658,142 @@ impl LineChain {
       return Err(SliceError::EndBeforeStart { start, end });
     }
 
-    Ok(Self {
-      points: self.points[start..=end].to_vec(),
-      closed: false,
-      width: 0,
-    })
+    let mut result = LineChain::new();
+    let mut start = start;
+
+    // :1437, the slice begins in the middle of an arc.
+    if self.is_arc_segment(start) && !self.is_arc_start(start) {
+      let Some(parent_index) = self.arc_index(start) else {
+        unreachable!("an arc segment has an arc index");
+      };
+      let Some(parent) = self.arc(parent_index) else {
+        unreachable!("an arc index names a stored arc");
+      };
+      let new_start = self.points[start];
+      let mut walk = start;
+
+      // :1444, no `end` bound: erratum E10.
+      while walk < self.points.len()
+        && self.arc_index(walk) == Some(parent_index)
+      {
+        result.points.push(self.points[walk]);
+        result.shapes.push(ArcRef::On {
+          arc: 0,
+          role: PointRole::Interior,
+        });
+        walk += 1;
+      }
+
+      // :1456
+      result.arcs.push(ShapeArc::from_start_end_center(
+        new_start,
+        parent.end(),
+        parent.center(),
+        !parent.is_ccw(),
+        0,
+      ));
+      result.mark_arc_run_roles(0);
+
+      // :1463
+      start += result.points.len();
+    }
+
+    // :1466
+    let mut index = start;
+
+    while index <= end && index < point_count {
+      let next_shape = self.next_shape(index);
+      let is_last_shape = next_shape.is_none();
+
+      if self.is_arc_start(index) {
+        // :1476
+        if (is_last_shape && end != point_count - 1)
+          || next_shape.is_some_and(|next| next > end)
+        {
+          if index == end {
+            // :1481, a single point of an arc, appended plain.
+            result.append(self.points[index]);
+            return Ok(result);
+          }
+
+          // :1487, the slice ends in the middle of this arc.
+          let Some(parent_index) = self.arc_index(index) else {
+            unreachable!("an arc start has an arc index");
+          };
+          let Some(parent) = self.arc(parent_index) else {
+            unreachable!("an arc index names a stored arc");
+          };
+          let first_result_arc = result.arcs.len();
+
+          // :1492
+          while index <= end && index < point_count {
+            if self.arc_index(index) != Some(parent_index) {
+              break;
+            }
+
+            result.points.push(self.points[index]);
+            result.shapes.push(ArcRef::On {
+              arc: first_result_arc,
+              role: PointRole::Interior,
+            });
+            index += 1;
+          }
+
+          // :1503
+          result.arcs.push(ShapeArc::from_start_end_center(
+            parent.start(),
+            self.points[end],
+            parent.center(),
+            !parent.is_ccw(),
+            0,
+          ));
+          result.mark_arc_run_roles(first_result_arc);
+          result.check_invariants();
+
+          return Ok(result);
+        }
+
+        // :1517, the whole arc fits.
+        let Some(parent_index) = self.arc_index(index) else {
+          unreachable!("an arc start has an arc index");
+        };
+        let Some(parent) = self.arc(parent_index) else {
+          unreachable!("an arc index names a stored arc");
+        };
+
+        result.append_arc(&parent, max_error);
+
+        if is_last_shape {
+          result.check_invariants();
+          return Ok(result);
+        }
+      } else {
+        // :1526
+        if index == start {
+          result.append(self.points[index]);
+        }
+
+        let next_is_arc =
+          next_shape.is_some_and(|next| self.is_arc_segment(next));
+
+        // :1534
+        if !next_is_arc && index < self.segment_count() && index < end {
+          result.append(self.segment(index).b);
+        }
+      }
+
+      match next_shape {
+        // :1470, `NextShape` reached the end.
+        None => {
+          result.check_invariants();
+          return Ok(result);
+        }
+        Some(next) => index = next,
+      }
+    }
+
+    result.check_invariants();
+    Ok(result)
   }
 
   /// Insert a vertex at the point of the chain closest to `point`.
@@ -828,6 +1819,13 @@ impl LineChain {
   /// segment whose own endpoint is the query point is skipped (`:1197`),
   /// which is what stops the split from producing a slightly concave
   /// corner.
+  ///
+  /// Splitting **on an arc segment** does not degrade the arc: the point
+  /// is inserted carrying the arc's index and `splitArc` then makes it a
+  /// shared vertex (`:1219`), so one arc becomes two that meet there. Both
+  /// halves are rebuilt through `ConstructFromStartEndCenter`, which is
+  /// lossy (note 09 section 1.2), so neither half reports exactly the
+  /// parent's centre.
   pub fn split(&mut self, point: Vec2) -> Option<usize> {
     let found_index = self.find(point, 0);
     let mut candidate: Option<usize> = None;
@@ -859,7 +1857,27 @@ impl LineChain {
 
     let new_index = index + 1;
 
-    self.insert(new_index, point);
+    // :1217
+    if self.is_arc_segment(index) {
+      let Some(arc) = self.arc_index(index) else {
+        unreachable!("an arc segment has an arc index");
+      };
+
+      self.points.insert(new_index, point);
+      self.shapes.insert(
+        new_index,
+        ArcRef::On {
+          arc,
+          role: PointRole::Interior,
+        },
+      );
+      // :1224, make the inserted point a shared point.
+      self.split_arc(new_index, true);
+      self.check_invariants();
+    } else {
+      self.insert(new_index, point);
+    }
+
     Some(new_index)
   }
 
@@ -868,8 +1886,51 @@ impl LineChain {
   /// KiCad has no in place reverse; `Reverse`
   /// (`libs/kimath/src/geometry/shape_line_chain.cpp:910`) copies. The
   /// closed flag and the width survive, as they do in the copy.
+  ///
+  /// The shape entries and the arcs reverse with the points, every arc
+  /// index is remapped to `arc_count - index - 1`, the two halves of a
+  /// shared vertex swap, and each arc is reversed in place (`:940`). The
+  /// remap is only a correct reversal while the arcs are in chain order,
+  /// which is the invariant this module enforces and KiCad's `Replace`
+  /// breaks (erratum E7).
+  ///
+  /// KiCad reverses each arc with `SHAPE_ARC::Reverse()`, which swaps the
+  /// two endpoints in place and leaves the cached centre and bounding box
+  /// stale (erratum E4). [`ShapeArc`] caches nothing, so the port has
+  /// nothing to go stale and the two forms agree here.
   pub fn reverse(&mut self) {
     self.points.reverse();
+    self.shapes.reverse();
+    self.arcs.reverse();
+
+    let arc_count = self.arcs.len();
+    let remap = |index: usize| arc_count - index - 1;
+
+    for entry in &mut self.shapes {
+      *entry = match *entry {
+        ArcRef::Plain => ArcRef::Plain,
+        ArcRef::On { arc, role } => ArcRef::On {
+          arc: remap(arc),
+          role: match role {
+            PointRole::Start => PointRole::End,
+            PointRole::Interior => PointRole::Interior,
+            PointRole::End => PointRole::Start,
+          },
+        },
+        // :939, first and second swap, which is what keeps `.first` the
+        // arc that ends here.
+        ArcRef::Shared { ends, starts } => ArcRef::Shared {
+          ends: remap(starts),
+          starts: remap(ends),
+        },
+      };
+    }
+
+    for arc in &mut self.arcs {
+      arc.reverse();
+    }
+
+    self.check_invariants();
   }
 
   /// A copy with the point order reversed.
@@ -890,10 +1951,15 @@ impl LineChain {
   /// Translate every point.
   ///
   /// Port of `Move`,
-  /// `libs/kimath/include/geometry/shape_line_chain.h:776`.
+  /// `libs/kimath/include/geometry/shape_line_chain.h:776`, which
+  /// translates the points and the arcs alike. Exact in both.
   pub fn move_by(&mut self, delta: Vec2) {
     for point in &mut self.points {
       *point += delta;
+    }
+
+    for arc in &mut self.arcs {
+      arc.move_by(delta);
     }
   }
 
@@ -902,10 +1968,14 @@ impl LineChain {
   /// Deviation from `SetPoint`,
   /// `libs/kimath/src/geometry/shape_line_chain.cpp:1362`, which wraps a
   /// negative or over range index one step the way `CPoint` does. This
-  /// panics instead, for the reason given on [`LineChain::point`]. Once
-  /// arcs exist this also has to destroy any arc touching the point, which
-  /// KiCad does at `:1371`; there is no operation that moves an arc
-  /// endpoint.
+  /// panics instead, for the reason given on [`LineChain::point`].
+  ///
+  /// Every arc touching the vertex is destroyed (`:1371`): there is no
+  /// operation that moves an arc endpoint, and the router uses `splitArc`
+  /// and [`LineChain::slice`] instead. The destruction is a degradation
+  /// rather than an erasure, as it is in KiCad: the arc's approximation
+  /// points all stay where they are and only the references and the arc
+  /// itself go.
   ///
   /// # Panics
   ///
@@ -918,6 +1988,21 @@ impl LineChain {
     );
 
     self.points[index] = point;
+
+    // :1371. KiCad runs `convertArc` over both halves of the entry, but
+    // the lambda reads the live pair and `convertArc` rewrites it: after
+    // the first call the entry's second half is already the sentinel, so
+    // the second call does nothing. At a shared vertex only the arc
+    // **ending** there is destroyed and the one starting there survives
+    // with a start point that no longer matches. That is defined, so it is
+    // reproduced rather than tidied.
+    match self.shapes[index] {
+      ArcRef::Plain => {}
+      ArcRef::On { arc, .. } => self.convert_arc(arc),
+      ArcRef::Shared { ends, .. } => self.convert_arc(ends),
+    }
+
+    self.check_invariants();
   }
 
   /// Reflect every point in an axis.
@@ -928,9 +2013,18 @@ impl LineChain {
   /// (`pcbnew/router/pns_meander.cpp:685`). KiCad's other overload, which
   /// mirrors about a horizontal or vertical line through a reference
   /// point (`:974`), has no caller in the router and is not ported.
+  ///
+  /// The arcs are mirrored with the points and the chain is **not**
+  /// reversed, so a mirrored closed chain winds the other way round. That
+  /// is KiCad's behaviour and note 01 section 12.4 records what depends on
+  /// the winding.
   pub fn mirror(&mut self, axis: &Seg) {
     for point in &mut self.points {
       *point = axis.reflect_point(*point);
+    }
+
+    for arc in &mut self.arcs {
+      arc.mirror(axis);
     }
   }
 
@@ -973,10 +2067,23 @@ impl LineChain {
   /// nanometre before it is added, so the sum is not the length of the
   /// exact polyline; that is what the router compares walkaround
   /// candidates by, so it is reproduced.
+  ///
+  /// Segments that lie on an arc are skipped and each arc contributes its
+  /// own `f64` length instead, truncated into the running total. This is
+  /// the **only** arc aware length in the router (note 09 section 2.7).
+  /// KiCad sums over `ArcCount()`, which counts an orphaned arc too
+  /// (erratum E13); this sums over [`LineChain::live_arcs`], so an arc no
+  /// vertex refers to adds nothing.
   pub fn length(&self) -> i64 {
-    (0..self.segment_count())
+    let straight: i64 = (0..self.segment_count())
+      .filter(|index| !self.is_arc_segment(*index))
       .map(|index| i64::from(self.segment(index).length()))
-      .sum()
+      .sum();
+
+    let curved: i64 =
+      self.live_arcs().map(|(_, arc)| arc.length() as i64).sum();
+
+    straight + curved
   }
 
   /// The distance from the start of the chain to a point on it.
@@ -998,6 +2105,10 @@ impl LineChain {
   ///
   /// KiCad accumulates in an `int`. This accumulates in an `i64` so a long
   /// path cannot overflow, and returns `None` where KiCad returns `-1`.
+  ///
+  /// **Polyline only, deliberately.** KiCad's is arc unaware and so is this: it
+  /// sums straight segment lengths whatever the segments lie on
+  /// (`shape_line_chain.cpp:1952`). Note 09 section 2.5.
   pub fn path_length(
     &self,
     point: Vec2,
@@ -1049,6 +2160,11 @@ impl LineChain {
   /// [`Vec2::resize`] reverses the direction for a negative length and
   /// the first segment always passes the `total + l >= path_length`
   /// test; that is KiCad's behaviour too, and no caller passes one.
+  ///
+  /// **Polyline only, deliberately.** KiCad's is arc unaware and so is this: a
+  /// point a given distance along a chain with an arc is that distance along the
+  /// polyline, which is shorter than the arc by the sagitta error
+  /// (`shape_line_chain.cpp:2671`). Note 09 section 2.5.
   pub fn point_along(&self, path_length: i64) -> Option<Vec2> {
     // :2675
     if path_length == 0 {
@@ -1121,6 +2237,14 @@ impl LineChain {
   /// its seam and lose its first vertex, while an open one always keeps
   /// its first and last.
   ///
+  /// Arcs survive. A run may not step **over** a vertex that belongs to an
+  /// arc (`:2816`), so no approximation point is ever dropped, but the
+  /// comment at `:2813` is explicit that a run may start or end on one, so
+  /// a straight run abutting an arc still collapses. The arcs themselves
+  /// are untouched, which means a chain can come out of here with an arc
+  /// no vertex refers to; [`LineChain::live_arcs`] is what keeps that from
+  /// mattering (erratum E13).
+  ///
   /// This is where [`LineChain::simplify2`] differs, and the difference is
   /// deliberate; see that method.
   pub fn simplify(&mut self, tolerance: i32) {
@@ -1131,10 +2255,12 @@ impl LineChain {
     }
 
     let mut new_points: Vec<Vec2> = Vec::with_capacity(point_count);
+    let mut new_shapes: Vec<ArcRef> = Vec::with_capacity(point_count);
     let mut start_index = 0usize;
 
     while start_index < point_count {
       new_points.push(self.points[start_index]);
+      new_shapes.push(self.shapes[start_index]);
 
       // An open chain must keep its last two points, so there is nothing
       // left to reach past (`shape_line_chain.cpp:2799`).
@@ -1152,6 +2278,12 @@ impl LineChain {
         let mut test_index = (start_index + 1) % point_count;
 
         while test_index != end_index {
+          // :2816, an intermediate vertex on an arc stops the run.
+          if self.is_pt_on_arc(test_index) {
+            can_simplify = false;
+            break;
+          }
+
           if !test_segment_hit(
             self.points[test_index],
             self.points[start_index],
@@ -1187,15 +2319,19 @@ impl LineChain {
     // A single point is not a line (`shape_line_chain.cpp:2856`).
     if new_points.len() == 1 {
       new_points.push(self.points[point_count - 1]);
+      new_shapes.push(self.shapes[point_count - 1]);
     }
 
     if !self.closed
       && self.points[point_count - 1] != new_points[new_points.len() - 1]
     {
       new_points.push(self.points[point_count - 1]);
+      new_shapes.push(self.shapes[point_count - 1]);
     }
 
     self.points = new_points;
+    self.shapes = new_shapes;
+    self.check_invariants();
   }
 
   /// The legacy simplifier the optimizer runs on.
@@ -1221,6 +2357,16 @@ impl LineChain {
   /// duplicate of the first point is removed and nothing is checked for
   /// colinearity. The router calls the no colinear form once, from
   /// `pcbnew/router/pns_line.cpp:660`.
+  ///
+  /// Two vertices at the same position merge only when their shape entries
+  /// agree or one of them is plain, and the surviving entry is the non
+  /// plain one (`:2934`). The colinear stage checks that the run's first
+  /// two vertices are plain before it starts (`:2968`) but does **not**
+  /// re-check as the run advances (`:2971`), so a shallow arc whose
+  /// consecutive approximation points sit within a nanometre of the chord
+  /// can lose interior points while its arc entry survives, leaving the
+  /// chain claiming an arc across a run that no longer approximates it.
+  /// That is erratum E12 and it is reproduced.
   pub fn simplify2(&mut self, remove_colinear: bool) {
     if self.points.len() < 3 {
       return;
@@ -1235,26 +2381,14 @@ impl LineChain {
     }
 
     // Stage 1, `shape_line_chain.cpp:2928`: collapse runs of equal points.
-    let mut unique: Vec<Vec2> = Vec::with_capacity(self.points.len());
-    let mut index = 0usize;
-
-    while index < self.points.len() {
-      let mut next = index + 1;
-
-      while next < self.points.len() && self.points[index] == self.points[next]
-      {
-        next += 1;
-      }
-
-      unique.push(self.points[index]);
-      index = next;
-    }
+    let (unique, unique_shapes) = self.merged_duplicate_points();
 
     // Stage 2, `shape_line_chain.cpp:2963`: collapse colinear runs.
     let unique_count = unique.len();
     let limit = unique_count.saturating_sub(2);
 
     self.points.clear();
+    self.shapes.clear();
 
     let mut index = 0usize;
 
@@ -1262,7 +2396,12 @@ impl LineChain {
       let first = unique[index];
       let mut reach = index;
 
-      if remove_colinear {
+      // :2968, both ends of the run have to start out plain. The run
+      // extension below never looks at a shape entry again, which is E12.
+      if remove_colinear
+        && unique_shapes[index] == ArcRef::Plain
+        && unique_shapes[index + 1] == ArcRef::Plain
+      {
         while reach < limit
           && (Seg::new(first, unique[reach + 2])
             .line_distance(unique[reach + 1])
@@ -1275,6 +2414,7 @@ impl LineChain {
       }
 
       self.points.push(first);
+      self.shapes.push(unique_shapes[index]);
 
       if reach > index {
         index = reach;
@@ -1282,6 +2422,8 @@ impl LineChain {
 
       if reach == limit {
         self.points.push(unique[unique_count - 1]);
+        self.shapes.push(unique_shapes[unique_count - 1]);
+        self.check_invariants();
         return;
       }
 
@@ -1290,9 +2432,12 @@ impl LineChain {
 
     if unique_count > 1 {
       self.points.push(unique[unique_count - 2]);
+      self.shapes.push(unique_shapes[unique_count - 2]);
     }
 
     self.points.push(unique[unique_count - 1]);
+    self.shapes.push(unique_shapes[unique_count - 1]);
+    self.check_invariants();
   }
 
   /// Collapse runs of consecutive equal vertices.
@@ -1321,22 +2466,50 @@ impl LineChain {
       return;
     }
 
+    let (unique, unique_shapes) = self.merged_duplicate_points();
+
+    self.points = unique;
+    self.shapes = unique_shapes;
+    self.check_invariants();
+  }
+
+  /// Stage one of [`LineChain::simplify2`], shared with
+  /// [`LineChain::remove_duplicate_points`].
+  ///
+  /// Port of `libs/kimath/src/geometry/shape_line_chain.cpp:2928` and the
+  /// identical loop at `:2739`. Two vertices at the same position merge
+  /// only when their shape entries agree or one of them is plain, and the
+  /// entry that survives is the non plain one, so a duplicate of an arc's
+  /// endpoint does not cost the arc its reference.
+  fn merged_duplicate_points(&self) -> (Vec<Vec2>, Vec<ArcRef>) {
     let mut unique: Vec<Vec2> = Vec::with_capacity(self.points.len());
+    let mut unique_shapes: Vec<ArcRef> = Vec::with_capacity(self.points.len());
     let mut index = 0usize;
 
     while index < self.points.len() {
       let mut next = index + 1;
 
-      while next < self.points.len() && self.points[index] == self.points[next]
+      while next < self.points.len()
+        && self.points[index] == self.points[next]
+        && (self.shapes[index] == self.shapes[next]
+          || self.shapes[index] == ArcRef::Plain
+          || self.shapes[next] == ArcRef::Plain)
       {
         next += 1;
       }
 
+      let mut keep = self.shapes[index];
+
+      if keep == ArcRef::Plain {
+        keep = self.shapes[next - 1];
+      }
+
       unique.push(self.points[index]);
+      unique_shapes.push(keep);
       index = next;
     }
 
-    self.points = unique;
+    (unique, unique_shapes)
   }
 
   /// Whether two chains describe the same simplified geometry.
@@ -1393,6 +2566,11 @@ impl LineChain {
   /// with `std::sort`, which is not stable, so hits at equal distance come
   /// out in an unspecified order; this sorts stably, so equal distances
   /// keep chain order, which `DESIGN.md` section 8 requires.
+  ///
+  /// **Polyline only, deliberately.** KiCad's is arc unaware and so is this: an
+  /// arc reaches it as its stored approximation, which is what
+  /// `PNS::HullIntersection` and therefore the whole walkaround sees
+  /// (`shape_line_chain.cpp:1741`). Note 09 section 2.5.
   pub fn intersect_seg(&self, seg: &Seg) -> Vec<Intersection> {
     let segment_min_x = seg.a.x.min(seg.b.x);
     let segment_max_x = seg.a.x.max(seg.b.x);
@@ -1472,6 +2650,10 @@ impl LineChain {
   ///
   /// KiCad's `aChainBBox` parameter, a precomputed bounding box for the
   /// other chain, is not ported: no router call site passes it.
+  ///
+  /// **Polyline only, deliberately.** KiCad's is arc unaware and so is this: both
+  /// chains reach it as their stored approximations
+  /// (`shape_line_chain.cpp:1841`). Note 09 section 2.5.
   pub fn intersect_chain(
     &self,
     other: &LineChain,
@@ -1626,6 +2808,10 @@ impl LineChain {
   /// records included and asks whether anything came back. The diff pair
   /// placer uses it to reject a candidate pair whose two lines meet
   /// (`pcbnew/router/pns_diff_pair.cpp:257`).
+  ///
+  /// **Polyline only, deliberately.** KiCad's is arc unaware and so is this: it
+  /// is [`LineChain::intersect_chain`] with an early exit
+  /// (`shape_line_chain.cpp:2610`). Note 09 section 2.5.
   pub fn intersects_chain(&self, other: &LineChain) -> bool {
     !self.intersect_chain(other, true).is_empty()
   }
@@ -1659,6 +2845,11 @@ impl LineChain {
   ///
   /// The arc exact `SelfIntersectingWithArcs` (`:2234`) is not ported:
   /// there are no arcs yet and the router never calls it.
+  ///
+  /// **Polyline only, deliberately.** KiCad's is arc unaware and so is this:
+  /// KiCad has an arc aware `SelfIntersectingWithArcs`
+  /// (`shape_line_chain.cpp:2234`) and the router never calls it, using this one
+  /// at all three of its sites (erratum E16). Note 09 section 2.5.
   pub fn self_intersecting(&self) -> Option<Intersection> {
     let segment_count = self.segment_count();
 
@@ -1757,7 +2948,12 @@ impl LineChain {
     let mut closest_squared = i64::MAX;
     let mut nearest = Vec2::new(0, 0);
 
+    // :445, the polyline phase skips the approximation of every arc.
     for index in 0..self.segment_count() {
+      if self.is_arc_segment(index) {
+        continue;
+      }
+
       let segment = self.segment(index);
       let projected = segment.nearest_point_to_point(point);
       let squared = projected.widening_sub(point).squared_euclidean_norm();
@@ -1779,6 +2975,20 @@ impl LineChain {
         actual: distance_from_squared(closest_squared),
         location: nearest,
       });
+    }
+
+    // :479, then the arcs, exactly, and the first one that collides wins.
+    // KiCad walks `ArcCount()`, which is what lets an orphaned arc collide
+    // (erratum E13); this walks [`LineChain::live_arcs`].
+    for (_, arc) in self.live_arcs() {
+      debug_assert_eq!(arc.width(), 0, "a chain stores zero width arcs");
+
+      if let Some(collision) = arc.collide_point(point, clearance) {
+        return Some(Collision {
+          actual: collision.actual,
+          location: collision.location,
+        });
+      }
     }
 
     None
@@ -1816,7 +3026,12 @@ impl LineChain {
     let mut closest_squared = i64::MAX;
     let mut nearest = Vec2::new(0, 0);
 
+    // :836, the polyline phase skips the approximation of every arc.
     for index in 0..self.segment_count() {
+      if self.is_arc_segment(index) {
+        continue;
+      }
+
       let segment = self.segment(index);
       let squared = segment.squared_distance_to_segment(seg);
 
@@ -1835,6 +3050,33 @@ impl LineChain {
     if closest_squared == 0 || closest_squared < clearance_squared {
       return Some(Collision {
         actual: distance_from_squared(closest_squared),
+        location: nearest,
+      });
+    }
+
+    // :870, the polyline's best distance carries into the arc phase so an
+    // arc can only improve on it. KiCad keeps it in a `SEG::ecoord`, wide
+    // enough to hold the square root of the `ECOORD_MAX` a chain of
+    // nothing but arc segments leaves behind; this keeps the same width
+    // rather than narrowing to the `i32` the other paths use.
+    let mut closest_distance = isqrt(closest_squared.max(0) as u64) as i64;
+
+    // :873, again the live arcs rather than KiCad's `ArcCount()`.
+    for (_, arc) in self.live_arcs() {
+      debug_assert_eq!(arc.width(), 0, "a chain stores zero width arcs");
+
+      if let Some(collision) = arc.collide_seg(seg, clearance)
+        && i64::from(collision.actual) < closest_distance
+      {
+        closest_distance = i64::from(collision.actual);
+        nearest = collision.location;
+      }
+    }
+
+    // :894
+    if closest_distance == 0 || closest_distance < i64::from(clearance) {
+      return Some(Collision {
+        actual: i32::try_from(closest_distance).unwrap_or(i32::MAX),
         location: nearest,
       });
     }
@@ -1892,19 +3134,32 @@ impl LineChain {
   /// going to the earlier segment, and the answer is that segment's
   /// nearest point.
   ///
-  /// KiCad's `aAllowInternalShapePoints` is not ported. Its whole body is
-  /// inside `if( !aAllowInternalShapePoints )` and every branch of it is
-  /// guarded by `IsArcSegment( nearest )` (`:2425` to `:2452`), so it
-  /// snaps to arc endpoints and does nothing at all on an arc free chain.
-  /// It has to come back with the arc vectors; the router passes both
-  /// values (`pcbnew/router/pns_shove.cpp:359` passes `true`,
-  /// `pcbnew/router/pns_helpers.cpp:98` passes `false`).
+  /// `allow_internal_shape_points` is KiCad's `aAllowInternalShapePoints`,
+  /// which defaults to `true` (`shape_line_chain.h:894`). Clearing it asks
+  /// for the answer to be **snapped to an arc endpoint** when the winning
+  /// segment lies on an arc: advance to the nearer of that segment's two
+  /// endpoints, return it when it is itself an arc start or end, and
+  /// otherwise return the nearer of the containing arc's two true
+  /// endpoints (`:2425` to `:2452`). On a chain with no arcs the flag
+  /// changes nothing.
+  ///
+  /// Erratum E14 is the `nearest++` at `:2433` reaching `PointCount()`,
+  /// after which KiCad calls the unchecked `ArcIndex` and `Arc`. It is
+  /// only reachable on a closed chain whose last segment is an arc
+  /// segment, which the router does not build. [`LineChain::arc_index`]
+  /// and [`LineChain::arc`] return [`Option`] here (change 4 of note 09
+  /// section 11.1), so the read is checked and the answer falls back to
+  /// the unsnapped nearest point.
   ///
   /// Returns `None` for an empty chain, where KiCad returns `(0, 0)` with
   /// the comment that the only right answer is not to crash (`:2406`). A
   /// chain of one point answers with that point, which is what KiCad's
   /// failed `wxCHECK` in `Segment` degrades to (`:1293`).
-  pub fn nearest_point(&self, point: Vec2) -> Option<Vec2> {
+  pub fn nearest_point(
+    &self,
+    point: Vec2,
+    allow_internal_shape_points: bool,
+  ) -> Option<Vec2> {
     let first_point = *self.points.first()?;
     let segment_count = self.segment_count();
 
@@ -1924,7 +3179,44 @@ impl LineChain {
       }
     }
 
-    Some(self.segment(nearest).nearest_point_to_point(point))
+    let unsnapped = self.segment(nearest).nearest_point_to_point(point);
+
+    // :2424
+    if allow_internal_shape_points
+      || nearest == 0
+      || nearest >= self.points.len()
+      || !self.is_arc_segment(nearest)
+    {
+      return Some(unsnapped);
+    }
+
+    let segment = self.segment(nearest);
+    let to_start = segment.a.widening_sub(point);
+    let to_end = segment.b.widening_sub(point);
+
+    // :2432
+    if to_start.euclidean_norm() > to_end.euclidean_norm() {
+      nearest += 1;
+    }
+
+    // :2435
+    if self.is_arc_start(nearest) || self.is_arc_end(nearest) {
+      return Some(self.points[nearest]);
+    }
+
+    // :2441. E14 is the unchecked read here.
+    let Some(arc) = self.arc_index(nearest).and_then(|index| self.arc(index))
+    else {
+      return Some(unsnapped);
+    };
+
+    if arc.start().widening_sub(point).euclidean_norm()
+      > arc.end().widening_sub(point).euclidean_norm()
+    {
+      Some(arc.end())
+    } else {
+      Some(arc.start())
+    }
   }
 
   /// The vertex of the chain that is nearest to the infinite line through
@@ -2034,6 +3326,10 @@ impl LineChain {
   /// widens to `i64` throughout. The straddle test bounds the numerator
   /// by the denominator, so `d` fits in an `i32` whenever it is used, and
   /// no in range chain can see a difference.
+  ///
+  /// **Polyline only, deliberately.** KiCad's is arc unaware and so is this:
+  /// containment is decided against the stored approximation
+  /// (`shape_line_chain.cpp:3060`). Note 09 section 2.5.
   pub fn point_inside(&self, point: Vec2, accuracy: i32) -> bool {
     let point_count = self.points.len();
 
@@ -2202,6 +3498,10 @@ impl LineChain {
   /// which way the chain winds, and the negation at `:2718` is what makes
   /// a clockwise chain in screen coordinates, where y grows downwards,
   /// come out **positive**.
+  ///
+  /// **Polyline only, deliberately.** KiCad's is arc unaware and so is this: the
+  /// shoelace sum runs over the points (`shape_line_chain.cpp:2696`). Note 09
+  /// section 2.5.
   pub fn area(&self, absolute: bool) -> f64 {
     if !self.closed {
       return 0.0;
@@ -2271,13 +3571,24 @@ impl LineChain {
   /// KiCad's `Find` answers `-1` and the `Slice` calls that follow read
   /// it as a wrapped index. The snap puts both points on the chain, so
   /// the case is not reachable through this API.
+  ///
+  /// Note 09 section 11.3 lists this among the polyline only members, and
+  /// that holds of its own body only: it has no arc logic. Everything it
+  /// calls is arc aware, in KiCad as here, so a range cut out of an arc
+  /// bearing chain comes back carrying arcs. `NearestPoint` is called with
+  /// `aAllowInternalShapePoints` cleared (`:2882`), so a point that lands
+  /// on an arc is pulled to that arc's nearer end before the chain is cut
+  /// there.
   pub fn split_three_way(
     &self,
     start: Vec2,
     end: Vec2,
   ) -> Option<(LineChain, LineChain, LineChain)> {
-    let end_on_chain = self.nearest_point(end)?;
-    let start_on_chain = self.nearest_point(start)?;
+    // :2882, both snaps clear `aAllowInternalShapePoints`, so a point
+    // that lands on an arc is pulled to that arc's nearer end before the
+    // chain is cut there.
+    let end_on_chain = self.nearest_point(end, false)?;
+    let start_on_chain = self.nearest_point(start, false)?;
 
     let mut working = self.clone();
 
@@ -2310,18 +3621,488 @@ impl LineChain {
   /// Port of `mergeFirstLastPointIfNeeded`,
   /// `libs/kimath/src/geometry/shape_line_chain.cpp:214`. Closing a chain
   /// of more than one point whose last point equals its first drops that
-  /// last point. KiCad's other branch, which duplicates point 0 at the end
-  /// when an open chain starts on a vertex shared between two arcs
-  /// (`:233`), cannot fire without arcs and is where the arc case goes.
+  /// last point, and when that last point was on an arc the arc reference
+  /// moves onto vertex zero, which becomes the shared vertex of the seam
+  /// (`:220`). Opening a chain whose vertex zero is shared is the mirror
+  /// image: vertex zero is duplicated at the end and the two halves are
+  /// split between them (`:234`).
   fn merge_first_last_point_if_needed(&mut self) {
-    if !self.closed {
+    if self.closed {
+      if self.points.len() > 1
+        && self.points[0] == self.points[self.points.len() - 1]
+      {
+        let last = self.points.len() - 1;
+
+        // :220
+        if let Some(arriving) = self.shapes[last].arc_index() {
+          self.shapes[0] = match self.shapes[0] {
+            ArcRef::Plain => ArcRef::On {
+              arc: arriving,
+              role: PointRole::End,
+            },
+            ArcRef::On { arc, .. } => ArcRef::Shared {
+              ends: arriving,
+              starts: arc,
+            },
+            // KiCad writes `.second = .first` and then `.first = arriving`
+            // unconditionally, which on an already shared vertex zero
+            // drops the arc that used to end there. Vertex zero can only
+            // be shared on a chain that is already closed, and this branch
+            // runs while closing one, so the case is not reachable.
+            ArcRef::Shared { starts, .. } => ArcRef::Shared {
+              ends: arriving,
+              starts,
+            },
+          };
+        }
+
+        self.points.pop();
+        self.shapes.pop();
+        self.fix_indices_rotation();
+      }
+
       return;
     }
 
-    if self.points.len() > 1
-      && self.points[0] == self.points[self.points.len() - 1]
-    {
-      self.points.pop();
+    // :234
+    if self.points.len() > 1 && self.is_shared_pt(0) {
+      let ArcRef::Shared { ends, starts } = self.shapes[0] else {
+        unreachable!("a shared point holds two arcs");
+      };
+
+      self.points.push(self.points[0]);
+      self.shapes.push(ArcRef::On {
+        arc: ends,
+        role: PointRole::End,
+      });
+      self.shapes[0] = ArcRef::On {
+        arc: starts,
+        role: PointRole::Start,
+      };
+    }
+  }
+
+  /// Rotate the chain so that no arc straddles the seam.
+  ///
+  /// Port of `fixIndicesRotation`,
+  /// `libs/kimath/src/geometry/shape_line_chain.cpp:191`, which rotates
+  /// right while vertex zero is on an arc without being that arc's start,
+  /// with a rotation count guard against an infinite loop on a malformed
+  /// chain (`:207`). The rotation is what keeps the chain order invariant
+  /// meaningful for a closed chain.
+  fn fix_indices_rotation(&mut self) {
+    if self.shapes.len() <= 1 {
+      return;
+    }
+
+    let mut rotations = 0usize;
+
+    while self.arc_index(0).is_some() && !self.is_arc_start(0) {
+      self.points.rotate_right(1);
+      self.shapes.rotate_right(1);
+
+      rotations += 1;
+
+      if rotations > self.shapes.len() {
+        return;
+      }
+    }
+  }
+
+  /// Degrade one arc to its polyline.
+  ///
+  /// Port of `convertArc`,
+  /// `libs/kimath/src/geometry/shape_line_chain.cpp:246`: every reference
+  /// to the arc is cleared, every higher reference is decremented, and the
+  /// arc is erased. **The points stay**, so the arc's approximation
+  /// survives as an ordinary polyline. An index past the end is a no
+  /// operation, as it is in KiCad (`:251`).
+  fn convert_arc(&mut self, arc_index: usize) {
+    if arc_index >= self.arcs.len() {
+      return;
+    }
+
+    for entry in &mut self.shapes {
+      *entry = match *entry {
+        ArcRef::Plain => ArcRef::Plain,
+        ArcRef::On { arc, role } => {
+          if arc == arc_index {
+            ArcRef::Plain
+          } else {
+            ArcRef::On {
+              arc: if arc > arc_index { arc - 1 } else { arc },
+              role,
+            }
+          }
+        }
+        ArcRef::Shared { ends, starts } => {
+          let ends_gone = ends == arc_index;
+          let starts_gone = starts == arc_index;
+          let shift = |index: usize| {
+            if index > arc_index { index - 1 } else { index }
+          };
+
+          match (ends_gone, starts_gone) {
+            (true, true) => ArcRef::Plain,
+            // :267, KiCad re-establishes "second is a point whenever first
+            // is" with a swap; the enum does it by construction.
+            (true, false) => ArcRef::On {
+              arc: shift(starts),
+              role: PointRole::Start,
+            },
+            (false, true) => ArcRef::On {
+              arc: shift(ends),
+              role: PointRole::End,
+            },
+            (false, false) => ArcRef::Shared {
+              ends: shift(ends),
+              starts: shift(starts),
+            },
+          }
+        }
+      };
+    }
+
+    self.arcs.remove(arc_index);
+  }
+
+  /// Rebuild one arc between two new endpoints about its own centre.
+  ///
+  /// Port of `amendArc`,
+  /// `libs/kimath/src/geometry/shape_line_chain.cpp:275`, which passes the
+  /// old arc's centre and handedness to `ConstructFromStartEndCenter`.
+  /// Both survive the call only as far as note 09 section 1.2 says they
+  /// do: the rebuilt arc keeps nothing but its three points, and the
+  /// centre it reports afterwards is recomputed from them.
+  fn amend_arc(&mut self, arc_index: usize, start: Vec2, end: Vec2) {
+    let Some(arc) = self.arc(arc_index) else {
+      return;
+    };
+
+    self.arcs[arc_index] = ShapeArc::from_start_end_center(
+      start,
+      end,
+      arc.center(),
+      !arc.is_ccw(),
+      0,
+    );
+  }
+
+  /// Cut an arc at one of its interior vertices.
+  ///
+  /// Port of `splitArc`,
+  /// `libs/kimath/src/geometry/shape_line_chain.cpp:292`. With
+  /// `coincident` the vertex becomes a shared point and the one arc
+  /// becomes two that meet there. Without it the arc is shortened to end
+  /// at the **previous** vertex, so a short straight segment is left
+  /// between that vertex and this one.
+  ///
+  /// Nothing to do when the vertex is already an arc start that is not
+  /// shared, or when it is not on an arc at all (`:297`, `:300`).
+  fn split_arc(&mut self, point_index: usize, coincident: bool) {
+    if !self.is_shared_pt(point_index) && self.is_arc_start(point_index) {
+      return;
+    }
+
+    if !self.is_pt_on_arc(point_index) {
+      return;
+    }
+
+    if point_index >= self.shapes.len() {
+      return;
+    }
+
+    // :308, the vertex already ends an arc.
+    if self.is_shared_pt(point_index) || self.is_arc_end(point_index) {
+      if coincident || point_index == 0 {
+        return;
+      }
+
+      let Some(first_arc) = self.shapes[point_index].entering_arc() else {
+        unreachable!("an arc end has an entering arc");
+      };
+      let Some(arc) = self.arc(first_arc) else {
+        return;
+      };
+      let new_end = self.points[point_index - 1];
+
+      self.amend_arc(first_arc, arc.start(), new_end);
+
+      self.shapes[point_index] = match self.shapes[point_index] {
+        ArcRef::Shared { starts, .. } => ArcRef::On {
+          arc: starts,
+          role: PointRole::Start,
+        },
+        _ => ArcRef::Plain,
+      };
+      self.mark_arc_run_roles(first_arc);
+
+      return;
+    }
+
+    // KiCad reads `m_points[aPtIndex - 1]` below without guarding
+    // `aPtIndex == 0` (`:345`). The vertex would have to be interior to an
+    // arc while being the chain's first point, which no mutator here
+    // produces, so the guard costs nothing and removes the underflow.
+    if !coincident && point_index == 0 {
+      return;
+    }
+
+    let Some(current_index) = self.arc_index(point_index) else {
+      return;
+    };
+    let Some(current) = self.arc(current_index) else {
+      return;
+    };
+
+    // :345
+    let first_half_end = if coincident {
+      self.points[point_index]
+    } else {
+      self.points[point_index - 1]
+    };
+    let second_half_start = self.points[point_index];
+    let first_half = ShapeArc::from_start_end_center(
+      current.start(),
+      first_half_end,
+      current.center(),
+      !current.is_ccw(),
+      0,
+    );
+    let second_half = ShapeArc::from_start_end_center(
+      second_half_start,
+      current.end(),
+      current.center(),
+      !current.is_ccw(),
+      0,
+    );
+
+    // :352, the first half would have no points of its own.
+    if !coincident && self.arc_index(point_index - 1) != Some(current_index) {
+      self.arcs[current_index] = second_half;
+      self.mark_arc_run_roles(current_index);
+
+      return;
+    }
+
+    self.arcs[current_index] = first_half;
+    self.arcs.insert(current_index + 1, second_half);
+
+    let mut first_of_second_half = point_index;
+
+    if coincident {
+      self.shapes[point_index] = ArcRef::Shared {
+        ends: current_index,
+        starts: current_index + 1,
+      };
+      first_of_second_half += 1;
+    }
+
+    // :366, only the second half of the point range is renumbered.
+    for index in first_of_second_half..self.shapes.len() {
+      self.shapes[index] = match self.shapes[index] {
+        ArcRef::Plain => ArcRef::Plain,
+        ArcRef::On { arc, role } => ArcRef::On { arc: arc + 1, role },
+        ArcRef::Shared { ends, starts } => ArcRef::Shared {
+          ends: ends + 1,
+          starts: starts + 1,
+        },
+      };
+    }
+
+    self.mark_arc_run_roles(current_index);
+    self.mark_arc_run_roles(current_index + 1);
+  }
+
+  /// Give the run of vertices that refer to one arc their roles.
+  ///
+  /// There is no KiCad counterpart, because KiCad reads the roles back off
+  /// the arc's own endpoints every time it needs them
+  /// (`libs/kimath/src/geometry/shape_line_chain.cpp:3278`, `:3299`).
+  /// Change 1 of note 09 section 11.1 stores them instead, so every mutator
+  /// that cuts or renumbers a run has to restate them.
+  fn mark_arc_run_roles(&mut self, arc_index: usize) {
+    let mut first: Option<usize> = None;
+    let mut last: Option<usize> = None;
+
+    for index in 0..self.shapes.len() {
+      let touches = match self.shapes[index] {
+        ArcRef::Plain => false,
+        ArcRef::On { arc, .. } => arc == arc_index,
+        ArcRef::Shared { ends, starts } => {
+          ends == arc_index || starts == arc_index
+        }
+      };
+
+      if touches {
+        first.get_or_insert(index);
+        last = Some(index);
+      }
+    }
+
+    let (Some(first), Some(last)) = (first, last) else {
+      return;
+    };
+
+    for index in first..=last {
+      if let ArcRef::On { arc, .. } = self.shapes[index]
+        && arc == arc_index
+      {
+        self.shapes[index] = ArcRef::On {
+          arc,
+          role: if index == first {
+            PointRole::Start
+          } else if index == last {
+            PointRole::End
+          } else {
+            PointRole::Interior
+          },
+        };
+      }
+    }
+  }
+
+  /// Check what this module promises about its own storage.
+  ///
+  /// Change 2 of note 09 section 11.1 asks for this, and every mutator
+  /// calls it. It is a debug assertion, so a release build pays nothing.
+  ///
+  /// Four things are checked: the shape vector is as long as the point
+  /// vector, every arc index names a stored arc, the vertices that refer
+  /// to one arc form a contiguous run whose ends carry the right roles,
+  /// and the arcs a vertex refers to appear in the arc vector in chain
+  /// order. The last is the invariant `Reverse` depends on and KiCad's
+  /// `Replace( int, int, const SHAPE_LINE_CHAIN& )` breaks (erratum E7).
+  ///
+  /// Deliberately **not** checked: that an arc's stored endpoints equal
+  /// the chain points at the ends of its run. `SetPoint` moves a vertex
+  /// out from under an arc that survives (see its documentation), and a
+  /// run rebuilt through `ConstructFromStartEndCenter` keeps the points it
+  /// was given, so the agreement is not an invariant in KiCad either.
+  fn check_invariants(&self) {
+    if !cfg!(debug_assertions) {
+      return;
+    }
+
+    assert_eq!(
+      self.points.len(),
+      self.shapes.len(),
+      "a chain holds one shape entry per point"
+    );
+
+    for entry in &self.shapes {
+      match *entry {
+        ArcRef::Plain => {}
+        ArcRef::On { arc, .. } => {
+          assert!(arc < self.arcs.len(), "arc index {arc} is out of range");
+        }
+        ArcRef::Shared { ends, starts } => {
+          assert!(
+            ends < self.arcs.len() && starts < self.arcs.len(),
+            "arc index out of range at a shared point"
+          );
+        }
+      }
+    }
+
+    let point_count = self.points.len();
+    let mut run_start_of: Vec<Option<usize>> = vec![None; self.arcs.len()];
+
+    // Each arc's vertices form one run, and the run's ends carry the roles
+    // the predicates read. A closed chain's run may cross the seam, which
+    // is exactly the shape `mergeFirstLastPointIfNeeded` builds when it
+    // folds a duplicated endpoint onto vertex zero.
+    for (arc, run_start) in run_start_of.iter_mut().enumerate() {
+      let touches: Vec<bool> = self
+        .shapes
+        .iter()
+        .map(|entry| match *entry {
+          ArcRef::Plain => false,
+          ArcRef::On { arc: on, .. } => on == arc,
+          ArcRef::Shared { ends, starts } => ends == arc || starts == arc,
+        })
+        .collect();
+
+      let mut starts: Vec<usize> = Vec::new();
+
+      for index in 0..point_count {
+        if !touches[index] {
+          continue;
+        }
+
+        let previous_touches = if index > 0 {
+          touches[index - 1]
+        } else {
+          self.closed && touches[point_count - 1]
+        };
+
+        if !previous_touches {
+          starts.push(index);
+        }
+      }
+
+      if touches.iter().all(|touched| !touched) {
+        // An orphan, which `live_arcs` never yields.
+        continue;
+      }
+
+      if starts.is_empty() {
+        // Every vertex is on this arc and the chain is closed, so the run
+        // has no beginning; that is a full circle stored as one arc.
+        assert!(
+          self.closed && touches.iter().all(|touched| *touched),
+          "arc {arc} is referred to by a broken run of vertices"
+        );
+        *run_start = Some(0);
+        continue;
+      }
+
+      assert_eq!(
+        starts.len(),
+        1,
+        "arc {arc} is referred to by {} separate runs of vertices",
+        starts.len()
+      );
+
+      let first = starts[0];
+      let mut last = first;
+
+      while touches[(last + 1) % point_count]
+        && (last + 1) % point_count != first
+      {
+        last = (last + 1) % point_count;
+      }
+
+      assert!(
+        self.shapes[first].starts_an_arc(),
+        "the first vertex of arc {arc} does not start it"
+      );
+      // A run of one vertex cannot both start and end its arc, and
+      // `splitArc` produces exactly that when it shortens an arc down to
+      // its own first point (`shape_line_chain.cpp:352`). KiCad's
+      // predicates read the same way there: the vertex is the arc's `P0`
+      // and `IsArcSegment` is false, so it is neither a start nor an end.
+      assert!(
+        first == last || self.shapes[last].ends_an_arc(),
+        "the last vertex of arc {arc} does not end it"
+      );
+
+      *run_start = Some(first);
+    }
+
+    // Chain order: the arcs appear in the arc vector in the order their
+    // runs start. Orphans are skipped, nothing being able to reach them.
+    let mut previous: Option<usize> = None;
+
+    for first in run_start_of.iter().flatten() {
+      if let Some(previous) = previous {
+        assert!(
+          previous <= *first,
+          "the arcs are not in chain order: {previous} then {first}"
+        );
+      }
+
+      previous = Some(*first);
     }
   }
 }
@@ -2585,7 +4366,10 @@ impl PointInsideTracker {
 
 #[cfg(test)]
 mod tests {
+  use proptest::prelude::*;
+
   use super::*;
+  use crate::geometry::math::Degrees;
 
   /// A shorthand for the KiCad test cases, which spell out coordinates.
   fn point(x: i32, y: i32) -> Vec2 {
@@ -3067,6 +4851,9 @@ mod tests {
     assert_eq!(chain, before);
   }
 
+  /// Mirror of `ReplaceChain`, `test_shape_line_chain.cpp:1216`. The
+  /// KiCad case carries no arcs; the arc side of the same member is
+  /// `replace_with_chain_splices_arcs_into_chain_order_erratum_e7`.
   #[test]
   fn replace_chain_reproduces_the_kicad_crash_case_8949() {
     // Verbatim from `test_shape_line_chain.cpp:1216`.
@@ -4432,15 +6219,15 @@ mod tests {
     let chain =
       LineChain::from_slice(&[point(0, 0), point(10, 0), point(10, 10)], false);
 
-    assert_eq!(chain.nearest_point(point(20, 5)), Some(point(10, 5)));
-    assert_eq!(chain.nearest_point(point(-5, -5)), Some(point(0, 0)));
+    assert_eq!(chain.nearest_point(point(20, 5), true), Some(point(10, 5)));
+    assert_eq!(chain.nearest_point(point(-5, -5), true), Some(point(0, 0)));
 
     // A chain of one point answers with that point, an empty one with
     // nothing.
     let single = LineChain::from_slice(&[point(7, 7)], false);
 
-    assert_eq!(single.nearest_point(point(0, 0)), Some(point(7, 7)));
-    assert_eq!(LineChain::new().nearest_point(point(0, 0)), None);
+    assert_eq!(single.nearest_point(point(0, 0), true), Some(point(7, 7)));
+    assert_eq!(LineChain::new().nearest_point(point(0, 0), true), None);
   }
 
   #[test]
@@ -4898,5 +6685,2372 @@ mod tests {
     ));
 
     assert!(tracker.is_inside());
+  }
+
+  // -----------------------------------------------------------------
+  // Arcs
+  // -----------------------------------------------------------------
+
+  /// The accuracy every arc case of `test_shape_line_chain.cpp` appends
+  /// at, `ARC_HIGH_DEF` (`include/base_units.h:137`).
+  const ARC_HIGH_DEF: i32 = ShapeArc::DEFAULT_ACCURACY_FOR_PCB;
+
+  /// KiCad's `GEOM_TEST::IsOutlineValid`,
+  /// `qa/tests/libs/kimath/geometry/geom_test_utils.h:206`: every vertex
+  /// that claims an arc lies on it, each arc is referred to by one
+  /// contiguous run, and each run begins and ends on the arc's own
+  /// endpoints.
+  fn is_outline_valid(chain: &LineChain) -> bool {
+    if chain.point_count() > 0 && !chain.is_closed() && chain.is_shared_pt(0) {
+      return false;
+    }
+
+    let mut previous: Option<usize> = None;
+    let mut tested: Vec<usize> = Vec::new();
+
+    for index in 0..chain.point_count() {
+      let current = chain.arc_index(index);
+
+      if let Some(arc_index) = current {
+        if previous != current && tested.contains(&arc_index) {
+          return false;
+        }
+
+        let Some(arc) = chain.arc(arc_index) else {
+          return false;
+        };
+
+        if arc
+          .collide_point(chain.point(index), ShapeArc::DEFAULT_ACCURACY_FOR_PCB)
+          .is_none()
+        {
+          return false;
+        }
+
+        tested.push(arc_index);
+      }
+
+      if previous != current {
+        if let Some(previous_index) = previous {
+          let to_test = if chain.is_shared_pt(index) {
+            chain.point(index)
+          } else {
+            chain.point(index - 1)
+          };
+          let Some(arc) = chain.arc(previous_index) else {
+            return false;
+          };
+
+          if arc.end() != to_test {
+            return false;
+          }
+        }
+
+        if let Some(arc_index) = current {
+          let Some(arc) = chain.arc(arc_index) else {
+            return false;
+          };
+
+          if arc.start() != chain.point(index) {
+            return false;
+          }
+        }
+      }
+
+      previous = current;
+    }
+
+    true
+  }
+
+  /// KiCad's `SLC_CASES` fixture,
+  /// `qa/tests/libs/kimath/geometry/test_shape_line_chain.cpp:34` to
+  /// `:119`.
+  struct SlcCases {
+    circle_one_arc: LineChain,
+    circle_two_arcs: LineChain,
+    arcs_coincident: LineChain,
+    arcs_coincident_closed: LineChain,
+    arcs_independent: LineChain,
+    duplicate_arcs: LineChain,
+    arcs_and_seg_mixed: LineChain,
+    arc_and_point: LineChain,
+    seg_and_arc_coincident: LineChain,
+    empty_chain: LineChain,
+    one_point: LineChain,
+    two_points: LineChain,
+    three_points: LineChain,
+  }
+
+  impl SlcCases {
+    fn new() -> Self {
+      let arc_circle = ShapeArc::new(
+        point(183_450_000, 128_360_000),
+        point(183_850_000, 128_360_000),
+        point(183_450_000, 128_360_000),
+        0,
+      );
+      let arc_0a = ShapeArc::new(
+        point(183_450_000, 128_360_000),
+        point(183_650_000, 128_560_000),
+        point(183_850_000, 128_360_000),
+        0,
+      );
+      let arc_0b = ShapeArc::new(
+        point(183_850_000, 128_360_000),
+        point(183_650_000, 128_160_000),
+        point(183_450_000, 128_360_000),
+        0,
+      );
+      let arc_1 = ShapeArc::new(
+        point(183_850_000, 128_360_000),
+        point(183_638_550, 128_640_305),
+        point(183_500_000, 129_204_974),
+        0,
+      );
+      let arc_2 = ShapeArc::new(
+        point(283_450_000, 228_360_000),
+        point(283_650_000, 228_560_000),
+        point(283_850_000, 228_360_000),
+        0,
+      );
+      let arc_3 = ShapeArc::new(
+        point(0, 0),
+        point(24_142_136, 10_000_000),
+        point(0, 20_000_000),
+        0,
+      );
+
+      let mut circle_one_arc = LineChain::new();
+
+      circle_one_arc.append_arc(&arc_circle, ARC_HIGH_DEF);
+      circle_one_arc.set_closed(true);
+
+      let mut circle_two_arcs = LineChain::new();
+
+      circle_two_arcs.append_arc(&arc_0a, ARC_HIGH_DEF);
+      circle_two_arcs.append_arc(&arc_0b, ARC_HIGH_DEF);
+      circle_two_arcs.set_closed(true);
+
+      let mut arcs_coincident = LineChain::new();
+
+      arcs_coincident.append_arc(&arc_0a, ARC_HIGH_DEF);
+      arcs_coincident.append_arc(&arc_1, ARC_HIGH_DEF);
+
+      let mut arcs_coincident_closed = arcs_coincident.clone();
+
+      arcs_coincident_closed.set_closed(true);
+
+      let mut arcs_independent = LineChain::new();
+
+      arcs_independent.append_arc(&arc_0a, ARC_HIGH_DEF);
+      arcs_independent.append_arc(&arc_2, ARC_HIGH_DEF);
+
+      let mut duplicate_arcs = arcs_coincident.clone();
+
+      duplicate_arcs.append_arc(&arc_1, ARC_HIGH_DEF);
+
+      let mut arc_and_point = LineChain::new();
+
+      arc_and_point.append_arc(&arc_0a, ARC_HIGH_DEF);
+      arc_and_point.append(point(233_450_000, 228_360_000));
+
+      let mut arcs_and_seg_mixed = arc_and_point.clone();
+
+      arcs_and_seg_mixed.append_arc(&arc_2, ARC_HIGH_DEF);
+
+      let mut one_point = LineChain::new();
+
+      one_point.append(point(233_450_000, 228_360_000));
+
+      let mut two_points = one_point.clone();
+
+      two_points.append(point(263_450_000, 258_360_000));
+
+      let mut three_points = two_points.clone();
+
+      three_points.append(point(263_450_000, 308_360_000));
+
+      let mut seg_and_arc_coincident = LineChain::new();
+
+      seg_and_arc_coincident.append(point(0, 20_000_000));
+      seg_and_arc_coincident.append_arc(&arc_3, ARC_HIGH_DEF);
+
+      Self {
+        circle_one_arc,
+        circle_two_arcs,
+        arcs_coincident,
+        arcs_coincident_closed,
+        arcs_independent,
+        duplicate_arcs,
+        arcs_and_seg_mixed,
+        arc_and_point,
+        seg_and_arc_coincident,
+        empty_chain: LineChain::new(),
+        one_point,
+        two_points,
+        three_points,
+      }
+    }
+  }
+
+  /// Mirror of `ShapeCount`, `test_shape_line_chain.cpp:599`.
+  #[test]
+  fn shape_count_counts_a_whole_arc_as_one() {
+    let cases = SlcCases::new();
+
+    assert_eq!(cases.circle_one_arc.shape_count(), 1);
+    assert_eq!(cases.circle_two_arcs.shape_count(), 2);
+    assert_eq!(cases.arcs_coincident.shape_count(), 2);
+    assert_eq!(cases.arcs_coincident_closed.shape_count(), 3);
+    assert_eq!(cases.duplicate_arcs.shape_count(), 4);
+    assert_eq!(cases.arc_and_point.shape_count(), 2);
+    assert_eq!(cases.arcs_and_seg_mixed.shape_count(), 4);
+    assert_eq!(cases.seg_and_arc_coincident.shape_count(), 2);
+    assert_eq!(cases.empty_chain.shape_count(), 0);
+    assert_eq!(cases.one_point.shape_count(), 0);
+    assert_eq!(cases.two_points.shape_count(), 1);
+    assert_eq!(cases.three_points.shape_count(), 2);
+  }
+
+  /// Mirror of `NextShape`, `test_shape_line_chain.cpp:616`.
+  ///
+  /// KiCad's rows that pass a negative or out of range index are written
+  /// here through [`LineChain::normalize_index`], which is where this port
+  /// puts that normalisation.
+  #[test]
+  fn next_shape_walks_one_whole_shape_at_a_time() {
+    let cases = SlcCases::new();
+
+    assert_eq!(cases.circle_one_arc.next_shape(0), None);
+
+    assert_eq!(cases.circle_two_arcs.next_shape(0), Some(8));
+    assert_eq!(cases.circle_two_arcs.next_shape(8), None);
+
+    assert_eq!(cases.arcs_coincident.next_shape(0), Some(8));
+    assert_eq!(cases.arcs_coincident.next_shape(8), None);
+
+    assert_eq!(cases.arcs_coincident_closed.next_shape(0), Some(8));
+    assert_eq!(cases.arcs_coincident_closed.next_shape(8), Some(13));
+    assert_eq!(cases.arcs_coincident_closed.next_shape(13), None);
+
+    assert_eq!(cases.arcs_independent.next_shape(0), Some(8));
+    assert_eq!(cases.arcs_independent.next_shape(8), Some(9));
+    assert_eq!(cases.arcs_independent.next_shape(9), None);
+
+    assert_eq!(cases.duplicate_arcs.next_shape(0), Some(8));
+    assert_eq!(cases.duplicate_arcs.next_shape(8), Some(13));
+    assert_eq!(cases.duplicate_arcs.next_shape(13), Some(14));
+    assert_eq!(cases.duplicate_arcs.next_shape(14), None);
+
+    assert_eq!(cases.arc_and_point.next_shape(0), Some(8));
+    assert_eq!(cases.arc_and_point.next_shape(8), None);
+
+    assert_eq!(cases.arcs_and_seg_mixed.next_shape(0), Some(8));
+    assert_eq!(cases.arcs_and_seg_mixed.next_shape(8), Some(9));
+    assert_eq!(cases.arcs_and_seg_mixed.next_shape(9), Some(10));
+    assert_eq!(cases.arcs_and_seg_mixed.next_shape(10), None);
+    assert_eq!(cases.arcs_and_seg_mixed.next_shape(20), None);
+    assert_eq!(cases.arcs_and_seg_mixed.normalize_index(-50), None);
+
+    assert_eq!(cases.seg_and_arc_coincident.next_shape(0), Some(1));
+    assert_eq!(cases.seg_and_arc_coincident.next_shape(1), None);
+
+    assert_eq!(cases.empty_chain.next_shape(0), None);
+    assert_eq!(cases.empty_chain.next_shape(1), None);
+    assert_eq!(cases.empty_chain.normalize_index(-2), None);
+
+    assert_eq!(cases.one_point.next_shape(0), None);
+    assert_eq!(cases.one_point.next_shape(1), None);
+    assert_eq!(
+      cases
+        .one_point
+        .normalize_index(-1)
+        .map(|index| cases.one_point.next_shape(index)),
+      Some(None)
+    );
+
+    assert_eq!(cases.two_points.next_shape(0), None);
+    assert_eq!(cases.two_points.next_shape(1), None);
+
+    assert_eq!(cases.three_points.next_shape(0), Some(1));
+    assert_eq!(cases.three_points.next_shape(1), None);
+    assert_eq!(cases.three_points.next_shape(2), None);
+  }
+
+  /// Mirror of `AppendArc`, `test_shape_line_chain.cpp:675`.
+  ///
+  /// The six cases are all about the demotion rule at
+  /// `shape_line_chain.cpp:1620`: an approximation of two points or fewer
+  /// is not tagged as an arc.
+  #[test]
+  fn append_arc_demotes_an_arc_that_polygonises_to_two_points() {
+    // Case 1: arc mid point nearly collinear.
+    let mut chain = LineChain::new();
+
+    chain.append_arc(
+      &ShapeArc::new(point(100_000, 0), point(0, 2499), point(-100_000, 0), 0),
+      ARC_HIGH_DEF,
+    );
+    assert!(is_outline_valid(&chain));
+    assert_eq!(chain.arc_count(), 0);
+    assert_eq!(chain.point_count(), 2);
+    assert_eq!(chain.point(0), point(100_000, 0));
+    assert_eq!(chain.point(1), point(-100_000, 0));
+
+    // Case 2: a large circle.
+    let mut chain = LineChain::new();
+
+    chain.append_arc(
+      &ShapeArc::new(point(100_000, 0), point(0, 0), point(100_000, 0), 0),
+      ARC_HIGH_DEF,
+    );
+    assert!(is_outline_valid(&chain));
+    assert_eq!(chain.arc_count(), 1);
+    assert_eq!(chain.point_count(), 10);
+    assert_eq!(chain.point(0), point(100_000, 0));
+    assert_eq!(chain.point(9), point(100_000, 0));
+
+    // Case 3: a circle small enough to approximate to a point.
+    let mut chain = LineChain::new();
+
+    chain.append_arc(
+      &ShapeArc::new(point(2499, 0), point(0, 0), point(2499, 0), 0),
+      ARC_HIGH_DEF,
+    );
+    assert!(is_outline_valid(&chain));
+    assert_eq!(chain.arc_count(), 0);
+    assert_eq!(chain.point_count(), 1);
+    assert_eq!(chain.point(0), point(2499, 0));
+
+    // Case 3 again in KiCad's numbering: a small arc, approximated to a
+    // segment.
+    let mut chain = LineChain::new();
+
+    chain.append_arc(
+      &ShapeArc::new(point(1767, 0), point(2499, 2499), point(0, 1767), 0),
+      ARC_HIGH_DEF,
+    );
+    assert!(is_outline_valid(&chain));
+    assert_eq!(chain.arc_count(), 0);
+    assert_eq!(chain.point_count(), 2);
+    assert_eq!(chain.point(0), point(1767, 0));
+    assert_eq!(chain.point(1), point(0, 1767));
+
+    // Case 4: a null arc, all three points coincident.
+    let mut chain = LineChain::new();
+
+    chain.append_arc(
+      &ShapeArc::new(point(2499, 0), point(2499, 0), point(2499, 0), 0),
+      ARC_HIGH_DEF,
+    );
+    assert!(is_outline_valid(&chain));
+    assert_eq!(chain.arc_count(), 0);
+    assert_eq!(chain.point_count(), 1);
+    assert_eq!(chain.point(0), point(2499, 0));
+
+    // Case 5: an infinite radius, all three points very close.
+    let mut chain = LineChain::new();
+
+    chain.append_arc(
+      &ShapeArc::new(point(2499, 0), point(2500, 0), point(2501, 0), 0),
+      ARC_HIGH_DEF,
+    );
+    assert!(is_outline_valid(&chain));
+    assert_eq!(chain.arc_count(), 0);
+    assert_eq!(chain.point_count(), 2);
+    assert_eq!(chain.point(0), point(2499, 0));
+    assert_eq!(chain.point(1), point(2501, 0));
+
+    // Case 6: a large radius, all three points very close.
+    let mut chain = LineChain::new();
+
+    chain.append_arc(
+      &ShapeArc::new(point(-100_000, 0), point(0, 1), point(100_000, 0), 0),
+      ARC_HIGH_DEF,
+    );
+    assert!(is_outline_valid(&chain));
+    assert_eq!(chain.arc_count(), 0);
+    assert_eq!(chain.point_count(), 2);
+    assert_eq!(chain.point(0), point(-100_000, 0));
+    assert_eq!(chain.point(1), point(100_000, 0));
+  }
+
+  /// Mirror of `ArcWrappingToStartSharedPoints`,
+  /// `test_shape_line_chain.cpp:764`.
+  ///
+  /// This is the case `fixIndicesRotation` and the closing half of
+  /// `mergeFirstLastPointIfNeeded` exist for.
+  #[test]
+  fn arc_wrapping_to_start_shared_points() {
+    let arc_1 = ShapeArc::new(
+      point(100_000, 0),
+      point(0, 100_000),
+      point(-100_000, 0),
+      0,
+    );
+    let arc_2 = ShapeArc::new(
+      point(-100_000, 0),
+      point(0, -100_000),
+      point(100_000, 0),
+      0,
+    );
+    let mut chain = LineChain::new();
+
+    chain.append_arc(&arc_1, ARC_HIGH_DEF);
+    chain.append_arc(&arc_2, ARC_HIGH_DEF);
+    assert_eq!(chain.point_count(), 13);
+
+    // Open: vertex zero is not shared yet, so it cannot end an arc.
+    assert!(!chain.is_shared_pt(0));
+    assert!(!chain.is_arc_end(0));
+    assert!(chain.is_arc_start(0));
+
+    // Vertex six is the shared point in the middle.
+    assert!(chain.is_shared_pt(6));
+    assert!(chain.is_arc_end(6));
+    assert!(chain.is_arc_start(6));
+
+    let end_index = chain.point_count() - 1;
+
+    assert!(!chain.is_shared_pt(end_index));
+    assert!(chain.is_arc_end(end_index));
+    assert!(!chain.is_arc_start(end_index));
+
+    for index in 0..chain.point_count() {
+      assert!(chain.is_pt_on_arc(index));
+    }
+
+    // Closed: the duplicated endpoint folds onto vertex zero, which
+    // becomes the seam's shared point.
+    chain.set_closed(true);
+    assert_eq!(chain.point_count(), 12);
+
+    assert!(chain.is_shared_pt(0));
+    assert!(chain.is_arc_end(0));
+    assert!(chain.is_arc_start(0));
+
+    assert!(chain.is_shared_pt(6));
+    assert!(chain.is_arc_end(6));
+    assert!(chain.is_arc_start(6));
+
+    let end_index = chain.point_count() - 1;
+
+    assert!(!chain.is_shared_pt(end_index));
+    assert!(!chain.is_arc_end(end_index));
+    assert!(!chain.is_arc_start(end_index));
+  }
+
+  /// One row of KiCad's `remove_shape_cases` table,
+  /// `test_shape_line_chain.cpp:476`.
+  struct RemoveShapeCase {
+    name: &'static str,
+    chain: LineChain,
+    shape_count: usize,
+    arc_count: usize,
+    remove_index: isize,
+    expected_shape_count: usize,
+    expected_arc_count: usize,
+  }
+
+  /// KiCad's `remove_shape_cases`, `test_shape_line_chain.cpp:487` to
+  /// `:554`.
+  fn remove_shape_cases() -> Vec<RemoveShapeCase> {
+    let row = |name: &'static str,
+               chain: LineChain,
+               shape_count: usize,
+               arc_count: usize,
+               remove_index: isize,
+               expected_shape_count: usize,
+               expected_arc_count: usize| RemoveShapeCase {
+      name,
+      chain,
+      shape_count,
+      arc_count,
+      remove_index,
+      expected_shape_count,
+      expected_arc_count,
+    };
+    let case = SlcCases::new;
+
+    vec![
+      row(
+        "Circle1Arc - 1st arc - index on start",
+        case().circle_one_arc,
+        1,
+        1,
+        0,
+        0,
+        0,
+      ),
+      row(
+        "Circle1Arc - 1st arc - index on mid",
+        case().circle_one_arc,
+        1,
+        1,
+        8,
+        0,
+        0,
+      ),
+      row(
+        "Circle1Arc - 1st arc - index on end",
+        case().circle_one_arc,
+        1,
+        1,
+        14,
+        0,
+        0,
+      ),
+      row(
+        "Circle1Arc - 1st arc - index on -1",
+        case().circle_one_arc,
+        1,
+        1,
+        -1,
+        0,
+        0,
+      ),
+      row(
+        "Circle1Arc - invalid index",
+        case().circle_one_arc,
+        1,
+        1,
+        15,
+        1,
+        1,
+      ),
+      row(
+        "Circle2Arcs - 1st arc - index on start",
+        case().circle_two_arcs,
+        2,
+        2,
+        0,
+        2,
+        1,
+      ),
+      row(
+        "Circle2Arcs - 1st arc - index on mid",
+        case().circle_two_arcs,
+        2,
+        2,
+        3,
+        2,
+        1,
+      ),
+      row(
+        "Circle2Arcs - 1st arc - index on end",
+        case().circle_two_arcs,
+        2,
+        2,
+        7,
+        2,
+        1,
+      ),
+      row(
+        "Circle2Arcs - 2nd arc - index on start",
+        case().circle_two_arcs,
+        2,
+        2,
+        8,
+        2,
+        1,
+      ),
+      row(
+        "Circle2Arcs - 2nd arc - index on mid",
+        case().circle_two_arcs,
+        2,
+        2,
+        11,
+        2,
+        1,
+      ),
+      row(
+        "Circle2Arcs - 2nd arc - index on end",
+        case().circle_two_arcs,
+        2,
+        2,
+        15,
+        2,
+        1,
+      ),
+      row(
+        "Circle2Arcs - 2nd arc - index on -1",
+        case().circle_two_arcs,
+        2,
+        2,
+        -1,
+        2,
+        1,
+      ),
+      row(
+        "Circle2Arcs - invalid index",
+        case().circle_two_arcs,
+        2,
+        2,
+        16,
+        2,
+        2,
+      ),
+      row(
+        "ArcsCoinc. - 1st arc - idx on start",
+        case().arcs_coincident,
+        2,
+        2,
+        0,
+        1,
+        1,
+      ),
+      row(
+        "ArcsCoinc. - 1st arc - idx on mid",
+        case().arcs_coincident,
+        2,
+        2,
+        3,
+        1,
+        1,
+      ),
+      row(
+        "ArcsCoinc. - 1st arc - idx on end",
+        case().arcs_coincident,
+        2,
+        2,
+        7,
+        1,
+        1,
+      ),
+      row(
+        "ArcsCoinc. - 2nd arc - idx on start",
+        case().arcs_coincident,
+        2,
+        2,
+        8,
+        1,
+        1,
+      ),
+      row(
+        "ArcsCoinc. - 2nd arc - idx on mid",
+        case().arcs_coincident,
+        2,
+        2,
+        10,
+        1,
+        1,
+      ),
+      row(
+        "ArcsCoinc. - 2nd arc - idx on end",
+        case().arcs_coincident,
+        2,
+        2,
+        13,
+        1,
+        1,
+      ),
+      row(
+        "ArcsCoinc. - 2nd arc - idx on -1",
+        case().arcs_coincident,
+        2,
+        2,
+        -1,
+        1,
+        1,
+      ),
+      row(
+        "ArcsCoinc. - invalid idx",
+        case().arcs_coincident,
+        2,
+        2,
+        14,
+        2,
+        2,
+      ),
+      row(
+        "A.Co.Closed - 1st arc - idx on start",
+        case().arcs_coincident_closed,
+        3,
+        2,
+        1,
+        2,
+        1,
+      ),
+      row(
+        "A.Co.Closed - 1st arc - idx on mid",
+        case().arcs_coincident_closed,
+        3,
+        2,
+        3,
+        2,
+        1,
+      ),
+      row(
+        "A.Co.Closed - 1st arc - idx on end",
+        case().arcs_coincident_closed,
+        3,
+        2,
+        7,
+        2,
+        1,
+      ),
+      row(
+        "A.Co.Closed - 2nd arc - idx on start",
+        case().arcs_coincident_closed,
+        3,
+        2,
+        8,
+        2,
+        1,
+      ),
+      row(
+        "A.Co.Closed - 2nd arc - idx on mid",
+        case().arcs_coincident_closed,
+        3,
+        2,
+        10,
+        2,
+        1,
+      ),
+      row(
+        "A.Co.Closed - 2nd arc - idx on end",
+        case().arcs_coincident_closed,
+        3,
+        2,
+        13,
+        2,
+        1,
+      ),
+      row(
+        "A.Co.Closed - 2nd arc - idx on -1",
+        case().arcs_coincident_closed,
+        3,
+        2,
+        -1,
+        2,
+        1,
+      ),
+      row(
+        "A.Co.Closed - invalid idx",
+        case().arcs_coincident_closed,
+        3,
+        2,
+        14,
+        3,
+        2,
+      ),
+      row(
+        "ArcsIndep. - 1st arc - idx on start",
+        case().arcs_independent,
+        3,
+        2,
+        0,
+        1,
+        1,
+      ),
+      row(
+        "ArcsIndep. - 1st arc - idx on mid",
+        case().arcs_independent,
+        3,
+        2,
+        3,
+        1,
+        1,
+      ),
+      row(
+        "ArcsIndep. - 1st arc - idx on end",
+        case().arcs_independent,
+        3,
+        2,
+        8,
+        1,
+        1,
+      ),
+      row(
+        "ArcsIndep. - 2nd arc - idx on start",
+        case().arcs_independent,
+        3,
+        2,
+        9,
+        1,
+        1,
+      ),
+      row(
+        "ArcsIndep. - 2nd arc - idx on mid",
+        case().arcs_independent,
+        3,
+        2,
+        12,
+        1,
+        1,
+      ),
+      row(
+        "ArcsIndep. - 2nd arc - idx on end",
+        case().arcs_independent,
+        3,
+        2,
+        17,
+        1,
+        1,
+      ),
+      row(
+        "ArcsIndep. - 2nd arc - idx on -1",
+        case().arcs_independent,
+        3,
+        2,
+        -1,
+        1,
+        1,
+      ),
+      row(
+        "ArcsIndep. - invalid idx",
+        case().arcs_independent,
+        3,
+        2,
+        18,
+        3,
+        2,
+      ),
+      row(
+        "Dup.Arcs - 1st arc - idx on start",
+        case().duplicate_arcs,
+        4,
+        3,
+        0,
+        3,
+        2,
+      ),
+      row(
+        "Dup.Arcs - 1st arc - idx on mid",
+        case().duplicate_arcs,
+        4,
+        3,
+        3,
+        3,
+        2,
+      ),
+      row(
+        "Dup.Arcs - 1st arc - idx on end",
+        case().duplicate_arcs,
+        4,
+        3,
+        7,
+        3,
+        2,
+      ),
+      row(
+        "Dup.Arcs - 2nd arc - idx on start",
+        case().duplicate_arcs,
+        4,
+        3,
+        8,
+        3,
+        2,
+      ),
+      row(
+        "Dup.Arcs - 2nd arc - idx on mid",
+        case().duplicate_arcs,
+        4,
+        3,
+        10,
+        3,
+        2,
+      ),
+      row(
+        "Dup.Arcs - 2nd arc - idx on end",
+        case().duplicate_arcs,
+        4,
+        3,
+        13,
+        3,
+        2,
+      ),
+      row(
+        "Dup.Arcs - 3rd arc - idx on start",
+        case().duplicate_arcs,
+        4,
+        3,
+        14,
+        2,
+        2,
+      ),
+      row(
+        "Dup.Arcs - 3rd arc - idx on mid",
+        case().duplicate_arcs,
+        4,
+        3,
+        17,
+        2,
+        2,
+      ),
+      row(
+        "Dup.Arcs - 3rd arc - idx on end",
+        case().duplicate_arcs,
+        4,
+        3,
+        19,
+        2,
+        2,
+      ),
+      row(
+        "Dup.Arcs - 3rd arc - idx on -1",
+        case().duplicate_arcs,
+        4,
+        3,
+        -1,
+        2,
+        2,
+      ),
+      row(
+        "Dup.Arcs - invalid idx",
+        case().duplicate_arcs,
+        4,
+        3,
+        20,
+        4,
+        3,
+      ),
+      row(
+        "Arcs Mixed - 1st arc - idx on start",
+        case().arcs_and_seg_mixed,
+        4,
+        2,
+        0,
+        2,
+        1,
+      ),
+      row(
+        "Arcs Mixed - 1st arc - idx on mid",
+        case().arcs_and_seg_mixed,
+        4,
+        2,
+        3,
+        2,
+        1,
+      ),
+      row(
+        "Arcs Mixed - 1st arc - idx on end",
+        case().arcs_and_seg_mixed,
+        4,
+        2,
+        8,
+        2,
+        1,
+      ),
+      row(
+        "Arcs Mixed - Straight segment",
+        case().arcs_and_seg_mixed,
+        4,
+        2,
+        9,
+        3,
+        2,
+      ),
+      row(
+        "Arcs Mixed - 2nd arc - idx on start",
+        case().arcs_and_seg_mixed,
+        4,
+        2,
+        10,
+        2,
+        1,
+      ),
+      row(
+        "Arcs Mixed - 2nd arc - idx on mid",
+        case().arcs_and_seg_mixed,
+        4,
+        2,
+        14,
+        2,
+        1,
+      ),
+      row(
+        "Arcs Mixed - 2nd arc - idx on end",
+        case().arcs_and_seg_mixed,
+        4,
+        2,
+        18,
+        2,
+        1,
+      ),
+      row(
+        "Arcs Mixed - 2nd arc - idx on -1",
+        case().arcs_and_seg_mixed,
+        4,
+        2,
+        -1,
+        2,
+        1,
+      ),
+      row(
+        "Arcs Mixed - invalid idx",
+        case().arcs_and_seg_mixed,
+        4,
+        2,
+        19,
+        4,
+        2,
+      ),
+    ]
+  }
+
+  /// KiCad's `RemoveShape( int )` takes a signed index; this port takes a
+  /// `usize` and leaves the normalisation to
+  /// [`LineChain::normalize_index`], so the table's negative and out of
+  /// range rows are translated here.
+  fn remove_shape_at(chain: &mut LineChain, index: isize) {
+    // An index that names no vertex is a no operation in KiCad too
+    // (`shape_line_chain.cpp:1385`).
+    if let Some(normalized) = chain.normalize_index(index) {
+      chain.remove_shape(normalized);
+    }
+  }
+
+  /// Mirror of `RemoveShape`, `test_shape_line_chain.cpp:557`.
+  #[test]
+  fn remove_shape_removes_the_whole_arc() {
+    for case in remove_shape_cases() {
+      let mut chain = case.chain.clone();
+
+      assert_eq!(chain.shape_count(), case.shape_count, "{}", case.name);
+      assert_eq!(chain.arc_count(), case.arc_count, "{}", case.name);
+      assert!(is_outline_valid(&chain), "{}", case.name);
+
+      remove_shape_at(&mut chain, case.remove_index);
+
+      assert_eq!(
+        chain.shape_count(),
+        case.expected_shape_count,
+        "{}",
+        case.name
+      );
+      assert_eq!(chain.arc_count(), case.expected_arc_count, "{}", case.name);
+      assert!(is_outline_valid(&chain), "{}", case.name);
+    }
+  }
+
+  /// Mirror of `RemoveShapeAfterSimplify`,
+  /// `test_shape_line_chain.cpp:576`: the same table with a
+  /// [`LineChain::simplify`] in the middle, which must change neither
+  /// count.
+  #[test]
+  fn remove_shape_after_simplify_removes_the_whole_arc() {
+    for case in remove_shape_cases() {
+      let mut chain = case.chain.clone();
+
+      assert!(is_outline_valid(&chain), "{}", case.name);
+      assert_eq!(chain.shape_count(), case.shape_count, "{}", case.name);
+      assert_eq!(chain.arc_count(), case.arc_count, "{}", case.name);
+
+      chain.simplify(0);
+
+      assert!(is_outline_valid(&chain), "{}", case.name);
+      assert_eq!(chain.shape_count(), case.shape_count, "{}", case.name);
+      assert_eq!(chain.arc_count(), case.arc_count, "{}", case.name);
+
+      remove_shape_at(&mut chain, case.remove_index);
+
+      assert!(is_outline_valid(&chain), "{}", case.name);
+      assert_eq!(
+        chain.shape_count(),
+        case.expected_shape_count,
+        "{}",
+        case.name
+      );
+      assert_eq!(chain.arc_count(), case.expected_arc_count, "{}", case.name);
+    }
+  }
+
+  /// The chain `Split` and `NearestPointPt` share,
+  /// `test_shape_line_chain.cpp:824` and `:1188`.
+  fn split_case_chain() -> (Seg, Seg, ShapeArc, LineChain) {
+    let seg_1 = Seg::new(point(0, 100_000), point(50_000, 0));
+    let seg_2 = Seg::new(point(200_000, 0), point(300_000, 0));
+    // KiCad's `SHAPE_ARC( VECTOR2I( 200000, 0 ), VECTOR2I( 300000, 0 ),
+    // ANGLE_180 )` is the centre, start, angle constructor
+    // (`shape_arc.h:57`), not the start, end, angle one.
+    let arc = ShapeArc::from_center_start_angle(
+      point(200_000, 0),
+      point(300_000, 0),
+      Degrees::HALF_TURN,
+      0,
+    );
+    let mut chain = LineChain::from_slice(&[seg_1.a, seg_1.b], false);
+
+    chain.append_arc(&arc, ARC_HIGH_DEF);
+    chain.append(seg_2.a);
+    chain.append(seg_2.b);
+
+    (seg_1, seg_2, arc, chain)
+  }
+
+  /// Mirror of `Split`, `test_shape_line_chain.cpp:822`.
+  #[test]
+  fn split_on_an_arc_segment_makes_two_arcs_sharing_a_point() {
+    let (seg_1, _seg_2, arc, chain) = split_case_chain();
+
+    assert_eq!(chain.point_count(), 11);
+    assert!(is_outline_valid(&chain));
+
+    // Case 1: a point that is not on the chain.
+    let mut copy = chain.clone();
+
+    assert_eq!(copy.split(point(400_000, 0)), None);
+    assert_eq!(copy.point_count(), chain.point_count());
+    assert_eq!(copy.arc_count(), chain.arc_count());
+
+    // Case 2: close to the start of a segment.
+    let mut copy = chain.clone();
+    let split_point = seg_1.a + point(5, -10);
+
+    assert_eq!(copy.split(split_point), Some(1));
+    assert!(is_outline_valid(&copy));
+    assert_eq!(copy.point(1), split_point);
+    assert_eq!(copy.point_count(), chain.point_count() + 1);
+    assert_eq!(copy.arc_count(), chain.arc_count());
+
+    // Case 3: exactly on the segment.
+    let mut copy = chain.clone();
+
+    assert_eq!(copy.split(seg_1.b), Some(1));
+    assert!(is_outline_valid(&copy));
+    assert_eq!(copy.point(1), seg_1.b);
+    assert_eq!(copy.point_count(), chain.point_count());
+    assert_eq!(copy.arc_count(), chain.arc_count());
+
+    // Case 4: exactly at the arc's start.
+    let mut copy = chain.clone();
+
+    assert_eq!(copy.split(arc.start()), Some(2));
+    assert!(is_outline_valid(&copy));
+    assert_eq!(copy.point(2), arc.start());
+    assert_eq!(copy.point_count(), chain.point_count());
+    assert_eq!(copy.arc_count(), chain.arc_count());
+
+    // Case 5: close to the arc's start, which cuts the arc in two.
+    let mut copy = chain.clone();
+    let split_point = arc.start() + point(-10, 130);
+
+    assert_eq!(copy.split(split_point), Some(3));
+    assert!(is_outline_valid(&copy));
+    assert_eq!(copy.point(3), split_point);
+    assert!(copy.is_shared_pt(3));
+    assert_eq!(copy.point_count(), chain.point_count() + 1);
+    assert_eq!(copy.arc_count(), chain.arc_count() + 1);
+  }
+
+  /// Mirror of `NearestPointPt`, `test_shape_line_chain.cpp:1186`, which
+  /// is the case KiCad's `aAllowInternalShapePoints` exists for.
+  #[test]
+  fn nearest_point_snaps_to_an_arc_endpoint_when_asked() {
+    let (_seg_1, _seg_2, arc, chain) = split_case_chain();
+
+    assert_eq!(chain.point_count(), 11);
+    assert!(is_outline_valid(&chain));
+
+    let near_start = point(297_553, 31_697);
+    let near_end = point(139_709, 82_983);
+
+    assert_eq!(chain.nearest_point(near_start, true), Some(near_start));
+    assert_eq!(chain.nearest_point(near_start, false), Some(arc.start()));
+
+    assert_eq!(chain.nearest_point(near_end, true), Some(near_end));
+    assert_eq!(chain.nearest_point(near_end, false), Some(arc.end()));
+  }
+
+  /// Mirror of `Slice`, `test_shape_line_chain.cpp:896`, all ten cases.
+  #[test]
+  fn slice_cuts_whole_and_partial_arcs() {
+    let target_segment = Seg::new(point(200_000, 0), point(300_000, 0));
+    let first_arc = ShapeArc::from_center_start_angle(
+      point(200_000, 0),
+      point(300_000, 0),
+      Degrees::HALF_TURN,
+      0,
+    );
+    let second_arc = ShapeArc::from_center_start_angle(
+      point(-200_000, -200_000),
+      point(-300_000, -100_000),
+      -Degrees::HALF_TURN,
+      0,
+    );
+    let tolerance = ShapeArc::DEFAULT_ACCURACY_FOR_PCB;
+
+    let mut chain = LineChain::from_slice(
+      &[point(0, 0), point(0, 100_000), point(100_000, 0)],
+      false,
+    );
+
+    assert_eq!(chain.point_count(), 3);
+    chain.append_arc(&first_arc, ARC_HIGH_DEF);
+    assert_eq!(chain.point_count(), 10);
+    chain.append(target_segment.a);
+    chain.append(target_segment.b);
+    assert_eq!(chain.point_count(), 12);
+    chain.append_arc(&second_arc, ARC_HIGH_DEF);
+    assert_eq!(chain.point_count(), 20);
+    assert!(is_outline_valid(&chain));
+
+    // Case 1: start at an arc endpoint, finish in the middle of an arc.
+    let sliced = chain.slice_with_max_error(9, 18, ARC_HIGH_DEF).unwrap();
+
+    assert!(is_outline_valid(&sliced));
+    assert_eq!(sliced.arc_count(), 1);
+
+    let expected = ShapeArc::from_start_end_center(
+      second_arc.start(),
+      chain.point(18),
+      second_arc.center(),
+      !second_arc.is_ccw(),
+      0,
+    );
+    let sliced_arc = sliced.arc(0).unwrap();
+
+    assert_eq!(sliced_arc.start(), expected.start());
+    assert!(
+      sliced_arc
+        .collide_point(expected.arc_mid(), tolerance)
+        .is_some()
+    );
+    assert!(
+      sliced_arc
+        .collide_point(expected.end(), tolerance)
+        .is_some()
+    );
+    assert_eq!(sliced.point_count(), 10);
+    assert_eq!(sliced.point(0), first_arc.end());
+    assert_eq!(sliced.point(1), target_segment.a);
+    assert_eq!(sliced.point(2), target_segment.b);
+    assert_eq!(sliced.point(3), expected.start());
+    assert!(sliced.is_arc_start(3));
+
+    for index in 4..=8 {
+      assert!(!sliced.is_arc_start(index));
+    }
+
+    for index in 3..=7 {
+      assert!(!sliced.is_arc_end(index));
+    }
+
+    assert!(sliced.is_arc_end(9));
+    assert_eq!(sliced.point(9), expected.end());
+
+    // Case 2: start in the middle of an arc, finish at an arc start point.
+    let sliced = chain.slice_with_max_error(5, 12, ARC_HIGH_DEF).unwrap();
+
+    assert!(is_outline_valid(&sliced));
+    assert_eq!(sliced.arc_count(), 1);
+
+    let expected = ShapeArc::from_start_end_center(
+      chain.point(5),
+      first_arc.end(),
+      first_arc.center(),
+      !first_arc.is_ccw(),
+      0,
+    );
+    let sliced_arc = sliced.arc(0).unwrap();
+
+    assert_eq!(sliced_arc.end(), expected.end());
+    assert!(
+      sliced_arc
+        .collide_point(expected.arc_mid(), tolerance)
+        .is_some()
+    );
+    assert!(
+      sliced_arc
+        .collide_point(expected.start(), tolerance)
+        .is_some()
+    );
+    assert_eq!(sliced.point_count(), 8);
+    assert_eq!(sliced.point(0), expected.start());
+    assert!(sliced.is_arc_start(0));
+
+    for index in 1..=4 {
+      assert!(!sliced.is_arc_start(index));
+    }
+
+    for index in 0..=3 {
+      assert!(!sliced.is_arc_end(index));
+    }
+
+    assert!(sliced.is_arc_end(4));
+    assert_eq!(sliced.point(4), expected.end());
+    assert_eq!(sliced.point(5), target_segment.a);
+    assert_eq!(sliced.point(6), target_segment.b);
+    assert_eq!(sliced.point(7), second_arc.start());
+
+    // Case 3: a whole arc and nothing else.
+    let sliced = chain.slice_with_max_error(3, 9, ARC_HIGH_DEF).unwrap();
+
+    assert!(is_outline_valid(&sliced));
+    assert_eq!(sliced.arc_count(), 1);
+
+    let sliced_arc = sliced.arc(0).unwrap();
+
+    assert_eq!(first_arc.end(), sliced_arc.end());
+    assert_eq!(first_arc.arc_mid(), sliced_arc.arc_mid());
+    assert_eq!(sliced.point_count(), 7);
+    assert_eq!(sliced.point(0), sliced_arc.start());
+    assert!(sliced.is_arc_start(0));
+
+    for index in 1..=6 {
+      assert!(!sliced.is_arc_start(index));
+    }
+
+    for index in 0..=5 {
+      assert!(!sliced.is_arc_end(index));
+    }
+
+    assert!(sliced.is_arc_end(6));
+    assert_eq!(sliced.point(6), sliced_arc.end());
+
+    // Case 4: a whole arc and the straight segments up to the next arc.
+    let sliced = chain.slice_with_max_error(3, 12, ARC_HIGH_DEF).unwrap();
+
+    assert!(is_outline_valid(&sliced));
+    assert_eq!(sliced.arc_count(), 1);
+
+    let sliced_arc = sliced.arc(0).unwrap();
+
+    assert_eq!(first_arc.end(), sliced_arc.end());
+    assert_eq!(first_arc.arc_mid(), sliced_arc.arc_mid());
+    assert_eq!(sliced.point_count(), 10);
+    assert_eq!(sliced.point(0), sliced_arc.start());
+    assert!(sliced.is_arc_start(0));
+    assert!(sliced.is_arc_end(6));
+    assert_eq!(sliced.point(6), sliced_arc.end());
+    assert_eq!(sliced.point(7), target_segment.a);
+    assert_eq!(sliced.point(8), target_segment.b);
+    assert_eq!(sliced.point(9), second_arc.start());
+
+    // Case 5: a chain that ends in an arc and then a point.
+    let mut copy = chain.clone();
+
+    copy.append(point(400_000, 400_000));
+
+    let last = copy.normalize_index(-1).unwrap();
+    let sliced = copy.slice_with_max_error(11, last, ARC_HIGH_DEF).unwrap();
+
+    assert!(is_outline_valid(&sliced));
+    assert_eq!(sliced.last_point(), Some(point(400_000, 400_000)));
+
+    // Case 6: a whole chain of one point.
+    let one_point = SlcCases::new().one_point;
+    let last = one_point.normalize_index(-1).unwrap();
+    let sliced = one_point
+      .slice_with_max_error(0, last, ARC_HIGH_DEF)
+      .unwrap();
+
+    assert_eq!(sliced.point_count(), 1);
+    assert_eq!(sliced.point(0), point(233_450_000, 228_360_000));
+
+    // Case 7: a whole chain of two points.
+    let two_points = SlcCases::new().two_points;
+    let last = two_points.normalize_index(-1).unwrap();
+    let sliced = two_points
+      .slice_with_max_error(0, last, ARC_HIGH_DEF)
+      .unwrap();
+
+    assert_eq!(sliced.point_count(), 2);
+    assert_eq!(sliced.point(0), point(233_450_000, 228_360_000));
+    assert_eq!(sliced.point(1), point(263_450_000, 258_360_000));
+
+    // Case 8: the whole second arc and nothing else.
+    let sliced = chain.slice_with_max_error(12, 19, ARC_HIGH_DEF).unwrap();
+
+    assert!(is_outline_valid(&sliced));
+    assert_eq!(sliced.arc_count(), 1);
+
+    let sliced_arc = sliced.arc(0).unwrap();
+
+    assert_eq!(second_arc.end(), sliced_arc.end());
+    assert_eq!(second_arc.arc_mid(), sliced_arc.arc_mid());
+    assert_eq!(sliced.point_count(), 8);
+    assert_eq!(sliced.point(0), sliced_arc.start());
+    assert!(sliced.is_arc_start(0));
+    assert!(sliced.is_arc_end(7));
+    assert_eq!(sliced.point(7), sliced_arc.end());
+
+    // Case 9: start in the middle of the second arc, finish at the end.
+    let sliced = chain.slice_with_max_error(16, 19, ARC_HIGH_DEF).unwrap();
+
+    assert!(is_outline_valid(&sliced));
+    assert_eq!(sliced.arc_count(), 1);
+
+    let expected = ShapeArc::from_start_end_center(
+      chain.point(16),
+      second_arc.end(),
+      second_arc.center(),
+      !second_arc.is_ccw(),
+      0,
+    );
+    let sliced_arc = sliced.arc(0).unwrap();
+
+    assert_eq!(sliced_arc.end(), expected.end());
+    assert!(
+      sliced_arc
+        .collide_point(expected.arc_mid(), tolerance)
+        .is_some()
+    );
+    assert!(
+      sliced_arc
+        .collide_point(expected.start(), tolerance)
+        .is_some()
+    );
+    assert_eq!(sliced.point_count(), 4);
+    assert_eq!(sliced.point(0), expected.start());
+    assert!(sliced.is_arc_start(0));
+    assert!(sliced.is_arc_end(3));
+    assert_eq!(sliced.point(3), expected.end());
+
+    // Case 10: a fresh chain of one arc, sliced from its middle to its end.
+    let mut chain_10 = LineChain::new();
+
+    chain_10.append_arc(&first_arc, ARC_HIGH_DEF);
+
+    let sliced = chain_10.slice_with_max_error(3, 6, ARC_HIGH_DEF).unwrap();
+
+    assert!(is_outline_valid(&sliced));
+    assert_eq!(sliced.arc_count(), 1);
+
+    let expected = ShapeArc::from_start_end_center(
+      chain_10.point(3),
+      first_arc.end(),
+      first_arc.center(),
+      !first_arc.is_ccw(),
+      0,
+    );
+    let sliced_arc = sliced.arc(0).unwrap();
+
+    assert_eq!(sliced_arc.end(), expected.end());
+    assert!(
+      sliced_arc
+        .collide_point(expected.arc_mid(), tolerance)
+        .is_some()
+    );
+    assert_eq!(sliced.point_count(), 4);
+    assert_eq!(sliced.point(0), expected.start());
+    assert!(sliced.is_arc_start(0));
+    assert!(sliced.is_arc_end(3));
+    assert_eq!(sliced.point(3), expected.end());
+  }
+
+  /// Mirror of `SimplifyWithArcs`, `test_shape_line_chain.cpp:1524`, all
+  /// ten contexts.
+  #[test]
+  fn simplify_keeps_every_arc_and_still_collapses_straight_runs() {
+    let hump = |start_x: i32, mid_x: i32, end_x: i32, mid_y: i32| {
+      ShapeArc::new(point(start_x, 0), point(mid_x, mid_y), point(end_x, 0), 0)
+    };
+
+    // 1 segment, arc, 2 collinear segments.
+    let mut original = LineChain::new();
+
+    original.append(point(0, 0));
+    original.append_arc(
+      &hump(2_000_000, 2_500_000, 3_000_000, 500_000),
+      ARC_HIGH_DEF,
+    );
+    original.append(point(4_000_000, 0));
+    original.append(point(5_000_000, 0));
+    assert!(is_outline_valid(&original));
+
+    let before = original.point_count();
+    let mut simplified = original.clone();
+
+    simplified.simplify(0);
+    assert_eq!(simplified.arc_count(), original.arc_count());
+    assert!(simplified.point_count() < before);
+    assert_eq!(simplified.arc(0).unwrap().start(), point(2_000_000, 0));
+    assert_eq!(simplified.arc(0).unwrap().end(), point(3_000_000, 0));
+    assert_eq!(simplified.find(point(4_000_000, 0), 0), None);
+    assert!(simplified.find(point(3_000_000, 0), 0).is_some());
+
+    // Arc, two collinear segments.
+    let mut original = LineChain::new();
+
+    original.append_arc(&hump(0, 1_000_000, 2_000_000, 500_000), ARC_HIGH_DEF);
+    original.append(point(3_000_000, 0));
+    original.append(point(4_000_000, 0));
+    assert!(is_outline_valid(&original));
+
+    let before = original.point_count();
+    let mut simplified = original.clone();
+
+    simplified.simplify(0);
+    assert_eq!(simplified.arc_count(), 1);
+    assert!(simplified.point_count() < before);
+    assert!(is_outline_valid(&simplified));
+    assert_eq!(simplified.find(point(3_000_000, 0), 0), None);
+    assert_eq!(simplified.arc(0).unwrap().start(), point(0, 0));
+    assert_eq!(simplified.arc(0).unwrap().end(), point(2_000_000, 0));
+
+    // 2 collinear segments, arc, 2 collinear segments.
+    let mut original = LineChain::new();
+
+    original.append(point(0, 0));
+    original.append(point(1_000_000, 0));
+    original.append_arc(
+      &hump(2_000_000, 2_500_000, 3_000_000, 500_000),
+      ARC_HIGH_DEF,
+    );
+    original.append(point(4_000_000, 0));
+    original.append(point(5_000_000, 0));
+    assert!(is_outline_valid(&original));
+
+    let before = original.point_count();
+    let before_arcs = original.arc_count();
+    let mut simplified = original.clone();
+
+    simplified.simplify(0);
+    assert_eq!(simplified.arc_count(), before_arcs);
+    assert!(simplified.point_count() < before);
+    assert!(is_outline_valid(&simplified));
+    assert_eq!(simplified.arc(0).unwrap().start(), point(2_000_000, 0));
+    assert_eq!(simplified.arc(0).unwrap().end(), point(3_000_000, 0));
+    assert_eq!(simplified.find(point(4_000_000, 0), 0), None);
+    assert!(simplified.find(point(5_000_000, 0), 0).is_some());
+
+    // 2 collinear segments, arc.
+    let mut original = LineChain::new();
+
+    original.append(point(0, 0));
+    original.append(point(1_000_000, 0));
+    original.append_arc(
+      &hump(2_000_000, 2_500_000, 3_000_000, 500_000),
+      ARC_HIGH_DEF,
+    );
+    assert!(is_outline_valid(&original));
+
+    let before = original.point_count();
+    let mut simplified = original.clone();
+
+    simplified.simplify(0);
+    assert_eq!(simplified.arc_count(), 1);
+    assert!(simplified.point_count() < before);
+    assert_eq!(simplified.find(point(1_000_000, 0), 0), None);
+    assert!(is_outline_valid(&simplified));
+    assert_eq!(simplified.arc(0).unwrap().start(), point(2_000_000, 0));
+    assert_eq!(simplified.arc(0).unwrap().end(), point(3_000_000, 0));
+
+    // Arc at the start, two collinear segments after it.
+    let mut original = LineChain::new();
+
+    original.append_arc(&hump(0, 1_000_000, 2_000_000, 500_000), ARC_HIGH_DEF);
+    original.append(point(3_000_000, 0));
+    original.append(point(4_000_000, 0));
+    assert!(is_outline_valid(&original));
+
+    let before = original.point_count();
+    let before_arcs = original.arc_count();
+    let mut simplified = original.clone();
+
+    simplified.simplify(0);
+    assert!(
+      simplified.arc_count() == before_arcs
+        || simplified.arc_count() == before_arcs - 1
+    );
+    assert!(simplified.point_count() < before);
+    assert!(is_outline_valid(&simplified));
+
+    // Tolerance semantics, zero against a small positive.
+    let mut original = LineChain::new();
+
+    original.append(point(0, 0));
+    original.append(point(1_000_000, 1));
+    original.append_arc(
+      &hump(2_000_000, 2_500_000, 3_000_000, 500_000),
+      ARC_HIGH_DEF,
+    );
+    original.append(point(4_000_000, 0));
+    original.append(point(5_000_000, 0));
+    assert!(is_outline_valid(&original));
+
+    let before = original.point_count();
+    let mut at_zero = original.clone();
+
+    at_zero.simplify(0);
+    assert_eq!(at_zero.point_count(), before - 1);
+
+    let mut at_one = original.clone();
+
+    at_one.simplify(1);
+    assert_eq!(at_one.point_count(), before - 2);
+    assert_eq!(at_one.arc_count(), original.arc_count());
+
+    // Two adjacent arcs.
+    let mut original = LineChain::new();
+
+    original.append_arc(&hump(0, 1_000_000, 2_000_000, 500_000), ARC_HIGH_DEF);
+    original.append_arc(
+      &hump(2_000_000, 3_000_000, 4_000_000, 500_000),
+      ARC_HIGH_DEF,
+    );
+    assert!(is_outline_valid(&original));
+
+    let before_arcs = original.arc_count();
+    let mut simplified = original.clone();
+
+    simplified.simplify(0);
+    assert_eq!(simplified.arc_count(), before_arcs);
+    assert!(is_outline_valid(&simplified));
+    assert_eq!(
+      simplified.arc(0).unwrap().end(),
+      simplified.arc(1).unwrap().start()
+    );
+    assert_eq!(simplified.arc(0).unwrap().start(), point(0, 0));
+    assert_eq!(simplified.arc(1).unwrap().end(), point(4_000_000, 0));
+
+    // A segment, two arcs of opposite bulge, two collinear segments.
+    let mut original = LineChain::new();
+
+    original.append(point(-1_000_000, 0));
+    original.append_arc(&hump(0, 500_000, 1_000_000, 500_000), ARC_HIGH_DEF);
+    original.append_arc(
+      &hump(1_000_000, 1_500_000, 2_000_000, -500_000),
+      ARC_HIGH_DEF,
+    );
+    original.append(point(3_000_000, 0));
+    original.append(point(4_000_000, 0));
+    assert!(is_outline_valid(&original));
+
+    let before = original.point_count();
+    let before_arcs = original.arc_count();
+    let mut simplified = original.clone();
+
+    simplified.simplify(0);
+    assert_eq!(simplified.arc_count(), before_arcs);
+    assert!(simplified.point_count() < before);
+    assert!(is_outline_valid(&simplified));
+    assert!(simplified.find(point(-1_000_000, 0), 0).is_some());
+    assert!(simplified.find(point(4_000_000, 0), 0).is_some());
+
+    // Arc, a collinear point, arc.
+    let mut original = LineChain::new();
+
+    original.append_arc(&hump(0, 1_000_000, 2_000_000, 500_000), ARC_HIGH_DEF);
+    original.append(point(2_500_000, 0));
+    original.append_arc(
+      &hump(3_000_000, 3_500_000, 4_000_000, 500_000),
+      ARC_HIGH_DEF,
+    );
+    assert!(is_outline_valid(&original));
+
+    let before = original.point_count();
+    let before_arcs = original.arc_count();
+    let mut simplified = original.clone();
+
+    simplified.simplify(0);
+    assert_eq!(simplified.arc_count(), before_arcs);
+    assert!(simplified.point_count() < before);
+    assert!(is_outline_valid(&simplified));
+    assert_eq!(simplified.arc(0).unwrap().end(), point(2_000_000, 0));
+    assert_eq!(simplified.arc(1).unwrap().start(), point(3_000_000, 0));
+  }
+
+  /// A chain shaped plain point, arc, plain point, arc, plain point, the
+  /// smallest shape that lets one removal range swallow two whole arcs.
+  fn two_arcs_between_plain_points() -> LineChain {
+    let mut chain = LineChain::new();
+
+    chain.append(point(-1_000_000, 0));
+    chain.append_arc(
+      &ShapeArc::new(
+        point(0, 0),
+        point(500_000, 500_000),
+        point(1_000_000, 0),
+        0,
+      ),
+      ARC_HIGH_DEF,
+    );
+    chain.append(point(2_000_000, 0));
+    chain.append_arc(
+      &ShapeArc::new(
+        point(3_000_000, 0),
+        point(3_500_000, 500_000),
+        point(4_000_000, 0),
+        0,
+      ),
+      ARC_HIGH_DEF,
+    );
+    chain.append(point(5_000_000, 0));
+    chain
+  }
+
+  /// Erratum E6: `Remove`'s arc dropping iterates its index set in
+  /// increasing order while `convertArc` renumbers everything above the
+  /// index it just erased
+  /// (`libs/kimath/src/geometry/shape_line_chain.cpp:1118` to `:1157`).
+  ///
+  /// Reproduced, because the behaviour is defined. A range covering two
+  /// whole arcs erases the first and leaves the second behind with every
+  /// reference to it gone, so the arc count drops by one rather than two.
+  #[test]
+  fn remove_range_erases_every_other_arc_of_the_range_erratum_e6() {
+    let mut chain = two_arcs_between_plain_points();
+
+    assert_eq!(chain.arc_count(), 2);
+    assert_eq!(chain.live_arcs().count(), 2);
+
+    let last = chain.point_count() - 1;
+
+    chain.remove_range(1, last - 1);
+
+    assert_eq!(chain.point_count(), 2);
+    // Both arcs were inside the range. One entry survives, referred to by
+    // nothing: that is the erratum.
+    assert_eq!(chain.arc_count(), 1);
+    assert_eq!(chain.live_arcs().count(), 0);
+  }
+
+  /// Erratum E13: an arc no vertex refers to still collides and still
+  /// contributes length in KiCad, because `Collide` and the preview walk
+  /// `ArcCount()` directly (`shape_line_chain.cpp:480`, `:873`).
+  ///
+  /// Fixed by construction: every consumer in this module goes through
+  /// [`LineChain::live_arcs`], so the orphan erratum E6 leaves behind is
+  /// invisible.
+  #[test]
+  fn an_orphaned_arc_neither_collides_nor_adds_length_erratum_e13() {
+    let mut chain = two_arcs_between_plain_points();
+    let last = chain.point_count() - 1;
+
+    chain.remove_range(1, last - 1);
+
+    assert_eq!(chain.arc_count(), 1);
+    assert_eq!(chain.live_arcs().count(), 0);
+
+    // What is left is the straight run from the first plain point to the
+    // last, and nothing else.
+    assert_eq!(chain.point_count(), 2);
+    assert_eq!(chain.length(), 6_000_000);
+
+    // The orphan's own geometry is around (3.5 mm, 0.5 mm), far from the
+    // surviving segment, and a query there finds nothing.
+    assert_eq!(chain.collide_point(point(3_500_000, 500_000), 1000), None);
+    assert_eq!(
+      chain.collide_seg(
+        &Seg::new(point(3_500_000, 400_000), point(3_600_000, 600_000)),
+        1000
+      ),
+      None
+    );
+  }
+
+  /// Erratum E7: `Replace( int, int, const SHAPE_LINE_CHAIN& )` appends
+  /// the incoming arcs at the end of `m_arcs` whatever position their
+  /// points took (`libs/kimath/src/geometry/shape_line_chain.cpp:1071`),
+  /// which breaks the chain order `Reverse` needs.
+  ///
+  /// Fixed: [`LineChain::replace_with_chain`] splices them into position.
+  /// The incoming arc here lands before the arc that was already there, so
+  /// KiCad would have numbered the two the other way round.
+  #[test]
+  fn replace_with_chain_splices_arcs_into_chain_order_erratum_e7() {
+    let trailing_arc = ShapeArc::new(
+      point(2_000_000, 0),
+      point(2_500_000, 500_000),
+      point(3_000_000, 0),
+      0,
+    );
+    let incoming_arc = ShapeArc::new(
+      point(500_000, 500_000),
+      point(1_000_000, 1_000_000),
+      point(1_500_000, 500_000),
+      0,
+    );
+    let mut chain = LineChain::from_slice(
+      &[point(0, 0), point(1_000_000, 0), point(2_000_000, 0)],
+      false,
+    );
+
+    chain.append_arc(&trailing_arc, ARC_HIGH_DEF);
+    assert_eq!(chain.arc_count(), 1);
+    assert_eq!(chain.arc(0).unwrap().start(), trailing_arc.start());
+
+    let mut incoming = LineChain::new();
+
+    incoming.append_arc(&incoming_arc, ARC_HIGH_DEF);
+    chain.replace_with_chain(1, 1, &incoming);
+
+    assert_eq!(chain.arc_count(), 2);
+    // Chain order: the arc whose points come first is the arc at index 0.
+    assert_eq!(chain.arc(0).unwrap().start(), incoming_arc.start());
+    assert_eq!(chain.arc(1).unwrap().start(), trailing_arc.start());
+    assert!(is_outline_valid(&chain));
+
+    // Which is what makes reversing twice an identity. With KiCad's order
+    // the index remap at `:926` would have swapped the two arcs.
+    let before = chain.clone();
+
+    chain.reverse();
+    chain.reverse();
+    assert_eq!(chain, before);
+  }
+
+  /// Erratum E10: `Slice` copies points forward from a start inside an arc
+  /// with no `aEndIndex` bound
+  /// (`libs/kimath/src/geometry/shape_line_chain.cpp:1444`), so a range
+  /// whose two ends are interior to the same arc runs on to that arc's
+  /// end.
+  ///
+  /// Reproduced, because the behaviour is defined and
+  /// `LINE::restoreUntouchedArcs` reaches it (`pns_line.cpp:285`).
+  #[test]
+  fn slice_inside_one_arc_runs_past_its_end_erratum_e10() {
+    let arc = ShapeArc::from_center_start_angle(
+      point(200_000, 0),
+      point(300_000, 0),
+      Degrees::HALF_TURN,
+      0,
+    );
+    let mut chain = LineChain::new();
+
+    chain.append_arc(&arc, ARC_HIGH_DEF);
+    assert_eq!(chain.point_count(), 7);
+
+    // Both ends of the range are interior to the one arc.
+    let sliced = chain.slice_with_max_error(2, 4, ARC_HIGH_DEF).unwrap();
+
+    // A bounded slice would have answered three points; this answers the
+    // five from index two to the arc's end.
+    assert_eq!(sliced.point_count(), 5);
+    assert_eq!(sliced.point(0), chain.point(2));
+    assert_eq!(sliced.last_point(), Some(chain.point(6)));
+    assert_eq!(sliced.arc_count(), 1);
+    assert_eq!(sliced.arc(0).unwrap().end(), arc.end());
+  }
+
+  /// Erratum E12: `Simplify2`'s colinear run checks the shape entries of
+  /// the run's first two vertices and then never looks again
+  /// (`libs/kimath/src/geometry/shape_line_chain.cpp:2968` to `:2974`), so
+  /// a shallow arc can lose interior points while its entry survives.
+  ///
+  /// Reproduced, because the behaviour is defined. The arc below has a
+  /// sagitta of three nanometres and is stored at an accuracy of one, so
+  /// its approximation points sit within `SIMPLIFY2_TOLERANCE` of the
+  /// chord and the run walks straight through them.
+  #[test]
+  fn simplify2_can_drop_an_arcs_interior_points_erratum_e12() {
+    let mut chain = LineChain::new();
+
+    chain.append(point(-2_000_000, 0));
+    chain.append(point(-1_000_000, 0));
+    chain.append_arc(
+      &ShapeArc::new(point(0, 0), point(1_000_000, 3), point(2_000_000, 0), 0),
+      1,
+    );
+
+    let before = chain.point_count();
+
+    assert!(before > 4, "the shallow arc must survive the demotion rule");
+    assert_eq!(chain.arc_count(), 1);
+
+    chain.simplify2(true);
+
+    // The arc entry is still there while its run has lost vertices.
+    assert_eq!(chain.arc_count(), 1);
+    assert!(
+      chain.point_count() < before,
+      "the colinear run should have eaten interior points of the arc"
+    );
+  }
+
+  /// Erratum E14: the arc snapping in `NearestPoint` can advance `nearest`
+  /// to `PointCount()` and then read the unchecked `ArcIndex` and `Arc`
+  /// (`libs/kimath/src/geometry/shape_line_chain.cpp:2427` to `:2450`).
+  ///
+  /// Fixed by change 4 of note 09 section 11.1: both accessors return
+  /// [`Option`], so the read is checked and the answer falls back to the
+  /// unsnapped nearest point. The chain below is the only shape that
+  /// reaches it, a closed chain whose last segment is an arc segment.
+  #[test]
+  fn nearest_point_snapping_stays_in_range_erratum_e14() {
+    let chain = SlcCases::new().circle_one_arc;
+    let last_segment = chain.segment_count() - 1;
+
+    assert!(chain.is_closed());
+    assert!(chain.is_arc_segment(last_segment));
+
+    // A point just outside the circle, nearest to the last segment and
+    // nearer to that segment's second endpoint than to its first, which is
+    // what makes KiCad step one past the last vertex.
+    let segment = chain.segment(last_segment);
+    let probe = segment.b + point(2000, 2000);
+    let nearest = chain.nearest_point(probe, false);
+
+    assert_eq!(nearest, Some(segment.nearest_point_to_point(probe)));
+  }
+
+  /// Erratum E35: `IsArcEnd( 0 )` looks back at the last vertex whether
+  /// the chain is closed or not
+  /// (`libs/kimath/src/geometry/shape_line_chain.cpp:3286`).
+  ///
+  /// Reproduced, and it cannot change an answer. The look back asks
+  /// `is_arc_segment` of the last vertex, and on an open chain there is no
+  /// segment there, so the predicate is false whatever the last shape is.
+  #[test]
+  fn is_arc_end_at_vertex_zero_never_wraps_erratum_e35() {
+    let chain = SlcCases::new().arcs_coincident;
+    let last = chain.point_count() - 1;
+
+    assert!(!chain.is_closed());
+    // The chain ends on an arc, and its first vertex starts one.
+    assert!(chain.is_arc_end(last));
+    assert!(chain.is_arc_start(0));
+
+    // The unconditional look back reaches the last vertex and finds no
+    // segment leaving it.
+    assert!(!chain.is_arc_segment(last));
+    assert!(!chain.is_arc_end(0));
+  }
+
+  /// Erratum E5: KiCad's `Insert( size_t, const SHAPE_ARC&, int )` scans
+  /// `m_shapes.rbegin()` to `m_shapes.rend() + aVertex` for the insertion
+  /// position, which is past the reverse end for any non zero vertex
+  /// (`libs/kimath/src/geometry/shape_line_chain.cpp:1674`).
+  ///
+  /// Fixed, an out of bounds read being outside what the milestone rule
+  /// asks to reproduce. The insertion position is found by scanning
+  /// forward from the insertion point, which puts the new arc in chain
+  /// order for every vertex.
+  #[test]
+  fn insert_arc_finds_its_position_without_reading_past_the_end_erratum_e5() {
+    let trailing_arc = ShapeArc::new(
+      point(2_000_000, 0),
+      point(2_500_000, 500_000),
+      point(3_000_000, 0),
+      0,
+    );
+    let inserted_arc = ShapeArc::new(
+      point(500_000, 500_000),
+      point(1_000_000, 1_000_000),
+      point(1_500_000, 500_000),
+      0,
+    );
+    let mut chain = LineChain::from_slice(
+      &[point(0, 0), point(1_000_000, 0), point(2_000_000, 0)],
+      false,
+    );
+
+    chain.append_arc(&trailing_arc, ARC_HIGH_DEF);
+    chain.insert_arc(1, &inserted_arc, ARC_HIGH_DEF);
+
+    assert_eq!(chain.arc_count(), 2);
+    assert_eq!(chain.arc(0).unwrap().start(), inserted_arc.start());
+    assert_eq!(chain.arc(1).unwrap().start(), trailing_arc.start());
+    assert!(is_outline_valid(&chain));
+
+    // The demotion rule of `Append( SHAPE_ARC )` applies here too, which
+    // KiCad's `Insert` skips.
+    let mut chain = LineChain::from_slice(&[point(0, 0), point(10, 0)], false);
+
+    chain.insert_arc(
+      1,
+      &ShapeArc::new(point(2499, 0), point(2500, 0), point(2501, 0), 0),
+      ARC_HIGH_DEF,
+    );
+    assert_eq!(chain.arc_count(), 0);
+  }
+
+  /// Two arcs that meet at one shared vertex.
+  fn chain_with_two_arcs_sharing_a_point() -> LineChain {
+    let mut chain = LineChain::new();
+
+    chain.append_arc(
+      &ShapeArc::new(
+        point(0, 0),
+        point(500_000, 500_000),
+        point(1_000_000, 0),
+        0,
+      ),
+      ARC_HIGH_DEF,
+    );
+    chain.append_arc(
+      &ShapeArc::new(
+        point(1_000_000, 0),
+        point(1_500_000, -500_000),
+        point(2_000_000, 0),
+        0,
+      ),
+      ARC_HIGH_DEF,
+    );
+    chain
+  }
+
+  /// Two arcs with a straight run between them.
+  fn chain_with_a_straight_run_between_two_arcs() -> LineChain {
+    let mut chain = LineChain::new();
+
+    chain.append_arc(
+      &ShapeArc::new(
+        point(0, 0),
+        point(500_000, 500_000),
+        point(1_000_000, 0),
+        0,
+      ),
+      ARC_HIGH_DEF,
+    );
+    chain.append(point(2_000_000, 0));
+    chain.append(point(3_000_000, 1_000_000));
+    chain.append_arc(
+      &ShapeArc::new(
+        point(4_000_000, 0),
+        point(4_500_000, 500_000),
+        point(5_000_000, 0),
+        0,
+      ),
+      ARC_HIGH_DEF,
+    );
+    chain
+  }
+
+  /// An arc at each end of an open chain, with plain vertices between.
+  fn chain_with_an_arc_at_each_end() -> LineChain {
+    let mut chain = chain_with_a_straight_run_between_two_arcs();
+
+    // The helper above already starts and ends on an arc; make the
+    // difference explicit by checking it here rather than in every caller.
+    assert!(chain.is_arc_start(0));
+    assert!(chain.is_arc_end(chain.point_count() - 1));
+    chain.set_width(250_000);
+    chain
+  }
+
+  /// One named edit for `every_mutator_leaves_the_arc_invariants_intact`.
+  type Mutator = Box<dyn Fn(&mut LineChain)>;
+
+  /// The three arc bearing shapes the invariant test walks.
+  fn invariant_fixtures() -> Vec<(&'static str, LineChain)> {
+    vec![
+      (
+        "two arcs sharing a point",
+        chain_with_two_arcs_sharing_a_point(),
+      ),
+      (
+        "a straight run between two arcs",
+        chain_with_a_straight_run_between_two_arcs(),
+      ),
+      ("an arc at each end", chain_with_an_arc_at_each_end()),
+    ]
+  }
+
+  /// The private `check_invariants` holds after every mutator.
+  ///
+  /// Change 2 of note 09 section 11.1 asks for exactly this: the shape
+  /// vector stays parallel to the points, every arc index names a stored
+  /// arc, each arc's vertices form one run with the right roles at its
+  /// ends, and the arcs stay in chain order.
+  #[test]
+  fn every_mutator_leaves_the_arc_invariants_intact() {
+    let extra = ShapeArc::new(
+      point(9_000_000, 0),
+      point(9_500_000, 500_000),
+      point(10_000_000, 0),
+      0,
+    );
+
+    for (name, original) in invariant_fixtures() {
+      let last = original.point_count() - 1;
+      let middle = original.point_count() / 2;
+
+      let mutators: Vec<(&str, Mutator)> = vec![
+        (
+          "append",
+          Box::new(|chain: &mut LineChain| {
+            chain.append(point(20_000_000, 20_000_000));
+          }),
+        ),
+        (
+          "append_allow_duplicate",
+          Box::new(|chain: &mut LineChain| {
+            let last_point = chain.last_point().unwrap();
+
+            chain.append_allow_duplicate(last_point);
+          }),
+        ),
+        (
+          "append_chain",
+          Box::new(move |chain: &mut LineChain| {
+            let mut other = LineChain::new();
+
+            other.append_arc(&extra, ARC_HIGH_DEF);
+            chain.append_chain(&other);
+          }),
+        ),
+        (
+          "append_arc",
+          Box::new(move |chain: &mut LineChain| {
+            chain.append_arc(&extra, ARC_HIGH_DEF);
+          }),
+        ),
+        (
+          "append_arc onto its own last point",
+          Box::new(|chain: &mut LineChain| {
+            let tail = chain.last_point().unwrap();
+            let arc = ShapeArc::new(
+              tail,
+              tail + point(500_000, 500_000),
+              tail + point(1_000_000, 0),
+              0,
+            );
+
+            chain.append_arc(&arc, ARC_HIGH_DEF);
+          }),
+        ),
+        (
+          "insert at the middle",
+          Box::new(move |chain: &mut LineChain| {
+            chain.insert(middle, point(-5_000_000, -5_000_000));
+          }),
+        ),
+        (
+          "insert_arc at the middle",
+          Box::new(move |chain: &mut LineChain| {
+            chain.insert_arc(middle, &extra, ARC_HIGH_DEF);
+          }),
+        ),
+        (
+          "remove the middle vertex",
+          Box::new(move |chain: &mut LineChain| {
+            chain.remove(middle);
+          }),
+        ),
+        (
+          "remove_range over the middle",
+          Box::new(move |chain: &mut LineChain| {
+            chain.remove_range(1, middle);
+          }),
+        ),
+        (
+          "remove_range over everything",
+          Box::new(move |chain: &mut LineChain| {
+            chain.remove_range(0, last);
+          }),
+        ),
+        (
+          "remove_shape at the middle",
+          Box::new(move |chain: &mut LineChain| {
+            chain.remove_shape(middle);
+          }),
+        ),
+        (
+          "remove_shape at the last vertex",
+          Box::new(move |chain: &mut LineChain| {
+            chain.remove_shape(last);
+          }),
+        ),
+        (
+          "replace the middle vertex",
+          Box::new(move |chain: &mut LineChain| {
+            chain.replace(middle, middle, point(-5_000_000, -5_000_000));
+          }),
+        ),
+        (
+          "replace_with_chain",
+          Box::new(move |chain: &mut LineChain| {
+            let mut other = LineChain::new();
+
+            other.append_arc(&extra, ARC_HIGH_DEF);
+            chain.replace_with_chain(1, middle, &other);
+          }),
+        ),
+        (
+          "set_point at the middle",
+          Box::new(move |chain: &mut LineChain| {
+            chain.set_point(middle, point(-5_000_000, -5_000_000));
+          }),
+        ),
+        (
+          "set_point at the first vertex",
+          Box::new(|chain: &mut LineChain| {
+            chain.set_point(0, point(-5_000_000, -5_000_000));
+          }),
+        ),
+        (
+          "set_closed",
+          Box::new(|chain: &mut LineChain| {
+            chain.set_closed(true);
+          }),
+        ),
+        (
+          "set_closed then open again",
+          Box::new(|chain: &mut LineChain| {
+            chain.set_closed(true);
+            chain.set_closed(false);
+          }),
+        ),
+        ("reverse", Box::new(|chain: &mut LineChain| chain.reverse())),
+        (
+          "mirror",
+          Box::new(|chain: &mut LineChain| {
+            chain.mirror(&Seg::new(point(0, 0), point(0, 1_000_000)));
+          }),
+        ),
+        (
+          "move_by",
+          Box::new(|chain: &mut LineChain| {
+            chain.move_by(point(1234, -4321));
+          }),
+        ),
+        (
+          "simplify",
+          Box::new(|chain: &mut LineChain| chain.simplify(0)),
+        ),
+        (
+          "simplify with a tolerance",
+          Box::new(|chain: &mut LineChain| {
+            chain.simplify(1000);
+          }),
+        ),
+        (
+          "simplify2",
+          Box::new(|chain: &mut LineChain| chain.simplify2(true)),
+        ),
+        (
+          "simplify2 without colinear removal",
+          Box::new(|chain: &mut LineChain| {
+            chain.simplify2(false);
+          }),
+        ),
+        (
+          "remove_duplicate_points",
+          Box::new(|chain: &mut LineChain| {
+            chain.remove_duplicate_points();
+          }),
+        ),
+        (
+          "split on an arc",
+          Box::new(move |chain: &mut LineChain| {
+            let on_arc = chain.point(1);
+
+            chain.split(on_arc + point(1, 0));
+          }),
+        ),
+        (
+          "split_exact on a vertex",
+          Box::new(move |chain: &mut LineChain| {
+            let on_arc = chain.point(1);
+
+            chain.split_exact(on_arc);
+          }),
+        ),
+        (
+          "clear_arcs",
+          Box::new(|chain: &mut LineChain| chain.clear_arcs()),
+        ),
+        ("clear", Box::new(|chain: &mut LineChain| chain.clear())),
+      ];
+
+      for (what, mutate) in mutators {
+        let mut chain = original.clone();
+
+        mutate(&mut chain);
+        chain.check_invariants();
+
+        assert_eq!(
+          chain.point_count(),
+          chain.shapes.len(),
+          "{name}: {what} left the shape vector out of step"
+        );
+
+        // Every live arc is reachable exactly once and in order.
+        let live: Vec<usize> =
+          chain.live_arcs().map(|(index, _)| index).collect();
+        let mut sorted = live.clone();
+
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+          live, sorted,
+          "{name}: {what} left the live arcs out of order or duplicated"
+        );
+      }
+    }
+  }
+
+  /// An arc whose approximation survives the demotion rule, taken from a
+  /// centre, a start point and a sweep so that the geometry is always
+  /// well formed.
+  fn arc_strategy() -> impl Strategy<Value = ShapeArc> {
+    (
+      -10_000_000i32..10_000_000,
+      -10_000_000i32..10_000_000,
+      100_000i32..5_000_000,
+      -350.0f64..350.0,
+    )
+      .prop_filter_map(
+        "the arc must not be degenerate",
+        |(x, y, radius, sweep)| {
+          if sweep.abs() < 10.0 {
+            return None;
+          }
+
+          let center = Vec2::new(x, y);
+          let arc = ShapeArc::from_center_start_angle(
+            center,
+            center + Vec2::new(radius, 0),
+            Degrees::new(sweep),
+            0,
+          );
+
+          if arc.is_effective_line() {
+            None
+          } else {
+            Some(arc)
+          }
+        },
+      )
+  }
+
+  proptest! {
+    /// Appending an arc and then slicing the whole chain gives the arc
+    /// back, which is the exit criterion of slice 3 of note 09 section 12.
+    ///
+    /// The slice re-polygonises at the accuracy it is given
+    /// (`shape_line_chain.cpp:1519`), so this passes the same accuracy the
+    /// chain was built at. With a different one the arc still comes back
+    /// identical and only the interior points move.
+    #[test]
+    fn append_arc_then_slicing_the_whole_chain_preserves_the_arc(
+      arc in arc_strategy()
+    ) {
+      let mut chain = LineChain::new();
+
+      chain.append_arc(&arc, LineChain::ARC_POLYGONIZATION_MAX_ERROR);
+      prop_assume!(chain.arc_count() == 1);
+
+      let last = chain.point_count() - 1;
+      let sliced = chain.slice(0, last).unwrap();
+
+      prop_assert_eq!(sliced.arc_count(), 1);
+      prop_assert_eq!(sliced.arc(0), chain.arc(0));
+      prop_assert_eq!(sliced.point_count(), chain.point_count());
+      prop_assert_eq!(sliced.points(), chain.points());
+    }
+
+    /// Reversing twice is the identity on the points, the shape entries
+    /// and the arcs.
+    ///
+    /// This is what the chain order invariant buys: the index remap at
+    /// `shape_line_chain.cpp:926` is only a reversal while the arcs are in
+    /// chain order, which is why erratum E7 is fixed rather than
+    /// reproduced.
+    #[test]
+    fn reversing_twice_is_the_identity(
+      first in arc_strategy(),
+      second in arc_strategy(),
+      tail_x in -10_000_000i32..10_000_000,
+      tail_y in -10_000_000i32..10_000_000,
+    ) {
+      let mut chain = LineChain::new();
+
+      chain.append_arc(&first, LineChain::ARC_POLYGONIZATION_MAX_ERROR);
+      chain.append(Vec2::new(tail_x, tail_y));
+      chain.append_arc(&second, LineChain::ARC_POLYGONIZATION_MAX_ERROR);
+
+      let before = chain.clone();
+
+      chain.reverse();
+      chain.reverse();
+
+      prop_assert_eq!(&chain, &before);
+    }
   }
 }

@@ -4741,7 +4741,8 @@ fn nearest_hull_point(
     } else {
       index
     }];
-    let Some(point) = hull.nearest_point(reference) else {
+    // `pns_shove.cpp:359` passes `aAllowInternalShapePoints` as `true`.
+    let Some(point) = hull.nearest_point(reference, true) else {
       continue;
     };
     let distance = if hull.point_inside(reference, 0) {

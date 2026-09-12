@@ -849,6 +849,12 @@ pub struct PendingUpdate {
 /// (`pcbnew/router/pns_line_placer.cpp:1750`, `:1587`). Its host cannot
 /// tell the last two apart and does not need to; this splits the terminal
 /// case out, because that is the one where the facade commits.
+// `LineChain` grew two vectors with the arcs (work item 012 slice 3), which
+// put this enum over clippy's size difference threshold. Boxing the large
+// variant would move a hot path's payload to the heap to satisfy a lint
+// about a value that is built once per call, so the lint is turned off
+// here instead.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, PartialEq, Debug)]
 pub enum FixOutcome {
   /// The placement continues. The frame is the state after the fix, which

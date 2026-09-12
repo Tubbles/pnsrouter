@@ -165,6 +165,12 @@ pub const WALKAROUND_ITERATION_LIMIT: u32 = 1000;
 /// whose ownership KiCad recovers by asking `m_via->BelongsTo( this )`
 /// (`pcbnew/router/pns_line.cpp:56`, `:78`, `:1651`). See the module
 /// documentation for why the distinction is worth a type.
+// `LineChain` grew two vectors with the arcs (work item 012 slice 3), which
+// put this enum over clippy's size difference threshold. Boxing the large
+// variant would move a hot path's payload to the heap to satisfy a lint
+// about a value that is built once per call, so the lint is turned off
+// here instead.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, PartialEq, Debug)]
 pub enum LineVia {
   /// A via the line owns, which is in no node.

@@ -807,6 +807,8 @@ There is **no** test for `Reverse` versus `Reversed`, none for `Mirror`, none fo
 
 ### 8.2 The arc cases of `test_shape_line_chain.cpp`
 
+The three argument `SHAPE_ARC( VECTOR2I, VECTOR2I, EDA_ANGLE )` these cases build their arcs with is the **centre, start, central angle** constructor (`shape_arc.h:57`), not start, end, angle; reading it the other way puts every point count in `Split`, `Slice` and `NearestPointPt` off by one (found in slice 3, 2026-09-12).
+
 | Case | Line | What it pins |
 | --- | --- | --- |
 | `ArcToPolyline` | `:179` | the chain constructor from an arc |
@@ -1040,7 +1042,7 @@ Measured by reimplementing `IO_UTILS::fileHashMMH3` (`common/io/io_utils.cpp:86`
 
 ### E35. `IsArcEnd( 0 )` wraps to the last point even on an open chain
 
-`libs/kimath/src/geometry/shape_line_chain.cpp:3286`, `:3287`. Unconditional, with the `aIndex > size - 1` bound check in the `else if` below it. On an open chain the first point can therefore be reported as an arc end because the **last** segment is an arc segment. Note 01 section 6.2 records it; repeated here because the port's `ArcRef` design (section 11.1) removes the need for the predicate to be geometric at all.
+`libs/kimath/src/geometry/shape_line_chain.cpp:3286`, `:3287`. Unconditional, with the `aIndex > size - 1` bound check in the `else if` below it. The consequence that suggests, the first point of an open chain being reported as an arc end because of the last segment, is unreachable: `IsArcSegment` of the last vertex of an open chain is always false (`:3253`), so `IsArcEnd( 0 )` is always false there and the look back cannot change an answer (found in slice 3, 2026-09-12, which keeps it). Note 01 section 6.2 records the wrap; repeated here because the port's `ArcRef` design (section 11.1) removes the need for the predicate to be geometric at all.
 
 ### E36. `NODE::Add( ARC )` has no degenerate check
 
@@ -1094,7 +1096,7 @@ pub enum ArcRef {
 }
 ```
 
-`is_arc_start`, `is_arc_end` and `is_pt_on_arc` then become field reads, maintained by the paired mutators, and `is_arc_segment` becomes `matches!(shapes[i], Plain) == false && shapes[i].leaving_arc() == shapes[i+1].entering_arc()` with no wrap special case and no geometry. That also removes E11's class of bug by construction, because `leaving_arc()` returns `None` for an `End` and the placer's two predicates collapse into one correct one.
+`is_arc_start`, `is_arc_end` and `is_pt_on_arc` then become field reads, maintained by the paired mutators, and `is_arc_segment` becomes "vertex `i` leaves arc `a` and the next vertex enters arc `a`", with both sides required to name an arc (a last point followed by a plain vertex has `None` on both sides and is not an arc segment) and no geometry. The next vertex is still found with KiCad's closed chain wrap (`shape_line_chain.cpp:3257`): on a closed chain the segment leaving the last vertex arrives at vertex zero. Corrected in slice 3, 2026-09-12; the first draft of this paragraph compared the two sides for equality and had no wrap. That also removes E11's class of bug by construction, because `leaving_arc()` returns `None` for an `End` and the placer's two predicates collapse into one correct one.
 
 **Change 2: enforce the chain order invariant.** KiCad's `Reverse` remaps `i` to `len - i - 1` (`shape_line_chain.cpp:926`), which is a correct reversal only while `arcs` is in chain order, and `Replace( range, chain )` violates that (E7). Make `replace_with_chain` splice the incoming arcs into position rather than appending, and put a debug assertion on the invariant in a private `check_invariants` that the test build calls after every mutator.
 
@@ -1148,7 +1150,7 @@ because `GetCentralAngle`'s `IsEffectiveLine` branch (`shape_arc.cpp:982`) depen
 
 **`src/geometry/line_chain.rs`.** The largest change. New fields `shapes: Vec<ArcRef>` and `arcs: Vec<ShapeArc>`; new methods `arc_count`, `arc`, `arc_index`, `is_pt_on_arc`, `is_arc_segment`, `is_arc_start`, `is_arc_end`, `is_shared_pt`, `next_shape`, `shape_count`, `remove_shape`, `clear_arcs`, and the private `convert_arc`, `split_arc`, `amend_arc`, `fix_indices_rotation`, `merge_first_last_point_if_needed`, `live_arcs`. Arc behaviour into the existing `append` (`:556`), `append_chain` (`:584`), `insert` (`:609`), `remove` (`:629`), `remove_range` (`:649`), `replace` (`:679`), `replace_with_chain` (`:709`), `slice` (`:776`), `split` (`:831`), `set_point` (`:913`), `reverse` (`:871`), `reversed` (`:883`), `mirror` (`:931`), `move_by` (`:894`), `length` (`:976`), `simplify` (`:1126`), `simplify2` (`:1224`), `remove_duplicate_points` (`:1311`), `collide_point` (`:1745`), `collide_seg` (`:1808`), `nearest_point` (`:1907`). New overload `append_arc( &ShapeArc, max_error )`.
 
-Deliberately **unchanged and polyline only**, matching KiCad: `intersect_seg` (`:1396`), `intersect_chain` (`:1475`), `intersects_chain` (`:1629`), `self_intersecting` (`:1662`), `point_along` (`:1052`), `path_length` (`:1001`), `point_inside` (`:2037`), `area` (`:2205`), `split_three_way` (`:2274`). Put a doc comment on each saying so and citing section 2.5, because a future reader will otherwise "fix" one of them.
+Deliberately **unchanged and polyline only**, matching KiCad: `intersect_seg` (`:1396`), `intersect_chain` (`:1475`), `intersects_chain` (`:1629`), `self_intersecting` (`:1662`), `point_along` (`:1052`), `path_length` (`:1001`), `point_inside` (`:2037`), `area` (`:2205`). Not `split_three_way` (`:2274`): its own body is polyline only but it calls `NearestPoint( .., false )`, `Split`, `Reverse` and three `Slice`s, all arc aware (found in slice 3). Put a doc comment on each saying so and citing section 2.5, because a future reader will otherwise "fix" one of them.
 
 Not ported at all: KiCad's `Format`, `Parse`, `CompareGeometry`, `Rotate`, `SelfIntersectingWithArcs` (E15, E16), which have no router caller.
 

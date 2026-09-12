@@ -1607,7 +1607,8 @@ impl Placing {
             Vec2::new(clamped.x as i32, clamped.y as i32)
           })
         } else {
-          hull.nearest_point(at)
+          // :830 takes the default `aAllowInternalShapePoints`, `true`.
+          hull.nearest_point(at, true)
         };
 
         // :832

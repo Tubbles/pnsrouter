@@ -1967,8 +1967,9 @@ fn point_has_bad_corner(chain: &LineChain, vertex_index: usize) -> bool {
 /// When the walk finds nothing, the bad nearest point is used after all
 /// (`:681`).
 fn best_anchor_for_point(chain: &LineChain, at: Vec2) -> Vec2 {
-  // :641, :642
-  let Some(nearest) = chain.nearest_point(at) else {
+  // :641, :642. KiCad takes the default `aAllowInternalShapePoints` here,
+  // which is `true`.
+  let Some(nearest) = chain.nearest_point(at, true) else {
     return at;
   };
   let Some(vertex_index) = chain.find(nearest, 0) else {
@@ -2162,7 +2163,7 @@ mod tests {
     let at = Vec2::new(300_000, -100_000);
 
     // The nearest point is the bad corner itself.
-    assert_eq!(chain.nearest_point(at), Some(Vec2::new(200_000, 0)));
+    assert_eq!(chain.nearest_point(at, true), Some(Vec2::new(200_000, 0)));
     assert_eq!(best_anchor_for_point(&chain, at), Vec2::new(0, 0));
   }
 
@@ -2178,7 +2179,7 @@ mod tests {
     ]);
     let at = Vec2::new(1_100_000, -100_000);
 
-    assert_eq!(chain.nearest_point(at), Some(Vec2::new(1_000_000, 0)));
+    assert_eq!(chain.nearest_point(at, true), Some(Vec2::new(1_000_000, 0)));
     assert!(point_has_bad_corner(&chain, 1));
     assert_eq!(
       best_anchor_for_point(&chain, at),

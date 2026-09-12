@@ -70,7 +70,9 @@ pub use hull::{
   convex_hull, hull_intersection, monotone_chain_hull, octagonal_hull,
   segment_hull,
 };
-pub use line_chain::{Collision, Hit, Intersection, LineChain, SliceError};
+pub use line_chain::{
+  ArcRef, Collision, Hit, Intersection, LineChain, PointRole, SliceError,
+};
 pub use seg::{NearestPoints, Seg, SegCollision};
 pub use shape::{Shape, ShapeKind, SimplePolygon};
 pub use vec2::{Vec2, Vec2L};
