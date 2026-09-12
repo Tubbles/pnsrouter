@@ -20,7 +20,7 @@ Reference: `doc/reference/kicad/09-arcs.md`. The research behind lifting the hol
 The eight slices of note 09 section 12, each leaving the crate green.
 
 - [x] Reference note `doc/reference/kicad/09-arcs.md` (2026-09-12).
-- [ ] Slice 1, `ShapeArc` as a value type: `src/geometry/arc.rs` and the angle helpers in `src/geometry/math.rs`. Exit: the twelve `test_shape_arc.cpp` cases of section 8.4 items 1 and 2, including all six `CalcArcCenter` cases; the E1 decision logged.
+- [x] Slice 1, `ShapeArc` as a value type: `src/geometry/arc.rs` and the angle helpers in `src/geometry/math.rs` (2026-09-12). Exit met except `CollideNearlyFlatArcDoesNotOverflow`, which needs `Collide` and moves to slice 2, where it is already listed. Finding: `test_shape_arc.cpp:1395` to `:1495` holds seven `CalcArcCenter` cases, not the six note 09 section 8.1 counts, and all seven are mirrored. E1 logged in `doc/log/2026-09-12.md`.
 - [ ] Slice 2, arc collision primitives: `collide_point`, `collide_seg`, `nearest_point`, the four `nearest_points` overloads. Exit: `CollidePt`, `CollideSeg`, `CollideArc`, `CollideCircle`, `CollideNearlyFlatArcDoesNotOverflow`; E2 and E3 decided.
 - [ ] Slice 3, arcs inside `LineChain`: the `shapes` and `arcs` fields, `ArcRef`, the predicates, the mutators and queries of section 11.3. Exit: the eleven `test_shape_line_chain.cpp` cases of section 8.4 item 4 plus the two property tests; E5, E6, E7, E10, E12, E13, E14 each behind a named test.
 - [ ] Slice 4, `Shape::Arc`, the six collision rows and `arc_hull`. Exit: `CollideArcToShapeLineChain`, `CollideArcToPolygonApproximation`, and a hull table reproducing `pns_utils.cpp:86`'s truncation.

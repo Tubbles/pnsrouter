@@ -10,7 +10,8 @@
 //!
 //! Modules are added as the port progresses. So far:
 //!
-//! - [`math`]: rounding, rational rescaling and integer square root.
+//! - [`math`]: rounding, rational rescaling, integer square root and the
+//!   degree angle with the rotation the arcs need.
 //! - [`vec2`]: the two integer vector types.
 //! - [`seg`]: line segments, with the distance, intersection and
 //!   collinearity tolerances the router depends on.
@@ -29,12 +30,16 @@
 //! - [`collision`]: the dispatch between two shapes, as an exhaustive
 //!   `match` over the pair, with one minimum translation vector sign
 //!   convention: the vector displaces the second argument.
+//! - [`arc`]: circular arcs in KiCad's three point form, with every
+//!   derived value computed on demand and none cached, and the polyline
+//!   approximation the collision layer falls back to.
 //! - [`hull`]: the octagons the walkaround and the shove walk around,
 //!   built around a rectangle, a capsule or a polygon assumed convex,
 //!   always clockwise, the monotone chain the item model uses in place of
 //!   KiCad's one polygon boolean, plus the filter that turns a raw chain
 //!   intersection into the crossings the walkaround can use.
 
+pub mod arc;
 pub mod box2;
 pub mod collision;
 pub mod direction45;
@@ -45,6 +50,11 @@ pub mod seg;
 pub mod shape;
 pub mod vec2;
 
+pub use arc::{
+  ArcCenter, ShapeArc, arc_to_segment_count, calc_arc_center,
+  calc_arc_center_f64, calc_arc_center_from_angle,
+  circle_to_end_segment_delta_radius,
+};
 pub use box2::Box2;
 pub use collision::{
   ShapeCollision, collide, collide_mtv, collide_point, collide_seg, collides,

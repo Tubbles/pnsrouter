@@ -65,7 +65,7 @@ The three points are the representation. `m_center`, `m_radius` and `m_bbox` are
 | `(segA, segB, radius, width)` | `:74` | tangent to two segments. Uses `EDA_ANGLE`, `sin`, `LineProject` and `RotatePoint` (`:145` to `:171`). On non intersecting or zero length input it asserts and falls back to a 180 degree arc around `segA` (`:121` to `:133`). **No caller in `pcbnew/router/`.** |
 | copy, copy with new width | `:178`, `:191` | copy the cached values directly; the width overload does not re-run `update_values()`, which is correct because width is not an input to it. |
 
-`ConstructFromStartEndAngle( start, end, angle, width )` (`shape_arc.cpp:198` to `:213`): computes `center = CalcArcCenter( start, end, angle )` (the two point plus angle overload, `trigo.cpp:329`), then `m_mid = start` rotated about that centre by `-angle/2`. Start and end survive exactly; mid is a rounded rotation. Note `aWidth` is a `double` parameter assigned into an `int` member (`:204`), a silent truncation.
+`ConstructFromStartEndAngle( start, end, angle, width )` (`shape_arc.cpp:198` to `:213`): computes `center = CalcArcCenter( start, end, angle )` (the two point plus angle overload, `trigo.cpp:329`), then `m_mid = start` rotated about that centre by `-angle/2`. Start and end survive exactly; mid is a rounded rotation. Note `aWidth` is a `double` parameter assigned into an `int` member (`:204`), a silent truncation. The centre itself is truncated as well: the angle overload of `CalcArcCenter` exists only for `VECTOR2D` (`trigo.h:142`), so `VECTOR2I center( ... )` at `:205` goes through the narrowing constructor at `libs/kimath/include/math/vector2d.h:85`, which clamps and then `static_cast`s towards zero, where the three point overload ends in `KiROUND` (`trigo.cpp:573`). The two centre routines therefore differ in their final rounding as well as in the snapping of section 1.3 (found in slice 1, 2026-09-12).
 
 `ConstructFromStartEndCenter( start, end, center, clockwise, width )` (`:216` to `:245`): takes both radial angles, normalises them, subtracts, then normalises the difference into `[0, 360)` or `(-360, 0]` according to `clockwise`, and rotates `m_mid = start` about `center` by `-angle/2`. **The given centre is not stored**; `update_values()` recomputes a centre from the three points, and that recomputed centre generally differs from the one passed in. This is the single most surprising property of the type for a port, and it is what makes `amendArc` and `Slice`'s arc re-cut lossy (section 2.2).
 
@@ -126,7 +126,7 @@ for i in 1, 3, 5, ... < n:  append KiROUND( c + r * unit( sa + ca*i/n ) )       
 append m_end                                                                   :1070
 ```
 
-The doubling at `:1053` with the odd stride at `:1057` is what makes the first and last sub-segments half length, so the exact endpoints stay on the arc while the interior points sit on the inflated radius. The degenerate branch produces a two point chain, which `Append(SHAPE_ARC)` then refuses to tag as an arc (`shape_line_chain.cpp:1622`).
+Two rounding sites the pseudo code hides: `GetArcToSegmentCount` and `CircleToEndSegmentDeltaRadius` both take an `int` radius (`geometry_utils.cpp:38`, `:63`), so `external_radius` truncates at each call, and `int seg360 = n * 360.0 / |ca|` truncates too (found in slice 1, 2026-09-12). The doubling at `:1053` with the odd stride at `:1057` is what makes the first and last sub-segments half length, so the exact endpoints stay on the arc while the interior points sit on the inflated radius. The degenerate branch produces a two point chain, which `Append(SHAPE_ARC)` then refuses to tag as an arc (`shape_line_chain.cpp:1622`).
 
 `GetArcToSegmentCount( radius, errorMax, arcAngle )` (`geometry_utils.cpp:38` to `:60`) clamps radius and error to at least 1, computes `arc_increment = 2 * acos( 1 - errorMax/radius )` in degrees, clamps it to at most `360/8 = 45` degrees, `KiROUND`s the quotient and returns at least 2. `CircleToEndSegmentDeltaRadius` (`:63` to `:79`) is `KiROUND( |radius * (1 - 1/cos(pi/segCount))| )` with the segment count floored at 3.
 
@@ -799,9 +799,9 @@ For the round trip that does matter, the crate's own: keep the three points and 
 | `DegenerateArcCoincidentPoints` | `:1343` | `CalcArcCenter`'s coincidence exits |
 | `CollinearArcSweepIsNotAFullTurn` | `:1361` | `IsEffectiveLine` feeding `GetCentralAngle` |
 | `CurvedArcsKeepTheirSweep` | `:1380` | the same, the other way |
-| `CalcArcCenterTwoCoincidentStartMid` etc., six cases | `:1395` to `:1495` | every `CalcArcCenter` early exit and the board scale sanity check |
+| `CalcArcCenterTwoCoincidentStartMid` etc., seven cases | `:1395` to `:1495` | every `CalcArcCenter` early exit and the board scale sanity check |
 
-**Mirror these.** They are pure geometry, need no board and no GUI, and they are the executable specification of the part a port is most likely to get subtly wrong. In priority order: the six `CalcArcCenter` cases, `BasicSMEGeom`, `ArcToPolyline`, `CollideSeg`, `CollidePt`, `CollideArc`, `CollideNearlyFlatArcDoesNotOverflow`.
+**Mirror these.** They are pure geometry, need no board and no GUI, and they are the executable specification of the part a port is most likely to get subtly wrong. In priority order: the seven `CalcArcCenter` cases, `BasicSMEGeom`, `ArcToPolyline`, `CollideSeg`, `CollidePt`, `CollideArc`, `CollideNearlyFlatArcDoesNotOverflow`.
 
 There is **no** test for `Reverse` versus `Reversed`, none for `Mirror`, none for `Rotate`, and none for `GetLength`.
 
@@ -861,7 +861,7 @@ Six of the eleven cases carry a `board_hash` that matches no board at this commi
 
 ### 8.4 What to mirror, consolidated
 
-1. The six `CalcArcCenter` cases from `test_shape_arc.cpp:1395` to `:1495`. Do these first; they pin the one routine whose behaviour is neither obvious nor continuous.
+1. The seven `CalcArcCenter` cases from `test_shape_arc.cpp:1395` to `:1495` (`TwoCoincidentStartMid`, `TwoCoincidentMidEnd`, `TwoCoincidentStartEnd`, `ThreeNearCoincident`, `ThinArcNotDegenerate`, `FewUnitArcKeepsItsCircumcircle`, `BoardScaleSanity`). Do these first; they pin the one routine whose behaviour is neither obvious nor continuous.
 2. `BasicSMEGeom`, `BasicSECGeom`, `ArcToPolyline`, `CollideNearlyFlatArcDoesNotOverflow`, `DegenerateArcCoincidentPoints`, `CollinearArcSweepIsNotAFullTurn`, `CurvedArcsKeepTheirSweep`.
 3. `CollidePt`, `CollideSeg`, `CollideArc`, `CollideCircle`, `CollideArcToShapeLineChain`.
 4. `AppendArc`, `Slice`, `Split`, `RemoveShape`, `RemoveShapeAfterSimplify`, `ShapeCount`, `NextShape`, `ArcWrappingToStartSharedPoints`, `SimplifyWithArcs`, `NearestPointPt`, `ReplaceChain`.
@@ -1132,7 +1132,7 @@ The centre needs a name for its degeneracy:
 ```rust
 pub enum ArcCenter {
     Circumcentre(Vec2),
-    Degenerate(Vec2),   // one of CalcArcCenter's four stand-ins
+    Degenerate(Vec2),   // one of CalcArcCenter's three coincidence stand-ins
 }
 ```
 
@@ -1210,7 +1210,7 @@ Each slice is independently reviewable, leaves the crate green, and has an exit 
 
 **Slice 1: `ShapeArc` as a value type.** `src/geometry/arc.rs` and the angle helpers in `src/geometry/math.rs`. The three points, the two named constructors, `calc_arc_center` both overloads, `is_ccw`, `is_effective_line`, `center`, `radius`, both endpoint angles, `central_angle`, `length`, `bbox`, `chord`, `nearest_point`, `slice_contains_point`, `convert_to_polyline`, `arc_to_segment_count`, `move_by`, `mirror`, `reverse`, `reversed`. No `LineChain` change, no `Shape` variant, nothing else in the crate touched.
 
-*Exit:* the twelve `test_shape_arc.cpp` cases of section 8.4 items 1 and 2 pass, including all six `CalcArcCenter` cases. Write the E1 decision into `doc/log/` before the commit.
+*Exit:* the twelve `test_shape_arc.cpp` cases of section 8.4 items 1 and 2 pass, including all seven `CalcArcCenter` cases. Write the E1 decision into `doc/log/` before the commit.
 
 **Slice 2: `ShapeArc::collide_point` and `collide_seg`.** The two candidate point routines of section 1.6, plus `nearest_point` and the four `nearest_points` overloads. Still no `LineChain` change.
 

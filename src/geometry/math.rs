@@ -1,10 +1,21 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Scalar arithmetic shared by the geometry layer.
+//! Scalar arithmetic and angles shared by the geometry layer.
 //!
 //! Ported from `libs/kimath/include/math/util.h`,
-//! `libs/kimath/src/math/util.cpp` and the integer square root in
-//! `libs/kimath/src/geometry/seg.cpp`.
+//! `libs/kimath/src/math/util.cpp`, the integer square root in
+//! `libs/kimath/src/geometry/seg.cpp`, and, for [`Degrees`] and
+//! [`rotate_point`], `libs/kimath/include/geometry/eda_angle.h` and
+//! `libs/kimath/src/trigo.cpp`.
+//!
+//! The angle part arrived with the arcs (`doc/reference/kicad/09-arcs.md`
+//! section 11.2): nothing below an arc needs a trigonometric angle, and
+//! everything an arc derives from its three points does.
+
+use std::f64::consts::{FRAC_1_SQRT_2, PI, SQRT_2};
+use std::ops::{Add, Div, Mul, Neg, Sub};
+
+use crate::geometry::vec2::{Vec2, Vec2L};
 
 /// Round to the nearest integer with halfway cases going away from zero,
 /// then saturate into the `i32` range.
@@ -103,6 +114,375 @@ pub fn isqrt(value: u64) -> u64 {
 pub fn sign<T: Default + PartialOrd>(value: T) -> i32 {
   let zero = T::default();
   i32::from(zero < value) - i32::from(value < zero)
+}
+
+/// The number of radians in one degree.
+///
+/// Port of `EDA_ANGLE::DEGREES_TO_RADIANS`,
+/// `libs/kimath/include/geometry/eda_angle.h:122`. Both conversions go
+/// through this one constant and KiCad divides by it to go from radians to
+/// degrees rather than multiplying by its reciprocal, which is reproduced
+/// in [`Degrees::from_radians`] because the two differ in the last bit.
+pub const DEGREES_TO_RADIANS: f64 = PI / 180.0;
+
+/// An angle in degrees.
+///
+/// Port of `EDA_ANGLE`, `libs/kimath/include/geometry/eda_angle.h:36`,
+/// which stores degrees in a `double` and offers the tenths of a degree
+/// and radians forms as conversions. Only the parts the arc geometry
+/// reaches are ported: the vector constructor, the two normalisations, the
+/// sine and cosine with their exact quadrant cases, and the arithmetic.
+///
+/// The type is deliberately not normalised on construction, as KiCad's is
+/// not: `Normalize` is something callers ask for, and several routines
+/// depend on an angle staying outside `[0, 360)`.
+#[derive(Copy, Clone, Debug, Default, PartialEq, PartialOrd)]
+pub struct Degrees(f64);
+
+impl Degrees {
+  /// Zero degrees, KiCad's `ANGLE_0` (`eda_angle.h:422`).
+  pub const ZERO: Degrees = Degrees(0.0);
+
+  /// 45 degrees, KiCad's `ANGLE_45` (`eda_angle.h:423`).
+  pub const EIGHTH_TURN: Degrees = Degrees(45.0);
+
+  /// 90 degrees, KiCad's `ANGLE_90` (`eda_angle.h:424`).
+  pub const QUARTER_TURN: Degrees = Degrees(90.0);
+
+  /// 180 degrees, KiCad's `ANGLE_180` (`eda_angle.h:426`).
+  pub const HALF_TURN: Degrees = Degrees(180.0);
+
+  /// 270 degrees, KiCad's `ANGLE_270` (`eda_angle.h:427`).
+  pub const THREE_QUARTER_TURN: Degrees = Degrees(270.0);
+
+  /// 360 degrees, KiCad's `ANGLE_360` (`eda_angle.h:428`).
+  pub const FULL_TURN: Degrees = Degrees(360.0);
+
+  /// An angle from a value already in degrees.
+  ///
+  /// Port of `EDA_ANGLE( double aAngleInDegrees )`,
+  /// `libs/kimath/include/geometry/eda_angle.h:68`.
+  pub const fn new(degrees: f64) -> Self {
+    Self(degrees)
+  }
+
+  /// An angle from a value in radians.
+  ///
+  /// Port of `EDA_ANGLE( double, RADIANS_T )`,
+  /// `libs/kimath/include/geometry/eda_angle.h:46`, which divides by
+  /// [`DEGREES_TO_RADIANS`] rather than multiplying by `180 / pi`.
+  pub fn from_radians(radians: f64) -> Self {
+    Self(radians / DEGREES_TO_RADIANS)
+  }
+
+  /// The angle of a vector measured from the positive x axis, with the y
+  /// axis pointing up.
+  ///
+  /// Port of `EDA_ANGLE( const VECTOR2D& )`,
+  /// `libs/kimath/include/geometry/eda_angle.h:72`. The five exact cases
+  /// come before the `atan2`, so an axis aligned or exactly diagonal
+  /// vector produces a whole number of degrees and the quadrant cases of
+  /// [`Degrees::sin`] and [`Degrees::cos`] then fire. The result is not
+  /// normalised: the negative x axis is `-180`, not `180`.
+  pub fn from_vector(x: f64, y: f64) -> Self {
+    if x == 0.0 && y == 0.0 {
+      Self(0.0)
+    } else if y == 0.0 {
+      if x >= 0.0 { Self(0.0) } else { Self(-180.0) }
+    } else if x == 0.0 {
+      if y >= 0.0 { Self(90.0) } else { Self(-90.0) }
+    } else if x == y {
+      if x >= 0.0 { Self(45.0) } else { Self(-135.0) }
+    } else if x == -y {
+      if x >= 0.0 { Self(-45.0) } else { Self(135.0) }
+    } else {
+      Self::from_radians(y.atan2(x))
+    }
+  }
+
+  /// The value in degrees.
+  ///
+  /// Port of `AsDegrees`,
+  /// `libs/kimath/include/geometry/eda_angle.h:116`.
+  pub const fn as_degrees(self) -> f64 {
+    self.0
+  }
+
+  /// The value in radians.
+  ///
+  /// Port of `AsRadians`,
+  /// `libs/kimath/include/geometry/eda_angle.h:120`.
+  pub fn as_radians(self) -> f64 {
+    self.0 * DEGREES_TO_RADIANS
+  }
+
+  /// The same angle brought into `[0, 360)`.
+  ///
+  /// Port of `Normalize`,
+  /// `libs/kimath/include/geometry/eda_angle.h:229`, which mutates in
+  /// place and returns itself. The repeated addition and subtraction of
+  /// 360 is kept rather than a remainder, because the two do not agree in
+  /// the last bit and the centre and sweep of an arc are compared exactly
+  /// in several places (note 09 section 1.10).
+  ///
+  /// # Panics
+  ///
+  /// In a debug build for a value that is not finite, where KiCad's loop
+  /// would not terminate either.
+  pub fn normalized(self) -> Self {
+    debug_assert!(self.0.is_finite(), "Degrees::normalized: not finite");
+
+    let mut value = self.0;
+
+    while value < 0.0 {
+      value += 360.0;
+    }
+
+    while value >= 360.0 {
+      value -= 360.0;
+    }
+
+    Self(value)
+  }
+
+  /// The same angle brought into `(-180, 180]`.
+  ///
+  /// Port of `Normalize180`,
+  /// `libs/kimath/include/geometry/eda_angle.h:269`. Note the asymmetric
+  /// bounds: `-180` is pushed up to `180`, and `180` itself stays.
+  ///
+  /// # Panics
+  ///
+  /// In a debug build for a value that is not finite, as
+  /// [`Degrees::normalized`] does.
+  pub fn normalized_180(self) -> Self {
+    debug_assert!(self.0.is_finite(), "Degrees::normalized_180: not finite");
+
+    let mut value = self.0;
+
+    while value <= -180.0 {
+      value += 360.0;
+    }
+
+    while value > 180.0 {
+      value -= 360.0;
+    }
+
+    Self(value)
+  }
+
+  /// The sine of the angle.
+  ///
+  /// Port of `Sin`, `libs/kimath/include/geometry/eda_angle.h:178`. The
+  /// eight exact multiples of 45 degrees are answered from a table so that
+  /// a quarter turn is exactly one and a diagonal is exactly
+  /// `sqrt(1/2)`; everything else goes through the library `sin` of the
+  /// **unnormalised** value, which is what KiCad passes.
+  pub fn sin(self) -> f64 {
+    let test = self.normalized().0;
+
+    if test == 0.0 || test == 180.0 {
+      0.0
+    } else if test == 45.0 || test == 135.0 {
+      FRAC_1_SQRT_2
+    } else if test == 225.0 || test == 315.0 {
+      -FRAC_1_SQRT_2
+    } else if test == 90.0 {
+      1.0
+    } else if test == 270.0 {
+      -1.0
+    } else {
+      self.as_radians().sin()
+    }
+  }
+
+  /// The cosine of the angle.
+  ///
+  /// Port of `Cos`, `libs/kimath/include/geometry/eda_angle.h:197`, with
+  /// the same exact cases and the same unnormalised fallback as
+  /// [`Degrees::sin`].
+  pub fn cos(self) -> f64 {
+    let test = self.normalized().0;
+
+    if test == 0.0 {
+      1.0
+    } else if test == 180.0 {
+      -1.0
+    } else if test == 90.0 || test == 270.0 {
+      0.0
+    } else if test == 45.0 || test == 315.0 {
+      FRAC_1_SQRT_2
+    } else if test == 135.0 || test == 225.0 {
+      -FRAC_1_SQRT_2
+    } else {
+      self.as_radians().cos()
+    }
+  }
+}
+
+impl Neg for Degrees {
+  type Output = Degrees;
+
+  /// Port of `EDA_ANGLE::Invert`,
+  /// `libs/kimath/include/geometry/eda_angle.h:173`.
+  fn neg(self) -> Degrees {
+    Degrees(-self.0)
+  }
+}
+
+impl Add for Degrees {
+  type Output = Degrees;
+
+  /// Port of `operator+( const EDA_ANGLE&, const EDA_ANGLE& )`,
+  /// `libs/kimath/include/geometry/eda_angle.h:340`.
+  fn add(self, other: Degrees) -> Degrees {
+    Degrees(self.0 + other.0)
+  }
+}
+
+impl Sub for Degrees {
+  type Output = Degrees;
+
+  /// Port of `operator-( const EDA_ANGLE&, const EDA_ANGLE& )',
+  /// `libs/kimath/include/geometry/eda_angle.h:334`.
+  fn sub(self, other: Degrees) -> Degrees {
+    Degrees(self.0 - other.0)
+  }
+}
+
+impl Mul<f64> for Degrees {
+  type Output = Degrees;
+
+  /// Port of `operator*( const EDA_ANGLE&, double )`,
+  /// `libs/kimath/include/geometry/eda_angle.h:346`.
+  fn mul(self, factor: f64) -> Degrees {
+    Degrees(self.0 * factor)
+  }
+}
+
+impl Div<f64> for Degrees {
+  type Output = Degrees;
+
+  /// Port of `operator/( const EDA_ANGLE&, double )`,
+  /// `libs/kimath/include/geometry/eda_angle.h:352`.
+  fn div(self, divisor: f64) -> Degrees {
+    Degrees(self.0 / divisor)
+  }
+}
+
+/// The Euclidean norm of a floating point vector.
+///
+/// Port of `VECTOR2<double>::EuclideanNorm`,
+/// `libs/kimath/include/math/vector2d.h:279`, the floating point
+/// instantiation: the exact diagonal takes `|x| * sqrt(2)` and an axis
+/// aligned vector takes the absolute value of its one non zero component,
+/// so that both come out without a `hypot` rounding step.
+///
+/// [`crate::geometry::vec2::Vec2::distance`] runs the same three cases on
+/// the integer types; this is the entry point the arc centre needs, where
+/// the operands are already `f64` and never were coordinates.
+pub fn euclidean_norm_f64(x: f64, y: f64) -> f64 {
+  if x.abs() == y.abs() {
+    return x.abs() * SQRT_2;
+  }
+
+  if x == 0.0 {
+    return y.abs();
+  }
+
+  if y == 0.0 {
+    return x.abs();
+  }
+
+  x.hypot(y)
+}
+
+/// Rotate a point about a centre, clockwise on screen for a positive
+/// angle.
+///
+/// Port of `RotatePoint( int*, int*, int, int, const EDA_ANGLE& )`,
+/// `libs/kimath/src/trigo.cpp:263`, which subtracts the centre, calls the
+/// two argument form (`:225`) and adds the centre back. The four cardinal
+/// angles are exact swaps of the two coordinates, so a quarter turn never
+/// loses a nanometre; every other angle rounds the trigonometric product
+/// with [`kiround`].
+///
+/// Deviation: the offset from the centre is carried in `i64` and the
+/// result saturates into `i32`, where KiCad computes in `int` throughout
+/// and wraps on a pair of points more than the coordinate range apart.
+pub fn rotate_point(point: Vec2, center: Vec2, angle: Degrees) -> Vec2 {
+  let rotated = rotate_offset(point.widening_sub(center), angle);
+
+  Vec2L::new(
+    rotated.x.saturating_add(i64::from(center.x)),
+    rotated.y.saturating_add(i64::from(center.y)),
+  )
+  .saturating_to_vec2()
+}
+
+/// Rotate a floating point position about a centre, clockwise on screen
+/// for a positive angle.
+///
+/// Port of `RotatePoint( double*, double*, double, double, const EDA_ANGLE& )`,
+/// `libs/kimath/src/trigo.cpp:277` and the two argument form at `:291`.
+/// Pass `(0.0, 0.0)` as the centre for the latter, which is what it does.
+/// Nothing is rounded here, so this is the form the constructors that take
+/// a centre use before they round once at the end.
+pub fn rotate_point_f64(
+  point: (f64, f64),
+  center: (f64, f64),
+  angle: Degrees,
+) -> (f64, f64) {
+  let (x, y) = rotate_offset_f64(point.0 - center.0, point.1 - center.1, angle);
+
+  (x + center.0, y + center.1)
+}
+
+/// The rotation about the origin that [`rotate_point`] is built on,
+/// `libs/kimath/src/trigo.cpp:225`.
+fn rotate_offset(offset: Vec2L, angle: Degrees) -> Vec2L {
+  let angle = angle.normalized();
+
+  if angle == Degrees::ZERO {
+    offset
+  } else if angle == Degrees::QUARTER_TURN {
+    Vec2L::new(offset.y, -offset.x)
+  } else if angle == Degrees::HALF_TURN {
+    Vec2L::new(-offset.x, -offset.y)
+  } else if angle == Degrees::THREE_QUARTER_TURN {
+    Vec2L::new(-offset.y, offset.x)
+  } else {
+    let sinus = angle.sin();
+    let cosinus = angle.cos();
+    let x = offset.x as f64;
+    let y = offset.y as f64;
+
+    Vec2L::new(
+      kiround_i64(y * sinus + x * cosinus),
+      kiround_i64(y * cosinus - x * sinus),
+    )
+  }
+}
+
+/// The rotation about the origin that [`rotate_point_f64`] is built on,
+/// `libs/kimath/src/trigo.cpp:291`.
+fn rotate_offset_f64(x: f64, y: f64, angle: Degrees) -> (f64, f64) {
+  let angle = angle.normalized();
+
+  if angle == Degrees::ZERO {
+    (x, y)
+  } else if angle == Degrees::QUARTER_TURN {
+    (y, -x)
+  } else if angle == Degrees::HALF_TURN {
+    (-x, -y)
+  } else if angle == Degrees::THREE_QUARTER_TURN {
+    (-y, x)
+  } else {
+    let sinus = angle.sin();
+    let cosinus = angle.cos();
+
+    (y * sinus + x * cosinus, y * cosinus - x * sinus)
+  }
 }
 
 #[cfg(test)]
@@ -343,6 +723,144 @@ mod tests {
         "isqrt({value})"
       );
     }
+  }
+
+  /// `Normalize` lands in `[0, 360)` from either side.
+  #[test]
+  fn degrees_normalize_into_a_full_turn() {
+    assert_eq!(Degrees::new(0.0).normalized(), Degrees::ZERO);
+    assert_eq!(Degrees::new(360.0).normalized(), Degrees::ZERO);
+    assert_eq!(Degrees::new(-360.0).normalized(), Degrees::ZERO);
+    assert_eq!(
+      Degrees::new(-90.0).normalized(),
+      Degrees::THREE_QUARTER_TURN
+    );
+    assert_eq!(Degrees::new(450.0).normalized(), Degrees::QUARTER_TURN);
+    assert_eq!(Degrees::new(-720.5).normalized(), Degrees::new(359.5));
+  }
+
+  /// `Normalize180`'s bounds are asymmetric: `-180` is pushed up to `180`
+  /// and `180` itself stays.
+  #[test]
+  fn degrees_normalize_180_keeps_the_half_turn() {
+    assert_eq!(Degrees::new(180.0).normalized_180(), Degrees::HALF_TURN);
+    assert_eq!(Degrees::new(-180.0).normalized_180(), Degrees::HALF_TURN);
+    assert_eq!(Degrees::new(181.0).normalized_180(), Degrees::new(-179.0));
+    assert_eq!(Degrees::new(-179.0).normalized_180(), Degrees::new(-179.0));
+    assert_eq!(Degrees::new(540.0).normalized_180(), Degrees::HALF_TURN);
+  }
+
+  /// The five exact cases of the vector constructor, which is what keeps
+  /// an axis aligned or diagonal arc on whole degrees.
+  #[test]
+  fn degrees_from_vector_has_exact_cases() {
+    assert_eq!(Degrees::from_vector(0.0, 0.0), Degrees::ZERO);
+    assert_eq!(Degrees::from_vector(5.0, 0.0), Degrees::ZERO);
+    assert_eq!(Degrees::from_vector(-5.0, 0.0), Degrees::new(-180.0));
+    assert_eq!(Degrees::from_vector(0.0, 5.0), Degrees::QUARTER_TURN);
+    assert_eq!(Degrees::from_vector(0.0, -5.0), Degrees::new(-90.0));
+    assert_eq!(Degrees::from_vector(5.0, 5.0), Degrees::EIGHTH_TURN);
+    assert_eq!(Degrees::from_vector(-5.0, -5.0), Degrees::new(-135.0));
+    assert_eq!(Degrees::from_vector(5.0, -5.0), Degrees::new(-45.0));
+    assert_eq!(Degrees::from_vector(-5.0, 5.0), Degrees::new(135.0));
+    // Everything else is an `atan2`.
+    assert!(
+      (Degrees::from_vector(1.0, 2.0).as_degrees() - 63.434_948_822_922).abs()
+        < 1e-9
+    );
+  }
+
+  /// The eight exact multiples of 45 degrees answer from the table, so a
+  /// quarter turn is exactly one and a diagonal exactly `sqrt(1/2)`.
+  #[test]
+  fn degrees_sin_and_cos_have_exact_cases() {
+    assert_eq!(Degrees::ZERO.sin(), 0.0);
+    assert_eq!(Degrees::HALF_TURN.sin(), 0.0);
+    assert_eq!(Degrees::QUARTER_TURN.sin(), 1.0);
+    assert_eq!(Degrees::THREE_QUARTER_TURN.sin(), -1.0);
+    assert_eq!(Degrees::EIGHTH_TURN.sin(), FRAC_1_SQRT_2);
+    assert_eq!(Degrees::new(225.0).sin(), -FRAC_1_SQRT_2);
+
+    assert_eq!(Degrees::ZERO.cos(), 1.0);
+    assert_eq!(Degrees::HALF_TURN.cos(), -1.0);
+    assert_eq!(Degrees::QUARTER_TURN.cos(), 0.0);
+    assert_eq!(Degrees::THREE_QUARTER_TURN.cos(), 0.0);
+    assert_eq!(Degrees::EIGHTH_TURN.cos(), FRAC_1_SQRT_2);
+    assert_eq!(Degrees::new(135.0).cos(), -FRAC_1_SQRT_2);
+
+    // The special cases are chosen on the normalised value but the
+    // fallback uses the unnormalised one, as KiCad's does.
+    assert_eq!(Degrees::new(-90.0).sin(), -1.0);
+    assert_eq!(Degrees::new(450.0).cos(), 0.0);
+  }
+
+  /// Radians go out through the same constant they came in through.
+  #[test]
+  fn degrees_round_trip_through_radians() {
+    assert_eq!(Degrees::from_radians(PI).as_degrees(), 180.0);
+    assert_eq!(Degrees::HALF_TURN.as_radians(), PI);
+    assert_eq!(DEGREES_TO_RADIANS, PI / 180.0);
+  }
+
+  /// The four cardinal rotations are exact swaps, so a quarter turn of a
+  /// board coordinate never loses a nanometre.
+  #[test]
+  fn rotate_point_is_exact_on_the_cardinals() {
+    let point = Vec2::new(1_234_567, -7_654_321);
+    let center = Vec2::new(1000, 2000);
+
+    assert_eq!(rotate_point(point, center, Degrees::ZERO), point);
+    assert_eq!(rotate_point(point, center, Degrees::FULL_TURN), point);
+    assert_eq!(
+      rotate_point(point, center, Degrees::HALF_TURN),
+      Vec2::new(2 * 1000 - 1_234_567, 2 * 2000 + 7_654_321)
+    );
+
+    // A quarter turn is clockwise on screen, where y grows downwards.
+    assert_eq!(
+      rotate_point(Vec2::new(100, 0), Vec2::new(0, 0), Degrees::QUARTER_TURN),
+      Vec2::new(0, -100)
+    );
+    assert_eq!(
+      rotate_point(
+        Vec2::new(100, 0),
+        Vec2::new(0, 0),
+        Degrees::THREE_QUARTER_TURN
+      ),
+      Vec2::new(0, 100)
+    );
+
+    // Four quarter turns are the identity.
+    let mut walked = point;
+
+    for _ in 0..4 {
+      walked = rotate_point(walked, center, Degrees::QUARTER_TURN);
+    }
+
+    assert_eq!(walked, point);
+  }
+
+  /// A non cardinal rotation rounds once, half away from zero.
+  #[test]
+  fn rotate_point_rounds_a_diagonal() {
+    assert_eq!(
+      rotate_point(Vec2::new(100, 0), Vec2::new(0, 0), Degrees::EIGHTH_TURN),
+      Vec2::new(71, -71)
+    );
+    assert_eq!(
+      rotate_point_f64((100.0, 0.0), (0.0, 0.0), Degrees::QUARTER_TURN),
+      (0.0, -100.0)
+    );
+  }
+
+  /// The diagonal and axis aligned cases avoid `hypot`, so they come out
+  /// on the exact constant.
+  #[test]
+  fn euclidean_norm_f64_has_exact_cases() {
+    assert_eq!(euclidean_norm_f64(3.0, 0.0), 3.0);
+    assert_eq!(euclidean_norm_f64(0.0, -3.0), 3.0);
+    assert_eq!(euclidean_norm_f64(2.0, -2.0), 2.0 * SQRT_2);
+    assert_eq!(euclidean_norm_f64(3.0, 4.0), 5.0);
   }
 
   /// `sign` over integers and floats.
