@@ -111,16 +111,24 @@
 //!
 //! # Not ported
 //!
-//! - Every arc and ellipse cell, and the polygon set short circuit
+//! - Every ellipse cell, and the polygon set short circuit
 //!   (`shape_collisions.cpp:1050`), because [`Shape`] has no such
 //!   variants. The arc rescue block inside the polyline versus polyline
 //!   cell (`:426`) is likewise dead here.
+//! - The two arc rows that walk a polyline, `SHAPE_LINE_CHAIN` (`:636`)
+//!   and `SHAPE_LINE_CHAIN_BASE` (`:786`). Both need a [`LineChain`] that
+//!   can carry arcs, which is slice 3 of `doc/work/012-arcs.md`. The
+//!   other four arc rows are here as the `collide_arc_*` free functions,
+//!   which nothing dispatches to yet because [`Shape`] gains its arc
+//!   variant in slice 4.
 //! - `SHAPE_NULL`, which the router never builds. See the
 //!   [`crate::geometry::shape`] module documentation.
 
+use crate::geometry::arc::ShapeArc;
 use crate::geometry::box2::Box2;
 use crate::geometry::line_chain::LineChain;
-use crate::geometry::seg::{Seg, distance_from_squared};
+use crate::geometry::math::kiround;
+use crate::geometry::seg::{NearestPoints, Seg, distance_from_squared};
 use crate::geometry::shape::{Shape, rect_corners, rect_outline};
 use crate::geometry::vec2::{Vec2, Vec2L};
 
@@ -1132,7 +1140,8 @@ fn circle_collide_seg(
 
   if request.wants_actual() {
     if distance_squared == 0
-      && let Some(first) = circle_intersect_seg(circle, seg).first()
+      && let Some(first) =
+        circle_intersect_seg(circle.center, circle.radius, seg).first()
     {
       outcome.location = *first;
     }
@@ -1144,6 +1153,36 @@ fn circle_collide_seg(
   }
 
   Some(outcome)
+}
+
+/// A circle against a segment of no width, in the gap reporting form.
+///
+/// The same cell as [`circle_collide_seg`], reachable from
+/// [`crate::geometry::arc`], which needs it for the full circle branch of
+/// `SHAPE_ARC::Collide( const SEG& )`
+/// (`libs/kimath/src/geometry/shape_arc.cpp:309`). KiCad builds a
+/// `SHAPE_CIRCLE` there and calls its `Collide` directly, passing the
+/// caller's out parameters through.
+///
+/// A boolean only caller gets the same answer from `is_some`, since
+/// `SHAPE_CIRCLE::Collide` decides the collision before it looks at the
+/// pointers (`libs/kimath/include/geometry/shape_circle.h:80`).
+pub(crate) fn circle_seg_collision(
+  center: Vec2,
+  radius: i32,
+  seg: &Seg,
+  clearance: i32,
+) -> Option<ShapeCollision> {
+  circle_collide_seg(
+    CircleRef { center, radius },
+    seg,
+    clearance,
+    Request::Actual,
+  )
+  .map(|outcome| ShapeCollision {
+    actual: outcome.actual,
+    location: outcome.location,
+  })
 }
 
 /// A rectangle against a segment of no width.
@@ -1929,6 +1968,331 @@ fn rect_rect(
 }
 
 // -------------------------------------------------------------------
+// The arc cells
+// -------------------------------------------------------------------
+
+/// Whether an arc and a circle come closer to each other than a
+/// clearance.
+///
+/// Port of `Collide( const SHAPE_ARC&, const SHAPE_CIRCLE&, ... )`,
+/// `libs/kimath/src/geometry/shape_collisions.cpp:597`. An arc that is
+/// straight enough to have no usable circle is handed to the capsule path
+/// as a [`Shape::Segment`] carrying its width (`:600`), which is the
+/// `IsEffectiveLine` guard five of KiCad's six arc rows begin with;
+/// otherwise the answer comes from
+/// [`ShapeArc::nearest_points_to_circle`], so both the arc's half width
+/// and the circle's radius are already in the distance.
+///
+/// This row is **not** wired into [`collide`]: the [`Shape`] enum has no
+/// arc variant until slice 4 of `doc/work/012-arcs.md`.
+pub fn collide_arc_circle(
+  arc: ShapeArc,
+  center: Vec2,
+  radius: i32,
+  clearance: i32,
+) -> Option<ShapeCollision> {
+  arc_circle(
+    arc,
+    CircleRef { center, radius },
+    clearance,
+    Request::Actual,
+  )
+  .map(shape_collision)
+}
+
+/// The translation that separates a circle from an arc.
+///
+/// The translation vector form of [`collide_arc_circle`],
+/// `libs/kimath/src/geometry/shape_collisions.cpp:623`. The vector
+/// displaces the circle, as everywhere else in this module, which is why
+/// the effective line branch negates what the capsule path produced
+/// (`:607`).
+pub fn collide_arc_circle_mtv(
+  arc: ShapeArc,
+  center: Vec2,
+  radius: i32,
+  clearance: i32,
+) -> Option<Vec2> {
+  arc_circle(arc, CircleRef { center, radius }, clearance, Request::Mtv)
+    .map(|outcome| outcome.mtv)
+}
+
+/// Whether an arc and an axis aligned rectangle come closer to each other
+/// than a clearance.
+///
+/// Port of `Collide( const SHAPE_ARC&, const SHAPE_RECT&, ... )`,
+/// `libs/kimath/src/geometry/shape_collisions.cpp:721`, for a rectangle
+/// with square corners. The rounded corner branch (`:723`) delegates to
+/// the arc against line chain row, which is slice 4 of
+/// `doc/work/012-arcs.md`, so this takes no corner radius.
+///
+/// The gap this reports is under-stated for a wide arc, because
+/// [`ShapeArc::nearest_points_to_rect`] loses the half width clamp its
+/// three sibling overloads apply. That is erratum E3 and it is
+/// reproduced; the erratum is on the `nearest_points` method, which is
+/// where the test naming it lives.
+///
+/// Not wired into [`collide`], see [`collide_arc_circle`].
+pub fn collide_arc_rect(
+  arc: ShapeArc,
+  origin: Vec2,
+  size: Vec2,
+  clearance: i32,
+) -> Option<ShapeCollision> {
+  arc_rect(arc, origin, size, clearance, Request::Actual).map(shape_collision)
+}
+
+/// The translation that separates a rectangle from an arc.
+///
+/// The translation vector form of [`collide_arc_rect`],
+/// `libs/kimath/src/geometry/shape_collisions.cpp:750`.
+///
+/// The effective line branch answers zero, because the rectangle against
+/// capsule row it hands off to has no translation vector of its own
+/// (`shape_collisions.cpp:563`). KiCad negates the zero it finds there
+/// and reaches the same answer.
+pub fn collide_arc_rect_mtv(
+  arc: ShapeArc,
+  origin: Vec2,
+  size: Vec2,
+  clearance: i32,
+) -> Option<Vec2> {
+  arc_rect(arc, origin, size, clearance, Request::Mtv)
+    .map(|outcome| outcome.mtv)
+}
+
+/// Whether an arc and a capsule come closer to each other than a
+/// clearance.
+///
+/// Port of `Collide( const SHAPE_ARC&, const SHAPE_SEGMENT&, ... )`,
+/// `libs/kimath/src/geometry/shape_collisions.cpp:763`. The capsule's
+/// half width folds into the clearance and comes back off the reported
+/// gap (`:777`, `:780`), so this is the only arc row that does not go
+/// through `NearestPoints`: it asks the arc itself with
+/// [`ShapeArc::collide_seg`] and therefore inherits erratum E2, the last
+/// colliding candidate rather than the nearest one.
+///
+/// No translation vector: KiCad asserts the request away (`:766`).
+///
+/// This is the row the router actually reaches for an arc against a
+/// straight track (note 09 section 6). Not wired into [`collide`], see
+/// [`collide_arc_circle`].
+pub fn collide_arc_segment(
+  arc: ShapeArc,
+  seg: &Seg,
+  width: i32,
+  clearance: i32,
+) -> Option<ShapeCollision> {
+  arc_segment(
+    arc,
+    SegmentRef { seg: *seg, width },
+    clearance,
+    Request::Actual,
+  )
+  .map(shape_collision)
+}
+
+/// Whether two arcs come closer to each other than a clearance.
+///
+/// Port of `Collide( const SHAPE_ARC&, const SHAPE_ARC&, ... )`,
+/// `libs/kimath/src/geometry/shape_collisions.cpp:850`. Either arc being
+/// straight enough sends the pair down a capsule path, the first one
+/// negating the translation vector and the second not (`:853`, `:864`);
+/// otherwise the answer comes from [`ShapeArc::nearest_points_to_arc`]
+/// with both half widths already applied.
+///
+/// Not wired into [`collide`], see [`collide_arc_circle`].
+pub fn collide_arc_arc(
+  a: ShapeArc,
+  b: ShapeArc,
+  clearance: i32,
+) -> Option<ShapeCollision> {
+  arc_arc(a, b, clearance, Request::Actual).map(shape_collision)
+}
+
+/// The translation that separates the second arc from the first.
+///
+/// The translation vector form of [`collide_arc_arc`],
+/// `libs/kimath/src/geometry/shape_collisions.cpp:879`.
+///
+/// Both effective line branches answer zero, because the arc against
+/// capsule row they reach has no translation vector (`:766`).
+pub fn collide_arc_arc_mtv(
+  a: ShapeArc,
+  b: ShapeArc,
+  clearance: i32,
+) -> Option<Vec2> {
+  arc_arc(a, b, clearance, Request::Mtv).map(|outcome| outcome.mtv)
+}
+
+/// Arc against circle.
+///
+/// `libs/kimath/src/geometry/shape_collisions.cpp:597`, the cell behind
+/// [`collide_arc_circle`].
+fn arc_circle(
+  arc: ShapeArc,
+  circle: CircleRef,
+  clearance: i32,
+  request: Request,
+) -> Option<Outcome> {
+  if arc.is_effective_line() {
+    return negated_mtv(circle_segment(
+      circle,
+      effective_line(arc),
+      clearance,
+      request,
+    ));
+  }
+
+  nearest_points_outcome(
+    arc.nearest_points_to_circle(circle.center, circle.radius),
+    clearance,
+    request,
+  )
+}
+
+/// Arc against a rectangle with square corners.
+///
+/// `libs/kimath/src/geometry/shape_collisions.cpp:721`, the cell behind
+/// [`collide_arc_rect`].
+fn arc_rect(
+  arc: ShapeArc,
+  origin: Vec2,
+  size: Vec2,
+  clearance: i32,
+  request: Request,
+) -> Option<Outcome> {
+  if arc.is_effective_line() {
+    return negated_mtv(rect_segment(
+      RectRef {
+        origin,
+        size,
+        radius: 0,
+      },
+      effective_line(arc),
+      clearance,
+      request,
+    ));
+  }
+
+  nearest_points_outcome(
+    arc.nearest_points_to_rect(origin, size),
+    clearance,
+    request,
+  )
+}
+
+/// Arc against capsule.
+///
+/// `libs/kimath/src/geometry/shape_collisions.cpp:763`, the cell behind
+/// [`collide_arc_segment`].
+fn arc_segment(
+  arc: ShapeArc,
+  capsule: SegmentRef,
+  clearance: i32,
+  request: Request,
+) -> Option<Outcome> {
+  if arc.is_effective_line() {
+    return segment_segment(effective_line(arc), capsule, clearance, request);
+  }
+
+  let half_width = i64::from(capsule.width) / 2;
+  let folded = saturate_i32(i64::from(clearance) + half_width);
+  let collision = arc.collide_seg(&capsule.seg, folded)?;
+
+  Some(Outcome {
+    actual: if request.wants_actual() {
+      clamped_gap(i64::from(collision.actual) - half_width)
+    } else {
+      0
+    },
+    location: collision.location,
+    mtv: Vec2::new(0, 0),
+  })
+}
+
+/// Arc against arc.
+///
+/// `libs/kimath/src/geometry/shape_collisions.cpp:850`, the cell behind
+/// [`collide_arc_arc`].
+fn arc_arc(
+  a: ShapeArc,
+  b: ShapeArc,
+  clearance: i32,
+  request: Request,
+) -> Option<Outcome> {
+  if a.is_effective_line() {
+    return negated_mtv(arc_segment(b, effective_line(a), clearance, request));
+  }
+
+  if b.is_effective_line() {
+    return arc_segment(a, effective_line(b), clearance, request);
+  }
+
+  nearest_points_outcome(a.nearest_points_to_arc(b), clearance, request)
+}
+
+/// The capsule an arc degenerates to when it is straight enough.
+///
+/// `SHAPE_SEGMENT tmp( aA.GetP0(), aA.GetP1(), aA.GetWidth() )`, written
+/// out identically at `libs/kimath/src/geometry/shape_collisions.cpp:602`,
+/// `:729`, `:772`, `:792`, `:855` and `:866`. The mid point is dropped,
+/// which is the whole point of the guard: there is no circle through the
+/// three points worth trusting.
+fn effective_line(arc: ShapeArc) -> SegmentRef {
+  SegmentRef {
+    seg: Seg::new(arc.start(), arc.end()),
+    width: arc.width(),
+  }
+}
+
+/// The tail the three `NearestPoints` based arc cells share.
+///
+/// `libs/kimath/src/geometry/shape_collisions.cpp:615` to `:632`,
+/// repeated verbatim at `:742` and `:871`. The predicate is the module's
+/// strict one, the location is the midpoint of the two points and so lies
+/// on neither shape, and the gap is `KiROUND` of the square root rather
+/// than the truncating integer root the rest of the module uses, because
+/// that is what KiCad writes here (`:622`).
+fn nearest_points_outcome(
+  points: NearestPoints,
+  clearance: i32,
+  request: Request,
+) -> Option<Outcome> {
+  if points.squared_distance != 0
+    && points.squared_distance >= square(i64::from(clearance))
+  {
+    return None;
+  }
+
+  let mut outcome = Outcome::default();
+  let distance = (points.squared_distance as f64).sqrt();
+
+  if request.wants_actual() {
+    outcome.location = midpoint(points.on_self, points.on_other);
+    outcome.actual = kiround(distance).max(0);
+  }
+
+  if request.wants_mtv() {
+    outcome.mtv = points
+      .on_other
+      .widening_sub(points.on_self)
+      .saturating_to_vec2()
+      .resize(truncate_i32(f64::from(clearance) - distance + 3.0));
+  }
+
+  Some(outcome)
+}
+
+/// Drop the fields a gap and location query did not ask for.
+fn shape_collision(outcome: Outcome) -> ShapeCollision {
+  ShapeCollision {
+    actual: outcome.actual,
+    location: outcome.location,
+  }
+}
+
+// -------------------------------------------------------------------
 // Small helpers
 // -------------------------------------------------------------------
 
@@ -1943,11 +2307,15 @@ fn rect_rect(
 /// Deviation: the chord half length uses this crate's exact integer square
 /// root where KiCad truncates an `f64` one (`:363`), as the module
 /// documentation explains.
-fn circle_intersect_line(circle: CircleRef, line: &Seg) -> Vec<Vec2> {
-  let projected = line.line_project(circle.center);
+pub(crate) fn circle_intersect_line(
+  center: Vec2,
+  radius: i32,
+  line: &Seg,
+) -> Vec<Vec2> {
+  let projected = line.line_project(center);
   let center_distance =
-    (Vec2L::from(projected) - Vec2L::from(circle.center)).euclidean_norm();
-  let radius = i64::from(circle.radius);
+    (Vec2L::from(projected) - Vec2L::from(center)).euclidean_norm();
+  let radius = i64::from(radius);
   let tolerance = i64::from(Shape::MIN_PRECISION_IU);
 
   if center_distance > radius + tolerance {
@@ -1971,8 +2339,12 @@ fn circle_intersect_line(circle: CircleRef, line: &Seg) -> Vec<Vec2> {
 /// `libs/kimath/src/geometry/circle.cpp:308`, which filters the line
 /// intersections by `SEG::Contains`, itself a squared tolerance of three
 /// (`seg.cpp:623`).
-fn circle_intersect_seg(circle: CircleRef, seg: &Seg) -> Vec<Vec2> {
-  circle_intersect_line(circle, seg)
+pub(crate) fn circle_intersect_seg(
+  center: Vec2,
+  radius: i32,
+  seg: &Seg,
+) -> Vec<Vec2> {
+  circle_intersect_line(center, radius, seg)
     .into_iter()
     .filter(|point| seg.contains_point(*point))
     .collect()
@@ -2065,6 +2437,7 @@ fn saturate_i32(value: i64) -> i32 {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::geometry::math::Degrees;
   use crate::geometry::shape::ShapeKind;
 
   /// Shorthand for a point.
@@ -2096,6 +2469,451 @@ mod tests {
   /// test pushes against.
   fn unit_square() -> [Vec2; 4] {
     [point(0, 0), point(100, 0), point(100, 100), point(0, 100)]
+  }
+
+  // -----------------------------------------------------------------
+  // Mirrors of qa/tests/libs/kimath/geometry/test_shape_arc.cpp, the
+  // cases that exercise a pairwise arc row
+  // -----------------------------------------------------------------
+
+  /// KiCad's `pcbIUScale.mmToIU`, `include/base_units.h:90`, which rounds
+  /// half towards positive infinity by adding a half and truncating.
+  fn mm_to_iu(millimetres: f64) -> i32 {
+    let scaled = millimetres * 1e6;
+
+    (if millimetres < 0.0 {
+      scaled - 0.5
+    } else {
+      scaled + 0.5
+    }) as i32
+  }
+
+  /// KiCad's `ARC_DATA_MM`, `test_shape_arc.cpp:839`: an arc given by a
+  /// centre, a start point and a sweep, all in millimetres.
+  struct ArcMillimetres {
+    /// The centre.
+    center: (f64, f64),
+    /// The start point.
+    start: (f64, f64),
+    /// The sweep in degrees.
+    central_angle: f64,
+    /// The full track width in millimetres.
+    width: f64,
+  }
+
+  /// One row of KiCad's `ARC_ARC_COLLIDE_CASE`,
+  /// `test_shape_arc.cpp:860`.
+  struct ArcArcCollideCase {
+    /// The case name KiCad gives it.
+    name: &'static str,
+    /// The first arc.
+    first: ArcMillimetres,
+    /// The second arc.
+    second: ArcMillimetres,
+    /// The clearance in millimetres.
+    clearance: f64,
+    /// Whether KiCad reports a collision.
+    collides: bool,
+  }
+
+  /// Shorthand for an [`ArcMillimetres`].
+  fn arc_millimetres(
+    center: (f64, f64),
+    start: (f64, f64),
+    central_angle: f64,
+    width: f64,
+  ) -> ArcMillimetres {
+    ArcMillimetres {
+      center,
+      start,
+      central_angle,
+      width,
+    }
+  }
+
+  /// KiCad's `ARC_DATA_MM::GenerateArc`, `test_shape_arc.cpp:849`, which
+  /// builds a `VECTOR2D` out of two already integral internal units, so
+  /// the narrowing back to `VECTOR2I` is exact.
+  fn arc_from_millimetres(arc: &ArcMillimetres) -> ShapeArc {
+    ShapeArc::from_center_start_angle(
+      point(mm_to_iu(arc.center.0), mm_to_iu(arc.center.1)),
+      point(mm_to_iu(arc.start.0), mm_to_iu(arc.start.1)),
+      Degrees::new(arc.central_angle),
+      mm_to_iu(arc.width),
+    )
+  }
+
+  /// `CollideArc`, `test_shape_arc.cpp:948`, over the fifteen row table
+  /// at `:869`.
+  ///
+  /// KiCad's body checks the same expectation four ways: arc against arc,
+  /// arc against a chain, chain against arc and chain against chain. Only
+  /// the first is mirrored here, because the other three need a
+  /// [`LineChain`] that carries arcs, which is slice 3 of
+  /// `doc/work/012-arcs.md`.
+  #[test]
+  fn collide_arc() {
+    let cases = [
+      ArcArcCollideCase {
+        name: "case 1: No intersection",
+        first: arc_millimetres(
+          (73.843527, 74.355869),
+          (71.713528, 72.965869),
+          -76.36664803,
+          0.2,
+        ),
+        second: arc_millimetres(
+          (71.236473, 74.704131),
+          (73.366472, 76.094131),
+          -76.36664803,
+          0.2,
+        ),
+        clearance: 0.0,
+        collides: false,
+      },
+      ArcArcCollideCase {
+        name: "case 2: No intersection",
+        first: arc_millimetres(
+          (82.542335, 74.825975),
+          (80.413528, 73.435869),
+          -76.4,
+          0.2,
+        ),
+        second: arc_millimetres(
+          (76.491192, 73.839894),
+          (78.619999, 75.23),
+          -76.4,
+          0.2,
+        ),
+        clearance: 0.0,
+        collides: false,
+      },
+      ArcArcCollideCase {
+        name: "case 3: No intersection",
+        first: arc_millimetres(
+          (89.318807, 74.810106),
+          (87.19, 73.42),
+          -76.4,
+          0.2,
+        ),
+        second: arc_millimetres(
+          (87.045667, 74.632941),
+          (88.826472, 75.794131),
+          -267.9,
+          0.2,
+        ),
+        clearance: 0.0,
+        collides: false,
+      },
+      ArcArcCollideCase {
+        name: "case 4: Co-centered not intersecting",
+        first: arc_millimetres(
+          (94.665667, 73.772941),
+          (96.446472, 74.934131),
+          -267.9,
+          0.2,
+        ),
+        second: arc_millimetres(
+          (94.665667, 73.772941),
+          (93.6551, 73.025482),
+          -255.5,
+          0.2,
+        ),
+        clearance: 0.0,
+        collides: false,
+      },
+      ArcArcCollideCase {
+        name: "case 5: Not intersecting, but end points very close",
+        first: arc_millimetres(
+          (72.915251, 80.493054),
+          (73.570159, 81.257692),
+          -260.5,
+          0.2,
+        ),
+        second: arc_millimetres(
+          (73.063537, 82.295989),
+          (71.968628, 81.581351),
+          -255.5,
+          0.2,
+        ),
+        clearance: 0.0,
+        collides: false,
+      },
+      ArcArcCollideCase {
+        name: "case 6: Coincident centers, colliding due to arc thickness",
+        first: arc_millimetres(
+          (79.279991, 80.67988),
+          (80.3749, 81.394518),
+          -255.5,
+          0.3,
+        ),
+        second: arc_millimetres(
+          (79.279991, 80.67988),
+          (80.3749, 81.694518),
+          -255.5,
+          0.3,
+        ),
+        clearance: 0.0,
+        collides: true,
+      },
+      ArcArcCollideCase {
+        name: "case 7: Single intersection",
+        first: arc_millimetres(
+          (88.495265, 81.766089),
+          (90.090174, 82.867869),
+          -255.5,
+          0.2,
+        ),
+        second: arc_millimetres(
+          (86.995265, 81.387966),
+          (89.090174, 82.876887),
+          -255.5,
+          0.2,
+        ),
+        clearance: 0.0,
+        collides: true,
+      },
+      ArcArcCollideCase {
+        name: "case 8: Double intersection",
+        first: arc_millimetres(
+          (96.149734, 81.792126),
+          (94.99, 83.37),
+          -347.2,
+          0.2,
+        ),
+        second: arc_millimetres(
+          (94.857156, 81.240589),
+          (95.91, 83.9),
+          -288.5,
+          0.2,
+        ),
+        clearance: 0.0,
+        collides: true,
+      },
+      ArcArcCollideCase {
+        name: "case 9: Endpoints within arc width",
+        first: arc_millimetres(
+          (72.915251, 86.493054),
+          (73.970159, 87.257692),
+          -260.5,
+          0.2,
+        ),
+        second: arc_millimetres(
+          (73.063537, 88.295989),
+          (71.968628, 87.581351),
+          -255.5,
+          0.2,
+        ),
+        clearance: 0.0,
+        collides: true,
+      },
+      ArcArcCollideCase {
+        name: "case 10: Endpoints close, outside, no collision",
+        first: arc_millimetres(
+          (78.915251, 86.393054),
+          (79.970159, 87.157692),
+          99.5,
+          0.2,
+        ),
+        second: arc_millimetres(
+          (79.063537, 88.295989),
+          (77.968628, 87.581351),
+          -255.5,
+          0.2,
+        ),
+        clearance: 0.0,
+        collides: false,
+      },
+      ArcArcCollideCase {
+        name: "case 11: Endpoints close, inside, collision due to arc width",
+        first: arc_millimetres(
+          (85.915251, 86.993054),
+          (86.970159, 87.757692),
+          99.5,
+          0.2,
+        ),
+        second: arc_millimetres(
+          (86.063537, 88.295989),
+          (84.968628, 87.581351),
+          -255.5,
+          0.2,
+        ),
+        clearance: 0.0,
+        collides: true,
+      },
+      ArcArcCollideCase {
+        name: "case 12: Simulated differential pair length-tuning",
+        first: arc_millimetres((94.6551, 88.296), (95.6551, 88.296), 90.0, 0.1),
+        second: arc_millimetres(
+          (94.6551, 88.296),
+          (95.8551, 88.296),
+          90.0,
+          0.1,
+        ),
+        clearance: 0.1,
+        collides: false,
+      },
+      ArcArcCollideCase {
+        name: "case 13: One arc fully enclosed in other, non-concentric",
+        first: arc_millimetres(
+          (73.77532, 93.413654),
+          (75.70532, 93.883054),
+          60.0,
+          0.1,
+        ),
+        second: arc_millimetres(
+          (73.86532, 93.393054),
+          (75.86532, 93.393054),
+          90.0,
+          0.3,
+        ),
+        clearance: 0.0,
+        collides: true,
+      },
+      ArcArcCollideCase {
+        name: "case 14: One arc fully enclosed in other, concentric",
+        first: arc_millimetres(
+          (79.87532, 93.413654),
+          (81.64532, 94.113054),
+          60.0,
+          0.1,
+        ),
+        second: arc_millimetres(
+          (79.87532, 93.413654),
+          (81.86532, 93.393054),
+          90.0,
+          0.3,
+        ),
+        clearance: 0.0,
+        collides: true,
+      },
+      ArcArcCollideCase {
+        name: "case 15: Arcs separated by clearance",
+        first: arc_millimetres(
+          (303.7615, 149.9252),
+          (303.695968, 149.925237),
+          90.0262,
+          0.065,
+        ),
+        second: arc_millimetres(
+          (303.6345, 149.2637),
+          (303.634523, 148.85619),
+          89.9957,
+          0.065,
+        ),
+        clearance: 0.15,
+        collides: false,
+      },
+    ];
+
+    for case in &cases {
+      let first = arc_from_millimetres(&case.first);
+      let second = arc_from_millimetres(&case.second);
+
+      assert_eq!(
+        collide_arc_arc(first, second, mm_to_iu(case.clearance)).is_some(),
+        case.collides,
+        "{}",
+        case.name
+      );
+    }
+  }
+
+  // -----------------------------------------------------------------
+  // The port's own arc cases
+  // -----------------------------------------------------------------
+
+  /// A straight run of three points, which
+  /// [`ShapeArc::is_effective_line`] catches and every arc row hands to a
+  /// capsule.
+  fn effective_line_arc() -> ShapeArc {
+    ShapeArc::new(point(0, 0), point(500_000, 0), point(1_000_000, 0), 200_000)
+  }
+
+  /// The port's own: the `IsEffectiveLine` guard that opens four of
+  /// KiCad's six arc rows (`shape_collisions.cpp:600`, `:727`, `:771`,
+  /// `:853`) hands the pair to exactly the capsule row it claims to, with
+  /// the same gap and the same location.
+  #[test]
+  fn effective_line_arcs_collide_as_capsules() {
+    let arc = effective_line_arc();
+
+    assert!(arc.is_effective_line());
+
+    let as_capsule = capsule(arc.start(), arc.end(), arc.width());
+    let clearance = 50_000;
+
+    let circle_center = point(500_000, 220_000);
+    let circle = Shape::circle(circle_center, 100_000);
+    let against_circle =
+      collide_arc_circle(arc, circle_center, 100_000, clearance);
+
+    assert!(against_circle.is_some());
+    assert_eq!(against_circle, collide(&circle, &as_capsule, clearance));
+
+    let rect_origin = point(400_000, 120_000);
+    let rect_size = point(200_000, 200_000);
+    let rect = Shape::rect(rect_origin, rect_size);
+    let against_rect = collide_arc_rect(arc, rect_origin, rect_size, clearance);
+
+    assert!(against_rect.is_some());
+    assert_eq!(against_rect, collide(&rect, &as_capsule, clearance));
+
+    let spine = Seg::new(point(0, 200_000), point(1_000_000, 200_000));
+    let other = Shape::segment(spine, 120_000);
+    let against_capsule = collide_arc_segment(arc, &spine, 120_000, clearance);
+
+    assert!(against_capsule.is_some());
+    assert_eq!(against_capsule, collide(&as_capsule, &other, clearance));
+
+    // Both arcs straight: the first one becomes the capsule the second is
+    // measured against (`shape_collisions.cpp:855`).
+    let second =
+      ShapeArc::new(spine.a, point(500_000, 200_000), spine.b, 120_000);
+    let against_arc = collide_arc_arc(arc, second, clearance);
+
+    assert!(against_arc.is_some());
+    assert_eq!(against_arc, collide(&other, &as_capsule, clearance));
+  }
+
+  /// The port's own: the translation vector an effective line arc
+  /// produces displaces the **second** operand, which is why KiCad's
+  /// result has to be negated where it swaps the pair
+  /// (`shape_collisions.cpp:607`).
+  #[test]
+  fn effective_line_arc_translation_vector_displaces_the_second_operand() {
+    let arc = effective_line_arc();
+    let as_capsule = capsule(arc.start(), arc.end(), arc.width());
+    let center = point(500_000, 150_000);
+    let circle = Shape::circle(center, 100_000);
+    let clearance = 20_000;
+
+    let pushout = collide_arc_circle_mtv(arc, center, 100_000, clearance)
+      .expect("the circle overlaps the straight arc");
+
+    assert_eq!(Some(-pushout), collide_mtv(&circle, &as_capsule, clearance));
+    assert!(pushout.y > 0, "the circle is pushed away from the arc");
+  }
+
+  /// The port's own: the arc against capsule row has no translation
+  /// vector of its own, so an arc pair that is not straight enough to
+  /// degenerate still answers one and a straight one does not
+  /// (`shape_collisions.cpp:766`).
+  #[test]
+  fn arc_translation_vectors_follow_kicad_availability() {
+    let curved = ShapeArc::new(
+      point(1_000_000, 0),
+      point(707_107, 707_107),
+      point(0, 1_000_000),
+      200_000,
+    );
+    let center = point(1_050_000, 0);
+
+    assert!(collide_arc_circle_mtv(curved, center, 100_000, 0).is_some());
+    assert_eq!(
+      collide_arc_arc_mtv(effective_line_arc(), effective_line_arc(), 0),
+      Some(point(0, 0))
+    );
   }
 
   // -----------------------------------------------------------------
@@ -2286,7 +3104,7 @@ mod tests {
     ];
 
     for (name, seg, expected) in cases {
-      let found = circle_intersect_seg(circle, &seg);
+      let found = circle_intersect_seg(circle.center, circle.radius, &seg);
       assert!(
         matches_unordered(&expected, &found),
         "{name}: expected {expected:?}, got {found:?}"
@@ -2331,7 +3149,7 @@ mod tests {
     ];
 
     for (name, line, expected) in cases {
-      let found = circle_intersect_line(circle, &line);
+      let found = circle_intersect_line(circle.center, circle.radius, &line);
       assert!(
         matches_unordered(&expected, &found),
         "{name}: expected {expected:?}, got {found:?}"

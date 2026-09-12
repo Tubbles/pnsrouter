@@ -150,7 +150,7 @@ Two overloads, both non virtual entry points for the dispatcher.
 - A sweep over 180 degrees whose chord is shorter than the clearance is treated as a full circle, with an early false when both segment endpoints are strictly inside `radius - clearance` (`:298` to `:310`).
 - Otherwise the candidates are the circle/segment intersections, the segment's nearest point to the centre, its nearest points to the two arc endpoints, and the two segment endpoints (`:318` to `:324`); each goes through the point overload (`:328` to `:335`).
 
-The loop short circuits on the first candidate with `*aActual == 0` when `aActual` is requested, and on the first hit otherwise (`:333`). With `aActual` requested and no exact touch, **every** candidate is tested and `*aActual` holds whichever candidate was evaluated last, not the minimum. That is erratum E2.
+The loop short circuits on the first candidate with `*aActual == 0` when `aActual` is requested, and on the first hit otherwise (`:333`). With `aActual` requested and no exact touch, **every** candidate is tested and `*aActual` holds the last candidate that collided, not the nearest one, because the point overload writes its out parameters only on its true path (`:922` to `:929`). That is erratum E2.
 
 ### 1.7 `NearestPoint`, `NearestPoints`, `IntersectLine`, `Intersect`
 
@@ -162,7 +162,7 @@ Four `NearestPoints` overloads, all returning both points and a squared distance
 | --- | --- | --- |
 | `SHAPE_CIRCLE` | `:499` | arc half width applied to `aPtA`, `aDistSq` zeroed when under `Square(width/2)` (`:543` to `:550`) |
 | `SEG` | `:556` | same treatment (`:622` to `:629`) |
-| `SHAPE_RECT` | `:635` | **none.** Delegates to `SHAPE_LINE_CHAIN::NearestPoints` on `aRect.Outline()` and returns the raw squared distance (`:640` to `:645`). Erratum E3. |
+| `SHAPE_RECT` | `:635` | **applied, then the clamp is lost.** Delegates to the inherited `SHAPE::NearestPoints( const SHAPE* )` on `aRect.Outline()` (`:642`), which reaches the `SEG` overload per outline segment, then recomputes the squared distance from the two returned points (`:644`), one of which the `SEG` overload already moved by half the width. Erratum E3. |
 | `SHAPE_ARC` | `:649` | both arcs' half widths applied by the `adjustForArcWidths` lambda (`:652` to `:663`) |
 
 `sliceContainsPoint( p )` (`:1139` to `:1162`) is the angular containment test used by all the intersection routines: normalise the point's radial angle, walk it by full turns until it is on the right side of the start angle, then compare against the end angle. It works on `EDA_ANGLE`, so it is `double` throughout and has no tolerance of its own.
@@ -667,7 +667,7 @@ So in KiCad's UI at this commit, an arc reaches the dragger only through the rou
 | --- | --- | --- | --- |
 | arc, circle | `:597` | `NearestPoints`, both widths applied | yes, `delta.Resize( clearance - sqrt(dist_sq) + 3 )` (`:626`) |
 | arc, line chain | `:636` | straight segments first skipping arc segments, then arc against each stored arc (`:658`, `:683` to `:688`) | asserted unimplemented (`:639`) |
-| arc, rect | `:721` | rounded rect delegates to the outline (`:724`, `:725`); otherwise `NearestPoints( SHAPE_RECT )`, **width ignored** | yes, same `+ 3` (`:753`) |
+| arc, rect | `:721` | rounded rect delegates to the outline (`:724`, `:725`); otherwise `NearestPoints( SHAPE_RECT )`, **half width applied but the zero clamp lost** (E3) | yes, same `+ 3` (`:753`) |
 | arc, segment | `:763` | `aA.Collide( aB.GetSeg(), clearance + aB.GetWidth()/2 )`, then subtract the half width from `*aActual` (`:777` to `:780`) | asserted unimplemented (`:766`) |
 | arc, line chain base | `:786` | `PointInside` shortcut for a closed chain, else `aA.Collide( segment )` per segment (`:803` to `:832`) | asserted unimplemented (`:796`) |
 | arc, arc | `:850` | `NearestPoints( SHAPE_ARC )`, both widths applied | yes, same `+ 3` |
@@ -683,7 +683,7 @@ Which does the router reach? `ITEM::collideSimple` collides the two items' `Shap
 - `SHAPE_COMPOUND` from a compound pad or a slot hole: flattened by the dispatcher into its children, each of which lands in one of the rows above.
 - `SHAPE_ARC` from another `ARC`: **reached**.
 - `SHAPE_LINE_CHAIN` from a `LINE`: the arc/line-chain case at `:636`, **reached** wherever a line is collided as an item rather than through its segments.
-- `SHAPE_RECT`: built by the router only in `PNS::ApproximateSegmentAsRect` (`pns_utils.cpp:356`), which is not part of any collision path, so the arc/rect case at `:721` is **not reached from the router**. Its `NearestPoints` width omission (erratum E3) therefore costs KiCad's router nothing, and costs a host that hands the router `SHAPE_RECT` pads everything.
+- `SHAPE_RECT`: built by the router only in `PNS::ApproximateSegmentAsRect` (`pns_utils.cpp:356`), which is not part of any collision path, so the arc/rect case at `:721` is **not reached from the router**. Its `NearestPoints` defect (erratum E3) therefore costs KiCad's router nothing, and costs a host that hands the router `SHAPE_RECT` pads everything.
 
 None of the arc rows produce an MTV except against a circle, a rect and another arc. The shove's via pushout (`onCollidingVia`) is the only MTV consumer (note 01 section 9.2), and it collides a `SHAPE_CIRCLE` against things, so the arc/circle row is the one that matters there.
 
@@ -908,11 +908,11 @@ Defects, dead code and surprising behaviour found in this reading. Numbering is 
 
 ### E2. `SHAPE_ARC::Collide( SEG )` reports the last candidate's distance, not the minimum
 
-`libs/kimath/src/geometry/shape_arc.cpp:328` to `:335`. The candidate loop calls `Collide( candidate, aClearance, aActual, aLocation )` for every candidate, each call overwriting `*aActual` and `*aLocation`. It returns early only on `*aActual == 0`. With `aActual` requested and no exact touch, the reported distance is whichever candidate happened to be evaluated last, which is `aSeg.B`. Every caller that wants a minimum distance from an arc against a segment gets an arbitrary one.
+`libs/kimath/src/geometry/shape_arc.cpp:328` to `:335`. The candidate loop calls `Collide( candidate, aClearance, aActual, aLocation )` for every candidate, each call overwriting `*aActual` and `*aLocation`. It returns early only on `*aActual == 0`. With `aActual` requested and no exact touch, the reported distance is the last candidate that collided, since the point overload writes its out parameters only on its true path (`:922` to `:929`). Every caller that wants a minimum distance from an arc against a segment gets an arbitrary one.
 
-### E3. `SHAPE_ARC::NearestPoints( const SHAPE_RECT& )` ignores the arc's width
+### E3. `SHAPE_ARC::NearestPoints( const SHAPE_RECT& )` loses the half width clamp
 
-`libs/kimath/src/geometry/shape_arc.cpp:635` to `:646`. The three sibling overloads (`SHAPE_CIRCLE` at `:543`, `SEG` at `:622`, `SHAPE_ARC` at `:652`) all pull `aPtA` in by half the arc's width and zero the distance when it falls inside. This one returns the raw centre line distance. Its consumer is `Collide( SHAPE_ARC, SHAPE_RECT )` (`shape_collisions.cpp:740`), so a wide arc track against a rectangle under-reports the collision by half the track width. The router does not reach that row (section 6), but a host that hands the engine `SHAPE_RECT` pads would.
+`libs/kimath/src/geometry/shape_arc.cpp:635` to `:646`. The three sibling overloads (`SHAPE_CIRCLE` at `:543`, `SEG` at `:622`, `SHAPE_ARC` at `:652`) all pull `aPtA` in by half the arc's width and zero the distance when it falls inside. This one delegates to the inherited `SHAPE::NearestPoints( const SHAPE* )` on the outline (`:642`), which reaches the `SEG` overload per outline segment and so does move `aPtA` by the half width, and then recomputes `aDistSq` from the two points (`:644`), throwing away the clamp. When the half width exceeds the gap the moved point overshoots the side and the recomputed distance measures the overshoot: a 400 um wide quarter circle whose centre line is 100 um from a side reports 88 um of separation where the `SEG` overload reports zero, and the same arc at zero width reports the true 100 um (measured in slice 2, 2026-09-12). Its consumer is `Collide( SHAPE_ARC, SHAPE_RECT )` (`shape_collisions.cpp:740`), so a wide arc track against a rectangle can be reported as clear when it overlaps. The router does not reach that row (section 6), but a host that hands the engine `SHAPE_RECT` pads would.
 
 ### E4. `SHAPE_ARC::Reverse()` and `Reversed()` are not equivalent
 

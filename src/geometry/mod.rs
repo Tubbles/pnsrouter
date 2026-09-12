@@ -31,8 +31,10 @@
 //!   `match` over the pair, with one minimum translation vector sign
 //!   convention: the vector displaces the second argument.
 //! - [`arc`]: circular arcs in KiCad's three point form, with every
-//!   derived value computed on demand and none cached, and the polyline
-//!   approximation the collision layer falls back to.
+//!   derived value computed on demand and none cached, the polyline
+//!   approximation the collision layer falls back to, and the point,
+//!   segment and nearest point primitives the arc collision rows in
+//!   [`collision`] are built from.
 //! - [`hull`]: the octagons the walkaround and the shove walk around,
 //!   built around a rectangle, a capsule or a polygon assumed convex,
 //!   always clockwise, the monotone chain the item model uses in place of
@@ -57,7 +59,10 @@ pub use arc::{
 };
 pub use box2::Box2;
 pub use collision::{
-  ShapeCollision, collide, collide_mtv, collide_point, collide_seg, collides,
+  ShapeCollision, collide, collide_arc_arc, collide_arc_arc_mtv,
+  collide_arc_circle, collide_arc_circle_mtv, collide_arc_rect,
+  collide_arc_rect_mtv, collide_arc_segment, collide_mtv, collide_point,
+  collide_seg, collides,
 };
 pub use direction45::{AngleType, CornerMode, Direction45, Octant};
 pub use hull::{

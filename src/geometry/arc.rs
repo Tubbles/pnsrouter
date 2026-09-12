@@ -40,17 +40,25 @@
 //! value. That is reproduced verbatim, see [`calc_arc_center`] and the
 //! decision of 2026-09-12 in `doc/log/`.
 //!
-//! Collision and the `NearestPoints` family are not here yet; they are
-//! slice 2 of `doc/work/012-arcs.md`.
+//! [`ShapeArc::collide_point`], [`ShapeArc::collide_seg`] and the four
+//! `nearest_points` methods are the collision primitives everything above
+//! this layer is built from. The pairwise rows that combine an arc with
+//! another shape live in [`crate::geometry::collision`]; they are free
+//! functions and are not reachable through [`crate::geometry::shape::Shape`]
+//! until slice 4 of `doc/work/012-arcs.md` adds the variant.
 
 use std::f64::consts::{FRAC_1_SQRT_2, PI};
 
 use crate::geometry::box2::Box2;
+use crate::geometry::collision::{
+  ShapeCollision, circle_intersect_seg, circle_seg_collision,
+};
 use crate::geometry::line_chain::LineChain;
 use crate::geometry::math::{
   Degrees, euclidean_norm_f64, kiround, rotate_point, rotate_point_f64, sign,
 };
-use crate::geometry::seg::Seg;
+use crate::geometry::seg::{NearestPoints, Seg};
+use crate::geometry::shape::rect_outline;
 use crate::geometry::vec2::{Vec2, Vec2L};
 
 /// The centre of the circle through three points, and where it came from.
@@ -678,6 +686,792 @@ impl ShapeArc {
     Self::new(self.end, self.mid, self.start, self.width)
   }
 
+  /// Whether a point comes within a clearance of the arc, and by how
+  /// much.
+  ///
+  /// Port of `Collide( const VECTOR2I&, int, int*, VECTOR2I* )`,
+  /// `libs/kimath/src/geometry/shape_arc.cpp:844`. The arc's own half
+  /// width is part of the test, so a zero width arc measures to its
+  /// centre line and a track width arc measures to its edge (`:847`,
+  /// `:927`).
+  ///
+  /// Four stages: a bounding box reject (`:851`), a nearly flat branch
+  /// that measures against the two chords instead of a circle (`:859`),
+  /// the nearest point on the full circle (`:882`), and an angular test
+  /// that falls back to the nearer endpoint when the point lies outside
+  /// the sweep (`:896`). The reported location is the point on the arc,
+  /// except in the nearly flat branch where it is the point on the nearer
+  /// chord.
+  ///
+  /// Two pieces of arithmetic here are not the obvious ones and are kept
+  /// as KiCad has them:
+  ///
+  /// - the radius is `|center - start|` through the three case
+  ///   `EuclideanNorm` (`:858`), not the square root of the squared norm
+  ///   that [`ShapeArc::radius`] takes (`:414`). The two disagree in the
+  ///   last bit on some inputs, so this routine has its own radius;
+  /// - a distance that rounds to zero is recomputed as
+  ///   `kiround(radius - sqrt(|point - center|^2))` (`:889`), because
+  ///   measuring from the already rounded nearest point would have
+  ///   truncated the gap away before the subtraction. KiCad's comment at
+  ///   `:887` says exactly that.
+  ///
+  /// Deviations, all widenings: the clearance and half width sum, the
+  /// point to centre difference and the two endpoint distances are taken
+  /// in `i64` where KiCad computes them in `int` and can wrap.
+  pub fn collide_point(
+    self,
+    point: Vec2,
+    clearance: i32,
+  ) -> Option<ShapeCollision> {
+    let minimum_distance = i64::from(clearance) + i64::from(self.width) / 2;
+
+    if !self
+      .bbox(saturate_i32(minimum_distance))
+      .contains_point(Vec2L::from(point))
+    {
+      return None;
+    }
+
+    let center = self.center();
+    let radius = self.collide_radius(center);
+
+    // `CIRCLE` stores an `int` radius, so a nearly straight arc is
+    // measured against its two chords instead (`shape_arc.cpp:861`).
+    if radius >= f64::from(i32::MAX) / 2.0 {
+      let first = Seg::new(self.start, self.mid);
+      let second = Seg::new(self.mid, self.end);
+      let first_distance = first.distance_to_point(point);
+      let second_distance = second.distance_to_point(point);
+      let distance = first_distance.min(second_distance);
+
+      if i64::from(distance) > minimum_distance {
+        return None;
+      }
+
+      return Some(ShapeCollision {
+        actual: self.gap_from_distance(i64::from(distance)),
+        location: if first_distance <= second_distance {
+          first.nearest_point_to_point(point)
+        } else {
+          second.nearest_point_to_point(point)
+        },
+      });
+    }
+
+    let circle_radius = truncate_f64_to_i32(radius);
+    let mut nearest = circle_nearest_point_f64(center, circle_radius, point);
+    let mut distance = i64::from(kiround(euclidean_norm_f64(
+      f64::from(point.x) - nearest.0,
+      f64::from(point.y) - nearest.1,
+    )));
+    let offset = point.widening_sub(center);
+    let angle_to_point = Degrees::from_vector(offset.x as f64, offset.y as f64);
+
+    if distance == 0 {
+      distance = i64::from(kiround(
+        radius - (offset.squared_euclidean_norm() as f64).sqrt(),
+      ));
+      nearest = rotate_point_f64(
+        (
+          f64::from(center.x) + f64::from(circle_radius),
+          f64::from(center.y),
+        ),
+        to_f64(center),
+        -angle_to_point,
+      );
+    }
+
+    // A full turn has no outside, so the angular test is skipped for one
+    // (`shape_arc.cpp:895`).
+    if self.start != self.end {
+      let counterclockwise = self.central_angle_from(center) > Degrees::ZERO;
+      let start_angle = self.start_angle_from(center);
+      let rotated_point_angle =
+        (angle_to_point.normalized() - start_angle).normalized();
+      let rotated_end_angle =
+        (self.end_angle_from(center) - start_angle).normalized();
+
+      if (counterclockwise && rotated_point_angle > rotated_end_angle)
+        || (!counterclockwise && rotated_point_angle < rotated_end_angle)
+      {
+        let to_start =
+          saturate_i32(point.widening_sub(self.start).euclidean_norm());
+        let to_end =
+          saturate_i32(point.widening_sub(self.end).euclidean_norm());
+
+        if to_start < to_end {
+          distance = i64::from(to_start);
+          nearest = to_f64(self.start);
+        } else {
+          distance = i64::from(to_end);
+          nearest = to_f64(self.end);
+        }
+      }
+    }
+
+    if distance > minimum_distance {
+      return None;
+    }
+
+    Some(ShapeCollision {
+      actual: self.gap_from_distance(distance),
+      location: truncate_f64_pair(nearest),
+    })
+  }
+
+  /// Whether a segment comes within a clearance of the arc, and by how
+  /// much.
+  ///
+  /// Port of `Collide( const SEG&, int, int*, VECTOR2I* )`,
+  /// `libs/kimath/src/geometry/shape_arc.cpp:257`. This is a candidate
+  /// point method and not a closed form: it builds a list of points that
+  /// could carry the collision and runs each through
+  /// [`ShapeArc::collide_point`]. The candidates are the circle and
+  /// segment intersections, the segment's nearest point to the centre,
+  /// its nearest points to the two arc endpoints, and the two segment
+  /// endpoints (`:318` to `:324`).
+  ///
+  /// Two branches come first. A nearly straight arc, radius at or above
+  /// `INT_MAX / 2`, builds nine candidates from the two chords and the
+  /// segment instead (`:264` to `:292`). An arc that sweeps more than a
+  /// half turn and whose chord is shorter than the clearance is treated
+  /// as a whole circle, with an early miss when both segment endpoints
+  /// sit strictly inside `radius - clearance` (`:298` to `:310`).
+  ///
+  /// # Erratum E2
+  ///
+  /// The reported gap and location are those of the **last candidate that
+  /// collided**, not of the nearest one. KiCad's loop overwrites its two
+  /// out parameters on every colliding candidate and only stops early on
+  /// an exact touch (`:328` to `:335`), so a caller that asks an arc how
+  /// far a segment is gets an arbitrary one of the candidate distances.
+  /// That is reproduced here, deliberately; the decision is in
+  /// `doc/log/2026-09-12.md` and
+  /// `arc_seg_collide_reports_the_last_candidate_erratum_e2` pins it.
+  ///
+  /// Note that KiCad's loop also returns at the **first** colliding
+  /// candidate when the caller passed no `aActual` pointer. That cannot
+  /// change the answer, only which candidate's numbers are discarded, so
+  /// this form always runs the full loop.
+  pub fn collide_seg(
+    self,
+    seg: &Seg,
+    clearance: i32,
+  ) -> Option<ShapeCollision> {
+    let center = self.center();
+    let radius = self.collide_radius(center);
+
+    if radius >= f64::from(i32::MAX) / 2.0 {
+      let first = Seg::new(self.start, self.mid);
+      let second = Seg::new(self.mid, self.end);
+
+      return self.collide_candidates(
+        &[
+          seg.nearest_point_to_point(self.start),
+          seg.nearest_point_to_point(self.mid),
+          seg.nearest_point_to_point(self.end),
+          first.nearest_point_to_point(seg.a),
+          first.nearest_point_to_point(seg.b),
+          second.nearest_point_to_point(seg.a),
+          second.nearest_point_to_point(seg.b),
+          seg.a,
+          seg.b,
+        ],
+        clearance,
+      );
+    }
+
+    let circle_radius = truncate_f64_to_i32(radius);
+
+    // An arc with less room left inside it than the clearance collides
+    // like the whole circle (`shape_arc.cpp:296`).
+    if self.central_angle_from(center).as_degrees() > 180.0
+      && self.start.widening_sub(self.end).squared_euclidean_norm()
+        < square(i64::from(clearance))
+    {
+      let to_a = seg.a.widening_sub(center).squared_euclidean_norm();
+      let to_b = seg.b.widening_sub(center).squared_euclidean_norm();
+      // `SEG::Square` takes an `int`, so the difference truncates
+      // (`shape_arc.cpp:303`).
+      let inner_radius_squared = square(i64::from(truncate_f64_to_i32(
+        radius - f64::from(clearance),
+      )));
+
+      if to_a < inner_radius_squared && to_b < inner_radius_squared {
+        return None;
+      }
+
+      return circle_seg_collision(center, circle_radius, seg, clearance);
+    }
+
+    let mut candidates = circle_intersect_seg(center, circle_radius, seg);
+
+    candidates.push(seg.nearest_point_to_point(center));
+    candidates.push(seg.nearest_point_to_point(self.start));
+    candidates.push(seg.nearest_point_to_point(self.end));
+    candidates.push(seg.a);
+    candidates.push(seg.b);
+
+    self.collide_candidates(&candidates, clearance)
+  }
+
+  /// The nearest points between the arc and a circle.
+  ///
+  /// Port of `NearestPoints( const SHAPE_CIRCLE&, VECTOR2I&, VECTOR2I&, int64_t& )`,
+  /// `libs/kimath/src/geometry/shape_arc.cpp:499`. The point on the arc
+  /// is pulled in by half the arc's width towards the circle and the
+  /// distance is zeroed when it falls inside that half width (`:543` to
+  /// `:550`), so the result is an edge to edge answer for a track width
+  /// arc and a centre line answer for a zero width one.
+  ///
+  /// The candidates are the two circle intersections that lie inside the
+  /// sweep, then the two arc endpoints and the arc circle's nearest point
+  /// to the other centre, each kept only when it lies inside the sweep
+  /// (`:513` to `:541`). An arc concentric with the circle and of the
+  /// same radius answers its own start point at zero distance (`:501`).
+  ///
+  /// When **no** candidate lies inside the sweep, KiCad reports the pair
+  /// its caller left default constructed, which is the origin twice at
+  /// zero distance (`shape_collisions.cpp:612`). That is reproduced,
+  /// origin and all, because the collision cell built on top of it then
+  /// reports a collision at the board origin and a port that quietly
+  /// fixed it would diverge. Both arc endpoints lie inside their own
+  /// sweep for every arc the router builds, so the branch needs a
+  /// degenerate arc to reach.
+  pub fn nearest_points_to_circle(
+    self,
+    center: Vec2,
+    radius: i32,
+  ) -> NearestPoints {
+    let own_center = self.center();
+    let own_radius = self.radius_from(own_center);
+
+    if own_center == center && own_radius == f64::from(radius) {
+      return NearestPoints {
+        on_self: self.start,
+        on_other: self.start,
+        squared_distance: 0,
+      };
+    }
+
+    let own_circle_radius = truncate_f64_to_i32(own_radius);
+
+    for point in
+      circle_intersect_circle(own_center, own_circle_radius, center, radius)
+    {
+      if self.slice_contains_point_from(point, own_center) {
+        return NearestPoints {
+          on_self: point,
+          on_other: point,
+          squared_distance: 0,
+        };
+      }
+    }
+
+    let mut nearest = NearestPoints {
+      on_self: Vec2::new(0, 0),
+      on_other: Vec2::new(0, 0),
+      squared_distance: i64::MAX,
+    };
+
+    for point in [
+      self.start,
+      self.end,
+      circle_nearest_point(own_center, own_circle_radius, center),
+    ] {
+      if !self.slice_contains_point_from(point, own_center) {
+        continue;
+      }
+
+      let on_circle = circle_nearest_point(center, radius, point);
+      let squared_distance = point.squared_distance(on_circle);
+
+      if squared_distance < nearest.squared_distance {
+        nearest = NearestPoints {
+          on_self: point,
+          on_other: on_circle,
+          squared_distance,
+        };
+      }
+    }
+
+    self.adjusted_for_own_width(nearest)
+  }
+
+  /// The nearest points between the arc and a segment.
+  ///
+  /// Port of `NearestPoints( const SEG&, VECTOR2I&, VECTOR2I&, int64_t& )`,
+  /// `libs/kimath/src/geometry/shape_arc.cpp:556`, with the same half
+  /// width treatment as [`ShapeArc::nearest_points_to_circle`] (`:622`
+  /// to `:629`).
+  ///
+  /// Four candidate families, in KiCad's order: the circle and segment
+  /// intersections inside the sweep, which answer zero straight away
+  /// (`:563`); the segment endpoints whose radial angle lies inside the
+  /// sweep, measured to the circle (`:574`); the two arc endpoints,
+  /// measured to the segment (`:590`); and the segment's nearest point to
+  /// the centre, measured to the circle (`:604`).
+  ///
+  /// The last family writes the **segment** point into the arc's slot and
+  /// the circle point into the segment's slot (`:612`, `:613`), the
+  /// reverse of the other three. That is KiCad's and is kept: the half
+  /// width adjustment that follows then moves the point on the segment,
+  /// not the one on the arc.
+  pub fn nearest_points_to_seg(self, seg: &Seg) -> NearestPoints {
+    let center = self.center();
+    let circle_radius = truncate_f64_to_i32(self.radius_from(center));
+
+    for point in circle_intersect_seg(center, circle_radius, seg) {
+      if self.slice_contains_point_from(point, center) {
+        return NearestPoints {
+          on_self: point,
+          on_other: point,
+          squared_distance: 0,
+        };
+      }
+    }
+
+    let mut nearest = NearestPoints {
+      on_self: Vec2::new(0, 0),
+      on_other: Vec2::new(0, 0),
+      squared_distance: i64::MAX,
+    };
+
+    for point in [seg.a, seg.b] {
+      if !self.slice_contains_point_from(point, center) {
+        continue;
+      }
+
+      let on_circle = circle_nearest_point(center, circle_radius, point);
+      let squared_distance = point.squared_distance(on_circle);
+
+      if squared_distance < nearest.squared_distance {
+        nearest = NearestPoints {
+          on_self: on_circle,
+          on_other: point,
+          squared_distance,
+        };
+      }
+    }
+
+    for point in [self.start, self.end] {
+      let on_seg = seg.nearest_point_to_point(point);
+      let squared_distance = point.squared_distance(on_seg);
+
+      if squared_distance < nearest.squared_distance {
+        nearest = NearestPoints {
+          on_self: point,
+          on_other: on_seg,
+          squared_distance,
+        };
+      }
+    }
+
+    let on_seg = seg.nearest_point_to_point(center);
+
+    if self.slice_contains_point_from(on_seg, center) {
+      let on_circle = circle_nearest_point(center, circle_radius, on_seg);
+      let squared_distance = on_seg.squared_distance(on_circle);
+
+      if squared_distance < nearest.squared_distance {
+        nearest = NearestPoints {
+          on_self: on_seg,
+          on_other: on_circle,
+          squared_distance,
+        };
+      }
+    }
+
+    self.adjusted_for_own_width(nearest)
+  }
+
+  /// The nearest points between the arc and an axis aligned rectangle.
+  ///
+  /// Port of `NearestPoints( const SHAPE_RECT&, VECTOR2I&, VECTOR2I&, int64_t& )`,
+  /// `libs/kimath/src/geometry/shape_arc.cpp:635`, which hands the
+  /// rectangle's outline to the generic shape dispatcher
+  /// (`shape_nearest_points.cpp:658`) and swaps the two output points
+  /// back. The dispatcher walks the outline's segments and takes the
+  /// minimum of [`ShapeArc::nearest_points_to_seg`] over them, which is
+  /// what this does directly.
+  ///
+  /// # Erratum E3
+  ///
+  /// The final line recomputes the squared distance from the two points
+  /// (`:644`) and so **throws away the zeroing** that the segment
+  /// overload applied when the arc's half width already covered the gap.
+  /// The point on the arc has still been pulled in by the half width, so
+  /// the result is an edge to edge distance that never clamps to zero:
+  /// once the arc's edge crosses the rectangle the distance starts
+  /// growing again instead of staying at zero. A wide arc track therefore
+  /// under-reports its overlap with a rectangle. Reproduced deliberately,
+  /// see `doc/log/2026-09-12.md` and
+  /// `arc_nearest_points_to_rect_drops_the_width_zeroing_erratum_e3`.
+  ///
+  /// Note 09 erratum E3 describes this as the overload ignoring the
+  /// width outright. It does apply the half width to the point; what it
+  /// loses is only the clamp.
+  pub fn nearest_points_to_rect(
+    self,
+    origin: Vec2,
+    size: Vec2,
+  ) -> NearestPoints {
+    let outline = rect_outline(origin, size);
+    let mut on_self = Vec2::new(0, 0);
+    let mut on_other = Vec2::new(0, 0);
+    let mut best = i64::MAX;
+
+    for index in 0..outline.segment_count() {
+      let candidate = self.nearest_points_to_seg(&outline.segment(index));
+
+      if candidate.squared_distance < best {
+        best = candidate.squared_distance;
+        on_self = candidate.on_self;
+        on_other = candidate.on_other;
+      }
+    }
+
+    NearestPoints {
+      on_self,
+      on_other,
+      squared_distance: on_self.squared_distance(on_other),
+    }
+  }
+
+  /// The nearest points between two arcs.
+  ///
+  /// Port of `NearestPoints( const SHAPE_ARC&, VECTOR2I&, VECTOR2I&, int64_t& )`,
+  /// `libs/kimath/src/geometry/shape_arc.cpp:649`. Both arcs' half widths
+  /// are applied at the end, the second one measured from the already
+  /// moved first point (`:652` to `:663`).
+  ///
+  /// The routine works down a ladder and stops at the first rung that
+  /// answers:
+  ///
+  /// 1. the four endpoint pairs, which return immediately on an exact
+  ///    touch and **without** the width adjustment (`:686`);
+  /// 2. each endpoint of this arc that lies inside the other's sweep,
+  ///    against the other's circle (`:692`);
+  /// 3. each endpoint of the other arc inside this sweep, against this
+  ///    circle (`:710`);
+  /// 4. the circle intersections inside both sweeps (`:735`);
+  /// 5. the closest pair of points on the two full circles, with a
+  ///    separate branch for one circle contained in the other (`:766` to
+  ///    `:787`), then the endpoints of each arc against whichever of that
+  ///    pair lies inside its own sweep (`:806`, `:820`).
+  ///
+  /// Rungs 2 and 3 only stop the ladder when the two centres are within
+  /// `min(radius) / 1000` of each other or the distance is exactly zero
+  /// (`:702`, `:720`). That epsilon exists because the two centres come
+  /// out of [`calc_arc_center`] and are not exact; KiCad's comment at
+  /// `:678` says so. Concentric arcs never reach rungs 4 and 5, whose
+  /// geometry needs two distinct circles (`:731`).
+  pub fn nearest_points_to_arc(self, other: ShapeArc) -> NearestPoints {
+    let own_center = self.center();
+    let other_center = other.center();
+    let own_radius = self.radius_from(own_center);
+    let other_radius = other.radius_from(other_center);
+    let own_circle_radius = truncate_f64_to_i32(own_radius);
+    let other_circle_radius = truncate_f64_to_i32(other_radius);
+    let center_distance_squared = own_center.squared_distance(other_center);
+    let center_epsilon =
+      i64::from(kiround(own_radius.min(other_radius) / 1000.0));
+    let colocated = center_distance_squared < center_epsilon * center_epsilon;
+    let own_ends = [self.start, self.end];
+    let other_ends = [other.start, other.end];
+
+    let mut nearest = NearestPoints {
+      on_self: Vec2::new(0, 0),
+      on_other: Vec2::new(0, 0),
+      squared_distance: i64::MAX,
+    };
+
+    for own in own_ends {
+      for far in other_ends {
+        let squared_distance = own.squared_distance(far);
+
+        if squared_distance < nearest.squared_distance {
+          nearest = NearestPoints {
+            on_self: own,
+            on_other: far,
+            squared_distance,
+          };
+
+          // An exact touch returns before either width is applied
+          // (`shape_arc.cpp:686`).
+          if nearest.squared_distance == 0 {
+            return nearest;
+          }
+        }
+      }
+    }
+
+    for own in own_ends {
+      if !other.slice_contains_point_from(own, other_center) {
+        continue;
+      }
+
+      let on_other =
+        circle_nearest_point(other_center, other_circle_radius, own);
+
+      nearest = NearestPoints {
+        on_self: own,
+        on_other,
+        squared_distance: own.squared_distance(on_other),
+      };
+
+      if colocated || nearest.squared_distance == 0 {
+        if nearest.squared_distance != 0 {
+          nearest = self.adjusted_for_both_widths(nearest, other.width);
+        }
+
+        return nearest;
+      }
+    }
+
+    for far in other_ends {
+      if !self.slice_contains_point_from(far, own_center) {
+        continue;
+      }
+
+      let on_self = circle_nearest_point(own_center, own_circle_radius, far);
+
+      nearest = NearestPoints {
+        on_self,
+        on_other: far,
+        squared_distance: on_self.squared_distance(far),
+      };
+
+      if colocated || nearest.squared_distance == 0 {
+        if nearest.squared_distance != 0 {
+          nearest = self.adjusted_for_both_widths(nearest, other.width);
+        }
+
+        return nearest;
+      }
+    }
+
+    // The rest needs two distinct circles (`shape_arc.cpp:731`).
+    if colocated {
+      return nearest;
+    }
+
+    for point in circle_intersect_circle(
+      own_center,
+      own_circle_radius,
+      other_center,
+      other_circle_radius,
+    ) {
+      if self.slice_contains_point_from(point, own_center)
+        && other.slice_contains_point_from(point, other_center)
+      {
+        return NearestPoints {
+          on_self: point,
+          on_other: point,
+          squared_distance: 0,
+        };
+      }
+    }
+
+    // For two separate circles the closest pair faces across the line of
+    // centres. For one circle inside the other the pair is on the same
+    // side, so the outer one takes its nearest point to the inner centre
+    // and the inner one its furthest point from the outer centre
+    // (`shape_arc.cpp:760` to `:787`).
+    let contained = (center_distance_squared as f64)
+      < (own_radius - other_radius) * (own_radius - other_radius);
+    let (own_point, other_point) = if contained && own_radius > other_radius {
+      (
+        circle_nearest_point(own_center, own_circle_radius, other_center),
+        circle_furthest_point(other_center, other_circle_radius, own_center),
+      )
+    } else if contained {
+      (
+        circle_furthest_point(own_center, own_circle_radius, other_center),
+        circle_nearest_point(other_center, other_circle_radius, own_center),
+      )
+    } else {
+      (
+        circle_nearest_point(own_center, own_circle_radius, other_center),
+        circle_nearest_point(other_center, other_circle_radius, own_center),
+      )
+    };
+
+    let own_in_slice = self.slice_contains_point_from(own_point, own_center);
+    let other_in_slice =
+      other.slice_contains_point_from(other_point, other_center);
+
+    if own_in_slice && other_in_slice {
+      let squared_distance = own_point.squared_distance(other_point);
+
+      if squared_distance < nearest.squared_distance {
+        nearest = NearestPoints {
+          on_self: own_point,
+          on_other: other_point,
+          squared_distance,
+        };
+      }
+
+      return self.adjusted_for_both_widths(nearest, other.width);
+    }
+
+    if other_in_slice {
+      for own in own_ends {
+        let squared_distance = own.squared_distance(other_point);
+
+        if squared_distance < nearest.squared_distance {
+          nearest = NearestPoints {
+            on_self: own,
+            on_other: other_point,
+            squared_distance,
+          };
+        }
+      }
+    }
+
+    if own_in_slice {
+      for far in other_ends {
+        let squared_distance = far.squared_distance(own_point);
+
+        if squared_distance < nearest.squared_distance {
+          nearest = NearestPoints {
+            on_self: own_point,
+            on_other: far,
+            squared_distance,
+          };
+        }
+      }
+    }
+
+    self.adjusted_for_both_widths(nearest, other.width)
+  }
+
+  /// The radius [`ShapeArc::collide_point`] and [`ShapeArc::collide_seg`]
+  /// measure with.
+  ///
+  /// `VECTOR2D( center - m_start ).EuclideanNorm()`,
+  /// `libs/kimath/src/geometry/shape_arc.cpp:259` and `:858`. The three
+  /// case norm of [`euclidean_norm_f64`] is not the same expression as
+  /// `sqrt( x * x + y * y )`, which is what `update_values` uses for
+  /// `m_radius` (`:414`), so the two can disagree in the last bit and the
+  /// collision routines have to use this one.
+  fn collide_radius(self, center: Vec2) -> f64 {
+    euclidean_norm_f64(
+      f64::from(center.x) - f64::from(self.start.x),
+      f64::from(center.y) - f64::from(self.start.y),
+    )
+  }
+
+  /// [`ShapeArc::end_angle`] against a centre the caller already has.
+  fn end_angle_from(self, center: Vec2) -> Degrees {
+    Self::angle_about(self.end, center).normalized()
+  }
+
+  /// `std::max( 0, dist - m_width / 2 )`,
+  /// `libs/kimath/src/geometry/shape_arc.cpp:874` and `:927`.
+  fn gap_from_distance(self, distance: i64) -> i32 {
+    saturate_i32((distance - i64::from(self.width) / 2).max(0))
+  }
+
+  /// The candidate loop of `Collide( const SEG& )`,
+  /// `libs/kimath/src/geometry/shape_arc.cpp:328` to `:335`.
+  ///
+  /// It keeps the **last** candidate that collided, which is erratum E2;
+  /// see [`ShapeArc::collide_seg`].
+  fn collide_candidates(
+    self,
+    candidates: &[Vec2],
+    clearance: i32,
+  ) -> Option<ShapeCollision> {
+    let mut collision = None;
+
+    for candidate in candidates {
+      let Some(hit) = self.collide_point(*candidate, clearance) else {
+        continue;
+      };
+
+      collision = Some(hit);
+
+      if hit.actual == 0 {
+        break;
+      }
+    }
+
+    collision
+  }
+
+  /// Pull the point on the arc in by half the arc's width and clamp the
+  /// distance.
+  ///
+  /// The tail shared by `NearestPoints( const SHAPE_CIRCLE& )` and
+  /// `NearestPoints( const SEG& )`,
+  /// `libs/kimath/src/geometry/shape_arc.cpp:543` and `:622`.
+  ///
+  /// Deviation: the difference of the two points is taken in `i64`, where
+  /// KiCad subtracts two `VECTOR2I` and can wrap.
+  fn adjusted_for_own_width(self, nearest: NearestPoints) -> NearestPoints {
+    let half_width = self.width / 2;
+    let direction = nearest
+      .on_other
+      .widening_sub(nearest.on_self)
+      .saturating_to_vec2()
+      .resize(half_width);
+    let on_self = nearest.on_self + direction;
+
+    NearestPoints {
+      on_self,
+      on_other: nearest.on_other,
+      squared_distance: if nearest.squared_distance
+        < square(i64::from(half_width))
+      {
+        0
+      } else {
+        on_self.squared_distance(nearest.on_other)
+      },
+    }
+  }
+
+  /// Pull both points in by their own arc's half width and clamp the
+  /// distance.
+  ///
+  /// KiCad's `adjustForArcWidths` lambda,
+  /// `libs/kimath/src/geometry/shape_arc.cpp:652` to `:663`. The second
+  /// direction is measured from the **already moved** first point, which
+  /// is why this cannot be two calls to
+  /// [`ShapeArc::adjusted_for_own_width`].
+  fn adjusted_for_both_widths(
+    self,
+    nearest: NearestPoints,
+    other_width: i32,
+  ) -> NearestPoints {
+    let own_half_width = self.width / 2;
+    let other_half_width = other_width / 2;
+    let on_self = nearest.on_self
+      + nearest
+        .on_other
+        .widening_sub(nearest.on_self)
+        .saturating_to_vec2()
+        .resize(own_half_width);
+    let on_other = nearest.on_other
+      + on_self
+        .widening_sub(nearest.on_other)
+        .saturating_to_vec2()
+        .resize(other_half_width);
+
+    NearestPoints {
+      on_self,
+      on_other,
+      squared_distance: if nearest.squared_distance
+        < square(i64::from(own_half_width) + i64::from(other_half_width))
+      {
+        0
+      } else {
+        on_self.squared_distance(on_other)
+      },
+    }
+  }
+
   /// [`ShapeArc::radius`] against a centre the caller already has.
   fn radius_from(self, center: Vec2) -> f64 {
     let x = f64::from(self.start.x) - f64::from(center.x);
@@ -1113,6 +1907,134 @@ fn calc_arc_center_f64_with_degeneracy(
   } else {
     (center_x, center_y, false)
   }
+}
+
+/// The point on a circle nearest a given floating point position.
+///
+/// Port of `CIRCLE::NearestPoint( const VECTOR2D& )`,
+/// `libs/kimath/src/geometry/circle.cpp:208`, the `double` overload
+/// `SHAPE_ARC::Collide( const VECTOR2I& )` uses (`shape_arc.cpp:883`).
+/// Nothing is rounded, so the caller decides where the result lands on the
+/// nanometre grid; `Collide` truncates it into the reported location.
+fn circle_nearest_point_f64(
+  center: Vec2,
+  radius: i32,
+  point: Vec2,
+) -> (f64, f64) {
+  let mut x = f64::from(point.x) - f64::from(center.x);
+  let y = f64::from(point.y) - f64::from(center.y);
+
+  // A point at the centre has no nearest point, so KiCad picks the
+  // positive x direction (`circle.cpp:214`).
+  if x == 0.0 && y == 0.0 {
+    x = 1.0;
+  }
+
+  let (resized_x, resized_y) = resize_f64(x, y, f64::from(radius));
+
+  (
+    resized_x + f64::from(center.x),
+    resized_y + f64::from(center.y),
+  )
+}
+
+/// The point on a circle furthest from a given point.
+///
+/// Port of `CIRCLE::FurthestPoint( const VECTOR2I& )`,
+/// `libs/kimath/src/geometry/circle.cpp:221`, which is
+/// [`circle_nearest_point`] with the difference taken the other way
+/// round.
+fn circle_furthest_point(center: Vec2, radius: i32, point: Vec2) -> Vec2 {
+  let mut offset = center.widening_sub(point).saturating_to_vec2();
+
+  if offset.x == 0 && offset.y == 0 {
+    offset = Vec2::new(1, 0);
+  }
+
+  offset.resize(radius) + center
+}
+
+/// The intersections of two circles.
+///
+/// Port of `CIRCLE::Intersect( const CIRCLE& )`,
+/// `libs/kimath/src/geometry/circle.cpp:243`. The problem is moved to the
+/// frame where this circle sits at the origin and the other on the
+/// positive x axis, solved there, and rotated back. Concentric circles
+/// answer nothing, even when their radii agree and every point is an
+/// intersection (`:328`).
+///
+/// Deviations, both widenings: the rotated solution is built from `i64`
+/// coordinates and saturates into `i32`, and the centre is added back in
+/// `i64`. KiCad narrows and adds in `int`.
+fn circle_intersect_circle(
+  first_center: Vec2,
+  first_radius: i32,
+  second_center: Vec2,
+  second_radius: i32,
+) -> Vec<Vec2> {
+  let center_to_center = second_center.widening_sub(first_center);
+  let center_distance = center_to_center.euclidean_norm();
+  let first = i64::from(first_radius);
+  let second = i64::from(second_radius);
+
+  if center_distance > first + second
+    || center_distance < (first - second).abs()
+    || center_distance == 0
+  {
+    return Vec::new();
+  }
+
+  let x = ((center_distance * center_distance) + (first * first)
+    - (second * second))
+    / (2 * center_distance);
+  let remainder = (first * first) - (x * x);
+
+  if remainder < 0 {
+    return Vec::new();
+  }
+
+  // `KiROUND` without an explicit return type narrows to `int` before the
+  // `int64_t` assignment at `circle.cpp:340`.
+  let y = i64::from(kiround((remainder as f64).sqrt()));
+  let rotation =
+    Degrees::from_vector(center_to_center.x as f64, center_to_center.y as f64);
+  let origin = Vec2::new(0, 0);
+  let mut intersections = vec![
+    (Vec2L::from(rotate_point(
+      Vec2L::new(x, y).saturating_to_vec2(),
+      origin,
+      -rotation,
+    )) + Vec2L::from(first_center))
+    .saturating_to_vec2(),
+  ];
+
+  if y != 0 {
+    intersections.push(
+      (Vec2L::from(rotate_point(
+        Vec2L::new(x, -y).saturating_to_vec2(),
+        origin,
+        -rotation,
+      )) + Vec2L::from(first_center))
+      .saturating_to_vec2(),
+    );
+  }
+
+  intersections
+}
+
+/// A squared length, saturating instead of wrapping.
+///
+/// Port of `SEG::Square`, `libs/kimath/include/geometry/seg.h:119`, which
+/// takes an `int` and multiplies in `i64`. Every caller here squares a
+/// clearance or a half width, so the saturation is unreachable on any
+/// board; see the note on [`crate::geometry::collision`].
+fn square(value: i64) -> i64 {
+  value.saturating_mul(value)
+}
+
+/// Clamp an `i64` into an `i32`.
+fn saturate_i32(value: i64) -> i32 {
+  value.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
 }
 
 /// The point on a circle nearest a given point.
@@ -2010,6 +2932,567 @@ mod tests {
     );
 
     assert!(pair.arc_center().is_degenerate());
+  }
+
+  /// One row of KiCad's `ARC_PT_COLLIDE_CASE`,
+  /// `test_shape_arc.cpp:676`, and of `ARC_SEG_COLLIDE_CASE` (`:772`),
+  /// which share the centre, start and angle geometry.
+  struct ArcCollideCase {
+    /// The case name KiCad gives it.
+    name: &'static str,
+    /// The arc's centre.
+    center: Vec2,
+    /// The arc's start point.
+    start: Vec2,
+    /// The sweep in degrees.
+    central_angle: f64,
+    /// The clearance the collision is tested at.
+    clearance: i32,
+    /// Whether KiCad reports a collision.
+    collides: bool,
+    /// The gap KiCad reports, meaningful only when it collides.
+    distance: i32,
+  }
+
+  /// The two halves of KiCad's `CollidePt` and `CollideSeg` bodies
+  /// (`test_shape_arc.cpp:747` and `:817`): the zero width arc reports
+  /// the clearance as the gap, and the same arc widened to twice the
+  /// clearance reports zero.
+  ///
+  /// KiCad leaves its `dist` at `-1` when the call answers false, which
+  /// an [`Option`] says by being `None`.
+  fn check_collide_case(
+    case: &ArcCollideCase,
+    zero_width: Option<ShapeCollision>,
+    wide: Option<ShapeCollision>,
+  ) {
+    assert_eq!(
+      zero_width.is_some(),
+      case.collides,
+      "{}: collision at the nominal clearance",
+      case.name
+    );
+
+    if let Some(collision) = zero_width {
+      assert_eq!(collision.actual, case.distance, "{}: gap", case.name);
+    }
+
+    assert_eq!(
+      wide.is_some(),
+      case.collides,
+      "{}: collision with the width folded in",
+      case.name
+    );
+
+    if let Some(collision) = wide {
+      assert_eq!(collision.actual, 0, "{}: widened gap", case.name);
+    }
+  }
+
+  /// `CollidePt`, `test_shape_arc.cpp:742`, over the table at `:687`.
+  #[test]
+  fn collide_pt() {
+    let cases: [(ArcCollideCase, Vec2); 41] = [
+      (
+        arc_case(" 270deg, 0 cl, 0   deg    ", 270.0, 0, true, 0),
+        Vec2::new(100, 0),
+      ),
+      (
+        arc_case(" 270deg, 0 cl, 90  deg    ", 270.0, 0, true, 0),
+        Vec2::new(0, 100),
+      ),
+      (
+        arc_case(" 270deg, 0 cl, 180 deg    ", 270.0, 0, true, 0),
+        Vec2::new(-100, 0),
+      ),
+      (
+        arc_case(" 270deg, 0 cl, 270 deg    ", 270.0, 0, true, 0),
+        Vec2::new(0, -100),
+      ),
+      (
+        arc_case(" 270deg, 0 cl, 45  deg    ", 270.0, 0, true, 0),
+        Vec2::new(71, 71),
+      ),
+      (
+        arc_case(" 270deg, 0 cl, -45 deg    ", 270.0, 0, false, -1),
+        Vec2::new(71, -71),
+      ),
+      (
+        arc_case("-270deg, 0 cl, 0   deg    ", -270.0, 0, true, 0),
+        Vec2::new(100, 0),
+      ),
+      (
+        arc_case("-270deg, 0 cl, 90  deg    ", -270.0, 0, true, 0),
+        Vec2::new(0, 100),
+      ),
+      (
+        arc_case("-270deg, 0 cl, 180 deg    ", -270.0, 0, true, 0),
+        Vec2::new(-100, 0),
+      ),
+      (
+        arc_case("-270deg, 0 cl, 270 deg    ", -270.0, 0, true, 0),
+        Vec2::new(0, -100),
+      ),
+      (
+        arc_case("-270deg, 0 cl, 45  deg    ", -270.0, 0, false, -1),
+        Vec2::new(71, 71),
+      ),
+      (
+        arc_case("-270deg, 0 cl, -45 deg    ", -270.0, 0, true, 0),
+        Vec2::new(71, -71),
+      ),
+      (
+        arc_case(" 270deg, 5 cl, 0   deg, 5 pos X", 270.0, 5, true, 5),
+        Vec2::new(105, 0),
+      ),
+      (
+        arc_case(" 270deg, 5 cl, 0  deg, 5 pos Y", 270.0, 5, true, 5),
+        Vec2::new(100, -5),
+      ),
+      (
+        arc_case(" 270deg, 5 cl, 90  deg, 5 pos", 270.0, 5, true, 5),
+        Vec2::new(0, 105),
+      ),
+      (
+        arc_case(" 270deg, 5 cl, 180 deg, 5 pos", 270.0, 5, true, 5),
+        Vec2::new(-105, 0),
+      ),
+      (
+        arc_case(" 270deg, 5 cl, 270 deg, 5 pos", 270.0, 5, true, 5),
+        Vec2::new(0, -105),
+      ),
+      (
+        arc_case(" 270deg, 5 cl, 0   deg, 5 neg", 270.0, 5, true, 5),
+        Vec2::new(105, 0),
+      ),
+      (
+        arc_case(" 270deg, 5 cl, 90  deg, 5 neg", 270.0, 5, true, 5),
+        Vec2::new(0, 105),
+      ),
+      (
+        arc_case(" 270deg, 5 cl, 180 deg, 5 neg", 270.0, 5, true, 5),
+        Vec2::new(-105, 0),
+      ),
+      (
+        arc_case(" 270deg, 5 cl, 270 deg, 5 neg", 270.0, 5, true, 5),
+        Vec2::new(0, -105),
+      ),
+      (
+        arc_case(" 270deg, 5 cl, 45  deg, 5 pos", 270.0, 5, true, 5),
+        Vec2::new(74, 75),
+      ),
+      (
+        arc_case(" 270deg, 5 cl, -45 deg, 5 pos", 270.0, 5, false, -1),
+        Vec2::new(74, -75),
+      ),
+      (
+        arc_case(" 270deg, 5 cl, 45  deg, 5 neg", 270.0, 5, true, 5),
+        Vec2::new(67, 67),
+      ),
+      (
+        arc_case(" 270deg, 5 cl, -45 deg, 5 neg", 270.0, 5, false, -1),
+        Vec2::new(67, -67),
+      ),
+      (
+        arc_case(" 270deg, 4 cl, 0   deg pos", 270.0, 4, false, -1),
+        Vec2::new(105, 0),
+      ),
+      (
+        arc_case(" 270deg, 4 cl, 90  deg pos", 270.0, 4, false, -1),
+        Vec2::new(0, 105),
+      ),
+      (
+        arc_case(" 270deg, 4 cl, 180 deg pos", 270.0, 4, false, -1),
+        Vec2::new(-105, 0),
+      ),
+      (
+        arc_case(" 270deg, 4 cl, 270 deg pos", 270.0, 4, false, -1),
+        Vec2::new(0, -105),
+      ),
+      (
+        quarter_case("  90deg, 0 cl,   0 deg    ", 90.0, 0, true, 0),
+        Vec2::new(71, -71),
+      ),
+      (
+        quarter_case("  90deg, 0 cl,  45 deg    ", 90.0, 0, true, 0),
+        Vec2::new(100, 0),
+      ),
+      (
+        quarter_case("  90deg, 0 cl,  90 deg    ", 90.0, 0, true, 0),
+        Vec2::new(71, 71),
+      ),
+      (
+        quarter_case("  90deg, 0 cl, 135 deg    ", 90.0, 0, false, -1),
+        Vec2::new(0, -100),
+      ),
+      (
+        quarter_case("  90deg, 0 cl, -45 deg    ", 90.0, 0, false, -1),
+        Vec2::new(0, 100),
+      ),
+      (
+        quarter_case(" -90deg, 0 cl,   0 deg    ", -90.0, 0, true, 0),
+        Vec2::new(71, -71),
+      ),
+      (
+        quarter_case(" -90deg, 0 cl,  45 deg    ", -90.0, 0, true, 0),
+        Vec2::new(100, 0),
+      ),
+      (
+        quarter_case(" -90deg, 0 cl,  90 deg    ", -90.0, 0, true, 0),
+        Vec2::new(71, 71),
+      ),
+      (
+        quarter_case(" -90deg, 0 cl, 135 deg    ", -90.0, 0, false, -1),
+        Vec2::new(0, -100),
+      ),
+      (
+        quarter_case(" -90deg, 0 cl, -45 deg    ", -90.0, 0, false, -1),
+        Vec2::new(0, 100),
+      ),
+      (
+        ArcCollideCase {
+          name: "issue 11358 collide",
+          center: Vec2::new(119_888_000, 60_452_000),
+          start: Vec2::new(120_904_000, 60_452_000),
+          central_angle: 360.0,
+          clearance: 0,
+          collides: true,
+          distance: 0,
+        },
+        Vec2::new(120_395_500, 59_571_830),
+      ),
+      (
+        ArcCollideCase {
+          name: "issue 11358 dist",
+          center: Vec2::new(119_888_000, 60_452_000),
+          start: Vec2::new(120_904_000, 60_452_000),
+          central_angle: 360.0,
+          clearance: 100,
+          collides: true,
+          distance: 50,
+        },
+        Vec2::new(118_872_050, 60_452_000),
+      ),
+    ];
+
+    for (case, point) in cases {
+      let mut arc = ShapeArc::from_center_start_angle(
+        case.center,
+        case.start,
+        Degrees::new(case.central_angle),
+        0,
+      );
+      let zero_width = arc.collide_point(point, case.clearance);
+
+      arc.set_width(case.clearance * 2);
+
+      let wide = arc.collide_point(point, 0);
+
+      check_collide_case(&case, zero_width, wide);
+    }
+  }
+
+  /// A `270deg` or `-270deg` row of KiCad's `arc_pt_collide_cases`, which
+  /// all share the centre `(0, 0)` and the start `(100, 0)`.
+  fn arc_case(
+    name: &'static str,
+    central_angle: f64,
+    clearance: i32,
+    collides: bool,
+    distance: i32,
+  ) -> ArcCollideCase {
+    ArcCollideCase {
+      name,
+      center: Vec2::new(0, 0),
+      start: Vec2::new(100, 0),
+      central_angle,
+      clearance,
+      collides,
+      distance,
+    }
+  }
+
+  /// A `90deg` row, whose start is the diagonal that matches the sign of
+  /// the sweep.
+  fn quarter_case(
+    name: &'static str,
+    central_angle: f64,
+    clearance: i32,
+    collides: bool,
+    distance: i32,
+  ) -> ArcCollideCase {
+    ArcCollideCase {
+      name,
+      center: Vec2::new(0, 0),
+      start: if central_angle > 0.0 {
+        Vec2::new(71, -71)
+      } else {
+        Vec2::new(71, 71)
+      },
+      central_angle,
+      clearance,
+      collides,
+      distance,
+    }
+  }
+
+  /// `CollideSeg`, `test_shape_arc.cpp:799`, over the table at `:783`.
+  ///
+  /// The third block of KiCad's body (`:838`) checks the reported
+  /// location, which is the candidate point the loop last wrote; see
+  /// erratum E2 on [`ShapeArc::collide_seg`].
+  #[test]
+  fn collide_seg() {
+    let cases: [(ArcCollideCase, Seg, Vec2); 10] = [
+      (
+        arc_case("0   deg    ", 270.0, 0, true, 0),
+        Seg::new(Vec2::new(100, 0), Vec2::new(50, 0)),
+        Vec2::new(100, 0),
+      ),
+      (
+        arc_case("90  deg    ", 270.0, 0, true, 0),
+        Seg::new(Vec2::new(0, 100), Vec2::new(0, 50)),
+        Vec2::new(0, 100),
+      ),
+      (
+        arc_case("180 deg    ", 270.0, 0, true, 0),
+        Seg::new(Vec2::new(-100, 0), Vec2::new(-50, 0)),
+        Vec2::new(-100, 0),
+      ),
+      (
+        arc_case("270 deg    ", 270.0, 0, true, 0),
+        Seg::new(Vec2::new(0, -100), Vec2::new(0, -50)),
+        Vec2::new(0, -100),
+      ),
+      (
+        arc_case("45  deg    ", 270.0, 0, true, 0),
+        Seg::new(Vec2::new(71, 71), Vec2::new(35, 35)),
+        Vec2::new(70, 70),
+      ),
+      (
+        arc_case("-45 deg    ", 270.0, 0, false, -1),
+        Seg::new(Vec2::new(71, -71), Vec2::new(35, -35)),
+        Vec2::new(0, 0),
+      ),
+      (
+        quarter_case("seg inside arc start", 90.0, 10, true, 10),
+        Seg::new(Vec2::new(90, 0), Vec2::new(-35, 0)),
+        Vec2::new(100, 0),
+      ),
+      (
+        quarter_case("seg inside arc end", 90.0, 10, true, 10),
+        Seg::new(Vec2::new(-35, 0), Vec2::new(90, 0)),
+        Vec2::new(100, 0),
+      ),
+      (
+        ArcCollideCase {
+          name: "large diameter arc",
+          center: Vec2::new(172_367_922, 82_282_076),
+          start: Vec2::new(162_530_000, 92_120_000),
+          central_angle: -45.0,
+          clearance: 433_300,
+          collides: true,
+          distance: 433_268,
+        },
+        Seg::new(
+          Vec2::new(162_096_732, 92_331_236),
+          Vec2::new(162_096_732, 78_253_268),
+        ),
+        Vec2::new(162_530_000, 92_120_000),
+      ),
+      (
+        ArcCollideCase {
+          name: "upside down collide",
+          center: Vec2::new(26_250_000, 16_520_000),
+          start: Vec2::new(28_360_000, 16_520_000),
+          central_angle: 90.0,
+          clearance: 0,
+          collides: true,
+          distance: 0,
+        },
+        Seg::new(
+          Vec2::new(27_545_249, 18_303_444),
+          Vec2::new(27_545_249, 18_114_500),
+        ),
+        Vec2::new(27_545_249, 18_185_662),
+      ),
+    ];
+
+    for (case, seg, location) in cases {
+      let mut arc = ShapeArc::from_center_start_angle(
+        case.center,
+        case.start,
+        Degrees::new(case.central_angle),
+        0,
+      );
+      let zero_width = arc.collide_seg(&seg, case.clearance);
+
+      if let Some(collision) = zero_width {
+        assert_eq!(collision.location, location, "{}: location", case.name);
+      }
+
+      arc.set_width(case.clearance * 2);
+
+      let wide = arc.collide_seg(&seg, 0);
+
+      check_collide_case(&case, zero_width, wide);
+    }
+  }
+
+  /// `CollideNearlyFlatArcDoesNotOverflow`, `test_shape_arc.cpp:1305`.
+  /// The radius of this arc, taken from a PADS import crash, is past
+  /// `INT_MAX / 2`, which is what the two chord branches of
+  /// [`ShapeArc::collide_point`] and [`ShapeArc::collide_seg`] exist for.
+  ///
+  /// KiCad asserts only that nothing throws. Here the equivalent is that
+  /// nothing panics, which in a debug build also covers every integer
+  /// overflow on the way.
+  #[test]
+  fn collide_nearly_flat_arc_does_not_overflow() {
+    let arc = ShapeArc::new(
+      Vec2::new(68_208_364, -8000),
+      Vec2::new(771_364, 500_000),
+      Vec2::new(35_224_335, -7999),
+      1_270_000,
+    );
+
+    assert!(arc.radius() >= f64::from(i32::MAX) / 2.0);
+
+    let point = Vec2::new(35_224_298, -5381);
+
+    arc.collide_point(point, 635_000);
+    arc.collide_seg(
+      &Seg::new(point, Vec2::new(35_696_364, -32_988_651)),
+      635_000,
+    );
+  }
+
+  /// The port's own: [`ShapeArc::collide_seg`] reports the last candidate
+  /// that collided, not the nearest one. Erratum E2, reproduced on
+  /// purpose; the decision is in `doc/log/2026-09-12.md`.
+  ///
+  /// The segment here runs radially away from a quarter circle, so every
+  /// candidate KiCad builds collapses onto one of its two endpoints and
+  /// the far one is evaluated last.
+  #[test]
+  fn collide_seg_reports_the_last_candidate_erratum_e2() {
+    let arc = ShapeArc::new(
+      Vec2::new(1_000_000, 0),
+      Vec2::new(707_107, 707_107),
+      Vec2::new(0, 1_000_000),
+      0,
+    );
+    let seg =
+      Seg::new(Vec2::new(900_000, 900_000), Vec2::new(1_200_000, 1_200_000));
+    let clearance = 750_000;
+
+    let near = arc.collide_point(seg.a, clearance).expect("the near end");
+    let far = arc.collide_point(seg.b, clearance).expect("the far end");
+
+    assert!(near.actual < far.actual, "{near:?} against {far:?}");
+
+    let reported = arc.collide_seg(&seg, clearance).expect("collides");
+
+    assert_eq!(reported, far);
+    assert!(reported.actual > near.actual);
+  }
+
+  /// The port's own: [`ShapeArc::nearest_points_to_rect`] loses the half
+  /// width clamp that [`ShapeArc::nearest_points_to_seg`] applies.
+  /// Erratum E3, reproduced on purpose.
+  ///
+  /// The arc's edge overlaps the rectangle here, so the segment overload
+  /// zeroes the distance while the rectangle overload recomputes it from
+  /// the two points and reports the overshoot instead.
+  #[test]
+  fn nearest_points_to_rect_drops_the_width_clamp_erratum_e3() {
+    let points = [
+      Vec2::new(1_000_000, 0),
+      Vec2::new(707_107, 707_107),
+      Vec2::new(0, 1_000_000),
+    ];
+    let origin = Vec2::new(1_100_000, -50_000);
+    let size = Vec2::new(200_000, 100_000);
+    // The first segment of the rectangle's outline, which is the one the
+    // minimum lands on.
+    let side = Seg::new(origin, Vec2::new(origin.x + size.x, origin.y));
+
+    let wide = ShapeArc::new(points[0], points[1], points[2], 400_000);
+
+    // The side is 100 micrometres from the arc's centre line, well inside
+    // the 200 micrometre half width, so the segment overload clamps to
+    // zero and says the two overlap.
+    assert_eq!(wide.nearest_points_to_seg(&side).squared_distance, 0);
+    // The rectangle overload recomputes the distance from the two points
+    // after the half width has already moved one of them, so it reports
+    // the overshoot, about 88 micrometres, instead of the zero.
+    assert_eq!(
+      wide.nearest_points_to_rect(origin, size).squared_distance,
+      7_778_593_474
+    );
+
+    // With no width there is nothing to clamp, so the same query answers
+    // the true centre line gap of 100 micrometres.
+    let thin = ShapeArc::new(points[0], points[1], points[2], 0);
+
+    assert_eq!(
+      thin.nearest_points_to_rect(origin, size).squared_distance,
+      100_000 * 100_000
+    );
+  }
+
+  /// The port's own: the four `nearest_points` methods put the point on
+  /// the arc in `on_self` and the point on the other shape in
+  /// `on_other`, including the rectangle overload, which reaches its
+  /// answer through a dispatcher that swaps them twice
+  /// (`shape_arc.cpp:642`).
+  #[test]
+  fn nearest_points_put_the_arc_point_first() {
+    let arc = ShapeArc::new(
+      Vec2::new(1_000_000, 0),
+      Vec2::new(707_107, 707_107),
+      Vec2::new(0, 1_000_000),
+      0,
+    );
+    let far = Vec2::new(3_000_000, 0);
+
+    let to_circle = arc.nearest_points_to_circle(far, 100_000);
+
+    assert_eq!(to_circle.on_self, Vec2::new(1_000_000, 0));
+    assert_eq!(to_circle.on_other, Vec2::new(2_900_000, 0));
+
+    let to_seg = arc.nearest_points_to_seg(&Seg::new(
+      Vec2::new(2_000_000, -1_000_000),
+      Vec2::new(2_000_000, 1_000_000),
+    ));
+
+    assert_eq!(to_seg.on_self, Vec2::new(1_000_000, 0));
+    assert_eq!(to_seg.on_other, Vec2::new(2_000_000, 0));
+
+    let to_rect = arc.nearest_points_to_rect(
+      Vec2::new(2_000_000, -100_000),
+      Vec2::new(200_000, 200_000),
+    );
+
+    assert_eq!(to_rect.on_self, Vec2::new(1_000_000, 0));
+    assert_eq!(to_rect.on_other, Vec2::new(2_000_000, 0));
+
+    // Two quarter circles a few millimetres apart: the nearest pair is
+    // one arc's endpoint against a point on the other's circle.
+    let other = ShapeArc::new(
+      Vec2::new(6_000_000, 0),
+      Vec2::new(5_707_107, 707_107),
+      Vec2::new(5_000_000, 1_000_000),
+      0,
+    );
+    let to_arc = arc.nearest_points_to_arc(other);
+
+    assert_eq!(to_arc.on_other, Vec2::new(5_000_000, 1_000_000));
+    assert!(
+      (i64::from(to_arc.on_self.euclidean_norm()) - 1_000_000).abs() <= 1,
+      "{:?} is not on the arc's circle",
+      to_arc.on_self
+    );
   }
 
   /// The port's own: the two helpers the polyline builder rests on,
