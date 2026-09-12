@@ -773,6 +773,8 @@ fn the_snapshot_of_the_via_case_holds_every_obstacle_kind() {
   let (snapshot, host_map) =
     support::kicad_snapshot::snapshot_from_board(&case.board, &case.rules);
 
+  // Zero for every board now that an arc track becomes a
+  // `WorldGeometry::Arc`, and the counter stays as the guard that says so.
   assert_eq!(host_map.skipped_arcs, 0);
   assert_eq!(host_map.skipped_keepouts, 0);
   assert_eq!(host_map.skipped_pads, 0);
@@ -780,6 +782,7 @@ fn the_snapshot_of_the_via_case_holds_every_obstacle_kind() {
     host_map.len(),
     case.board.pads.len()
       + case.board.segments.len()
+      + case.board.arcs.len()
       + case.board.vias.len()
       + case.board.board_outline.len(),
     "one host object per board object"

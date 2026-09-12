@@ -7,8 +7,8 @@
 //! (`pcbnew/router/pns_solid.h:36`), `SEGMENT`
 //! (`pcbnew/router/pns_segment.h:38`), `VIA`
 //! (`pcbnew/router/pns_via.h:60`) and `HOLE`
-//! (`pcbnew/router/pns_hole.h:33`), plus the value types they carry.
-//! `ARC` arrives with the arc geometry, see `DESIGN.md` section 3.
+//! (`pcbnew/router/pns_hole.h:33`), plus `ARC`
+//! (`pcbnew/router/pns_arc.h:37`) and the value types they all carry.
 //!
 //! # Shape of the port
 //!
@@ -43,11 +43,12 @@ use std::f64::consts::FRAC_1_SQRT_2;
 use std::ops::{BitOr, BitOrAssign};
 
 use crate::arena::ArenaId;
+use crate::geometry::arc::ShapeArc;
 use crate::geometry::box2::Box2;
 use crate::geometry::collision::collide_mtv;
 use crate::geometry::hull::{
-  build_hull_for_primitive_shape, monotone_chain_hull, octagonal_hull,
-  segment_hull,
+  arc_hull, build_hull_for_primitive_shape, monotone_chain_hull,
+  octagonal_hull, segment_hull,
 };
 use crate::geometry::line_chain::LineChain;
 use crate::geometry::seg::Seg;
@@ -168,8 +169,8 @@ impl Kind {
 
   /// A curved track. Port of `ARC_T`, `pcbnew/router/pns_item.h:109`.
   ///
-  /// There is no arc body yet, see `DESIGN.md` section 3. The bit is here
-  /// so that the masks below have KiCad's numeric values.
+  /// The body is [`Arc`]; the bit already had KiCad's numeric value
+  /// before the body arrived, so no mask in the crate changed with it.
   pub const ARC: Kind = Kind(16);
 
   /// A via. Port of `VIA_T`, `pcbnew/router/pns_item.h:110`.
@@ -932,6 +933,128 @@ impl Segment {
   /// `pcbnew/router/pns_segment.h:133`.
   pub const fn anchor_count(&self) -> usize {
     2
+  }
+}
+
+// ---------------------------------------------------------------------
+// Arc
+// ---------------------------------------------------------------------
+
+/// A curved track of a given width.
+///
+/// Port of `PNS::ARC`, `pcbnew/router/pns_arc.h:37`, whose one data
+/// member is a `SHAPE_ARC` (`:119`). The width lives inside the arc here
+/// too, because [`ShapeArc`] carries one and KiCad's `SetWidth` and
+/// `Width` forward straight to it (`:83`, `:88`); that is the one place
+/// where this body differs in shape from [`Segment`], which keeps its
+/// width beside the spine.
+///
+/// Not ported: `CLine()` (`:93`), which returns a 1000 nm polygonisation
+/// and has no caller anywhere in KiCad's tree (erratum E20). The three
+/// copy constructors at `:51` and `:61` are the callers' job here: an
+/// arena [`Item`] carries the net, the layers, the marker and the rank,
+/// and every site that builds an arc from a parent sets them itself.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct Arc {
+  /// The curve. Port of `m_arc`, `pcbnew/router/pns_arc.h:119`.
+  arc: ShapeArc,
+}
+
+impl Arc {
+  /// An arc of a given curve.
+  ///
+  /// Port of `ARC( const SHAPE_ARC&, NET_HANDLE )`,
+  /// `pcbnew/router/pns_arc.h:44`, without the net, which lives on
+  /// [`Item`].
+  pub const fn new(arc: ShapeArc) -> Self {
+    Self { arc }
+  }
+
+  /// The curve. Port of `CArc`, `pcbnew/router/pns_arc.h:116`.
+  pub const fn arc(&self) -> ShapeArc {
+    self.arc
+  }
+
+  /// Replace the curve. Port of the mutable `Arc()` accessor,
+  /// `pcbnew/router/pns_arc.h:115`, which is how every caller that
+  /// rewrites the geometry reaches it.
+  pub const fn set_arc(&mut self, arc: ShapeArc) {
+    self.arc = arc;
+  }
+
+  /// The full width. Port of `Width`,
+  /// `pcbnew/router/pns_arc.h:88`.
+  pub const fn width(&self) -> i32 {
+    self.arc.width()
+  }
+
+  /// Set the full width. Port of `SetWidth`,
+  /// `pcbnew/router/pns_arc.h:83`.
+  pub const fn set_width(&mut self, width: i32) {
+    self.arc.set_width(width);
+  }
+
+  /// The curve the collision code sees.
+  ///
+  /// Port of `Shape`, `pcbnew/router/pns_arc.h:78`, which ignores the
+  /// layer and hands out the member itself.
+  pub const fn shape(&self) -> Shape {
+    Shape::Arc(self.arc)
+  }
+
+  /// The walkaround boundary.
+  ///
+  /// Port of `ARC::Hull`, `pcbnew/router/pns_arc.cpp:28`, which forwards
+  /// to `PNS::ArcHull` (`pcbnew/router/pns_utils.cpp:71`) with the raw
+  /// clearance and walkaround thickness and ignores the layer.
+  ///
+  /// [`arc_hull`] answers a [`Result`] where KiCad dereferences two empty
+  /// optionals (erratum E21), and this is the one caller that has to
+  /// decide what an error means. **An error becomes an empty chain**,
+  /// which is what a hull of an item with no shape already is: [`Item::hull`]
+  /// has no way to say "no hull", `LINE::Walkaround` treats a hull it
+  /// cannot intersect as an obstacle it does not have to avoid
+  /// (`pcbnew/router/pns_line.cpp:404`), and answering a wrong hull would
+  /// be worse than answering none. KiCad cannot reach the case at all:
+  /// the collinear mitre needs a polygonisation accuracy no caller
+  /// passes, and the degenerate arc needs three coincident points **and**
+  /// a combined clearance of zero, see the slice 4 entry of
+  /// `doc/log/2026-09-12.md`. The world refuses neither, so the case is
+  /// reachable in principle and has to answer something.
+  pub fn hull(&self, clearance: i32, walkaround_thickness: i32) -> LineChain {
+    arc_hull(&self.arc, clearance, walkaround_thickness).unwrap_or_default()
+  }
+
+  /// One of the two endpoints.
+  ///
+  /// Port of `Anchor`, `pcbnew/router/pns_arc.h:100`, which returns
+  /// `GetP0()` for `n == 0` and `GetP1()` for **every** other index, as
+  /// [`Segment::anchor`] does.
+  pub const fn anchor(&self, n: usize) -> Vec2 {
+    if n == 0 {
+      self.arc.start()
+    } else {
+      self.arc.end()
+    }
+  }
+
+  /// Two. Port of `AnchorCount`,
+  /// `pcbnew/router/pns_arc.h:108`.
+  pub const fn anchor_count(&self) -> usize {
+    2
+  }
+
+  /// The area two revisions of one arc cover between them.
+  ///
+  /// Port of `ARC::ChangedArea`, `pcbnew/router/pns_arc.cpp:51`, the
+  /// union of the two bounding boxes. KiCad's `OPT_BOX2I` is always
+  /// engaged, so there is nothing to make optional; [`Box2`] is the
+  /// crate's own possibly empty box and an arc always has one.
+  ///
+  /// The only caller is the shove's changed area accumulation, which
+  /// reaches arcs in slice 7 of `doc/work/012-arcs.md`.
+  pub fn changed_area(&self, other: &Arc) -> Box2 {
+    self.arc.bbox(0).merge(other.arc.bbox(0))
   }
 }
 
@@ -1815,14 +1938,16 @@ pub fn compound_hull(
 /// Replaces KiCad's `ITEM` subclass hierarchy
 /// (`pcbnew/router/pns_item.h:97` and its five descendants), as
 /// `doc/reference/kicad/02-item-model-and-node.md` section 10.8 asks.
-/// `ARC` will join it with the arc geometry, and `LINE` never will: a line
-/// is a transient value and is never stored (`DESIGN.md` section 4.2).
+/// `LINE` never joins it: a line is a transient value and is never stored
+/// (`DESIGN.md` section 4.2).
 #[derive(Clone, PartialEq, Debug)]
 pub enum ItemBody {
   /// A pad or another fixed obstacle. `PNS::SOLID`.
   Solid(Solid),
   /// A straight track. `PNS::SEGMENT`.
   Segment(Segment),
+  /// A curved track. `PNS::ARC`.
+  Arc(Arc),
   /// A via. `PNS::VIA`.
   Via(Via),
   /// A drilled hole or a slot. `PNS::HOLE`.
@@ -1838,6 +1963,7 @@ impl ItemBody {
     match self {
       Self::Solid(_) => Kind::SOLID,
       Self::Segment(_) => Kind::SEGMENT,
+      Self::Arc(_) => Kind::ARC,
       Self::Via(_) => Kind::VIA,
       Self::Hole(_) => Kind::HOLE,
     }
@@ -2340,6 +2466,7 @@ impl Item {
     match &self.body {
       ItemBody::Solid(solid) => solid.shape().map(Cow::Borrowed),
       ItemBody::Segment(segment) => Some(Cow::Owned(segment.shape())),
+      ItemBody::Arc(arc) => Some(Cow::Owned(arc.shape())),
       ItemBody::Via(via) => Some(Cow::Owned(via.shape(self.layers, layer))),
       ItemBody::Hole(hole) => Some(Cow::Borrowed(hole.shape())),
     }
@@ -2372,6 +2499,7 @@ impl Item {
       ItemBody::Segment(segment) => {
         segment.hull(clearance, walkaround_thickness)
       }
+      ItemBody::Arc(arc) => arc.hull(clearance, walkaround_thickness),
       ItemBody::Via(via) => via.hull(
         self.layers,
         clearance,
@@ -2416,6 +2544,7 @@ impl Item {
     match &self.body {
       ItemBody::Solid(solid) => solid.anchor(n),
       ItemBody::Segment(segment) => segment.anchor(n),
+      ItemBody::Arc(arc) => arc.anchor(n),
       ItemBody::Via(via) => via.anchor(n),
       ItemBody::Hole(_) => Vec2::new(0, 0),
     }
@@ -2429,6 +2558,7 @@ impl Item {
     match &self.body {
       ItemBody::Solid(solid) => solid.anchor_count(),
       ItemBody::Segment(segment) => segment.anchor_count(),
+      ItemBody::Arc(arc) => arc.anchor_count(),
       ItemBody::Via(via) => via.anchor_count(),
       ItemBody::Hole(_) => 0,
     }
@@ -3044,6 +3174,92 @@ mod tests {
       flatten(&item.hull(100, 51, 0)),
       flatten(&item.hull(100, 51, 3))
     );
+  }
+
+  // -----------------------------------------------------------------
+  // Arc
+  // -----------------------------------------------------------------
+
+  /// A quarter turn about `(1000, 0)` of radius 1000, width 200.
+  fn quarter() -> ShapeArc {
+    ShapeArc::new(point(0, 0), point(293, 707), point(1000, 1000), 200)
+  }
+
+  #[test]
+  fn arc_forwards_its_shape_width_and_anchors() {
+    let mut arc = Arc::new(quarter());
+
+    assert_eq!(arc.shape(), Shape::Arc(quarter()));
+    assert_eq!(arc.width(), 200);
+    assert_eq!(arc.anchor(0), point(0, 0));
+    // Every index but zero is the far end, as `Segment::anchor` is.
+    assert_eq!(arc.anchor(1), point(1000, 1000));
+    assert_eq!(arc.anchor(7), point(1000, 1000));
+    assert_eq!(arc.anchor_count(), 2);
+
+    arc.set_width(50);
+    assert_eq!(arc.width(), 50);
+    assert_eq!(arc.arc().width(), 50);
+
+    let moved = ShapeArc::new(point(0, 0), point(293, 707), point(0, 2000), 50);
+    arc.set_arc(moved);
+    assert_eq!(arc.arc(), moved);
+  }
+
+  /// The hull is exactly what the geometry layer's builder produces from
+  /// the raw arguments.
+  #[test]
+  fn arc_hull_is_the_geometry_layers_arc_hull() {
+    let arc = quarter();
+    let item = item_on(0, ItemBody::Arc(Arc::new(arc)));
+
+    assert_eq!(
+      flatten(&item.hull(100, 51, -1)),
+      flatten(&arc_hull(&arc, 100, 51).expect("a quarter turn hulls"))
+    );
+    // The layer is ignored.
+    assert_eq!(
+      flatten(&item.hull(100, 51, 0)),
+      flatten(&item.hull(100, 51, 3))
+    );
+  }
+
+  /// The one case [`arc_hull`] cannot answer becomes an empty chain.
+  ///
+  /// Erratum E21's guard needs three coincident points **and** a combined
+  /// clearance of zero, because any clearance at all sends a chord of
+  /// zero down the whole circle branch instead. KiCad dereferences an
+  /// empty optional here; the item answers the hull of an item with no
+  /// geometry, which is what [`Arc::hull`] documents.
+  #[test]
+  fn an_arc_whose_hull_cannot_be_built_answers_an_empty_chain() {
+    let at = point(500, 500);
+    let degenerate = ShapeArc::new(at, at, at, 200);
+    let item = item_on(0, ItemBody::Arc(Arc::new(degenerate)));
+
+    assert!(arc_hull(&degenerate, 0, 0).is_err());
+    assert_eq!(item.hull(0, 0, -1).point_count(), 0);
+
+    // Any clearance at all takes the whole circle branch and answers an
+    // octagon, so the empty chain is as unreachable here as it is in
+    // KiCad.
+    assert!(item.hull(1, 0, -1).point_count() > 2);
+  }
+
+  #[test]
+  fn arc_changed_area_is_the_union_of_the_two_boxes() {
+    let first = Arc::new(quarter());
+    let second = Arc::new(ShapeArc::new(
+      point(0, 0),
+      point(293, -707),
+      point(1000, -1000),
+      200,
+    ));
+
+    let area = first.changed_area(&second);
+
+    assert_eq!(area, first.arc().bbox(0).merge(second.arc().bbox(0)));
+    assert_eq!(first.changed_area(&first), first.arc().bbox(0));
   }
 
   // -----------------------------------------------------------------

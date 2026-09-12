@@ -869,8 +869,8 @@ fn chain_text(chain: &LineChain) -> String {
 /// (`pcbnew/router/pns_logger.cpp:245`), and not
 /// `SHAPE_LINE_CHAIN::Format`'s, which drops arcs (erratum E15). A chain
 /// that carries arcs still loses them here, because [`chain_text`] writes
-/// points only. Nothing in the world model can build one until
-/// `doc/work/012-arcs.md` slice 5 adds `ItemBody::Arc`.
+/// points only; no snapshot shape can be such a chain, an arc track being
+/// a [`WorldGeometry::Arc`] of its own and not a chain.
 fn shape_text(shape: &Shape) -> String {
   match shape {
     Shape::Circle { center, radius } => {
@@ -925,6 +925,17 @@ fn world_geometry_text(geometry: &WorldGeometry) -> String {
     WorldGeometry::Segment { seg, width } => {
       format!("segment {} {width}", seg_text(*seg))
     }
+    WorldGeometry::Arc {
+      start,
+      mid,
+      end,
+      width,
+    } => format!(
+      "arc {} {} {} {width}",
+      vec2_text(*start),
+      vec2_text(*mid),
+      vec2_text(*end)
+    ),
     WorldGeometry::Via {
       pos,
       diameter,
@@ -1359,10 +1370,17 @@ impl SessionRecording {
   /// `<flash>` is `flash-default` for [`WorldItem::flashed_layers`] of
   /// [`None`] and `flash <count> <layer>...` otherwise. `<drill>` is
   /// `no-drill` or `drill <shape>`. A `<geometry>` is one of
-  /// `segment <seg> <width>`, `via <x> <y> <diameter> <drill> <via-type>
+  /// `segment <seg> <width>`, `arc <start> <mid> <end> <width>`,
+  /// `via <x> <y> <diameter> <drill> <via-type>
   /// <is-free>`, `solid <shape> <pos> <offset> <orientation>
   /// <anchor-count> <anchor>...` or `hole <shape>`, and a `<seg>` is
   /// `<ax> <ay> <bx> <by> <parent-index>`.
+  ///
+  /// The `arc` geometry is KiCad's own log form for an arc shape
+  /// (`pcbnew/router/pns_logger.cpp:245`), the same four tokens
+  /// `<shape>`'s `arc` uses, and each of `<start>`, `<mid>` and `<end>`
+  /// is an `<x> <y>` pair. A recording of a board with no arc track is
+  /// byte for byte what it was before the form existed.
   ///
   /// A `<shape>` is `circle <x> <y> <radius>`, `rect <x> <y> <w> <h>
   /// <corner-radius>`, `segment <seg> <width>`, `simple <chain>`,
@@ -1915,6 +1933,18 @@ impl<'a> Tokens<'a> {
 
         Ok(WorldGeometry::Segment {
           seg,
+          width: self.number("a track width")?,
+        })
+      }
+      "arc" => {
+        let start = self.vec2("an arc start")?;
+        let mid = self.vec2("an arc mid point")?;
+        let end = self.vec2("an arc end")?;
+
+        Ok(WorldGeometry::Arc {
+          start,
+          mid,
+          end,
           width: self.number("a track width")?,
         })
       }

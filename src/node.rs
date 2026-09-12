@@ -113,6 +113,7 @@ use crate::arena::{Arena, ArenaId};
 use crate::collide::{
   CollisionSearchOptions, LineHead, Obstacle, collide_into, collide_line_items,
 };
+use crate::geometry::arc::ShapeArc;
 use crate::geometry::box2::Box2;
 use crate::geometry::collision;
 use crate::geometry::direction45::CornerMode;
@@ -122,7 +123,7 @@ use crate::geometry::shape::Shape;
 use crate::geometry::vec2::Vec2;
 use crate::index::Index;
 use crate::item::{
-  Hole, Item, ItemBody, ItemId, Kind, LayerRange, MarkerFlags, NetId,
+  Arc, Hole, Item, ItemBody, ItemId, Kind, LayerRange, MarkerFlags, NetId,
   UidCounter,
 };
 use crate::joint::{Joint, JointId, JointMap};
@@ -813,6 +814,15 @@ impl World {
 
         id
       }
+      // `:662`, the `ARC_T` case, which like `SEGMENT_T` goes straight to
+      // the private adder and performs none of `Add( unique_ptr<ARC> )`'s
+      // redundancy check.
+      ItemBody::Arc(_) => {
+        let id = self.items.insert(item);
+        self.do_add_arc(node, id);
+
+        id
+      }
       ItemBody::Via(_) => self.add_via(node, item),
       ItemBody::Hole(_) => self.add_hole(node, item),
     }
@@ -901,6 +911,58 @@ impl World {
 
     let id = self.items.insert(segment);
     self.do_add_segment(node, id);
+
+    Some(id)
+  }
+
+  /// Add a curved track.
+  ///
+  /// Port of `NODE::Add( unique_ptr<ARC>, bool )`,
+  /// `pcbnew/router/pns_node.cpp:776`, which refuses an arc that
+  /// duplicates one already linked to the joint at its start unless
+  /// `allow_redundant` is set (`:780`), and otherwise calls `addArc`
+  /// (`:765`), which links the joints at both anchors and indexes it.
+  ///
+  /// # Erratum E36, reproduced: no degenerate check
+  ///
+  /// `Add( SEGMENT )` refuses a segment whose two ends coincide
+  /// (`:749`); this overload has no counterpart, so an arc whose three
+  /// points coincide goes in. That is defined behaviour rather than a
+  /// crash, so the milestone rule says reproduce it, and the consequence
+  /// is smaller than the erratum's text suggests: the two `linkJoint`
+  /// calls land on one position and [`Joint::link`] refuses the second
+  /// (`pcbnew/router/pns_joint.h:213`), so the joint holds the arc once
+  /// and [`World::remove`] takes it out again cleanly. What is left is an
+  /// arc in the index with a point sized bounding box, which collides
+  /// with whatever comes within a clearance of that point. See
+  /// `doc/log/2026-09-12.md`.
+  ///
+  /// # Panics
+  ///
+  /// When the item is not an arc.
+  pub fn add_arc(
+    &mut self,
+    node: NodeId,
+    arc: Item,
+    allow_redundant: bool,
+  ) -> Option<ItemId> {
+    let ItemBody::Arc(body) = arc.body() else {
+      panic!("add_arc needs an arc body");
+    };
+
+    let shape = body.arc();
+
+    // :780
+    if !allow_redundant
+      && self
+        .find_redundant_arc(node, shape, arc.layers(), arc.net())
+        .is_some()
+    {
+      return None;
+    }
+
+    let id = self.items.insert(arc);
+    self.do_add_arc(node, id);
 
     Some(id)
   }
@@ -1023,6 +1085,7 @@ impl World {
     match item.body() {
       ItemBody::Solid(_) => self.do_add_solid(node, id),
       ItemBody::Segment(_) => self.do_add_segment(node, id),
+      ItemBody::Arc(_) => self.do_add_arc(node, id),
       ItemBody::Via(_) => self.do_add_via(node, id),
       // :676, "added by parent VIA_T or SOLID_T (pad)".
       ItemBody::Hole(_) => {}
@@ -1110,6 +1173,29 @@ impl World {
     self.index_add(node, id);
   }
 
+  /// Port of `NODE::addArc`, `pcbnew/router/pns_node.cpp:765`, which is
+  /// `addSegment` with the two anchors in place of the two segment ends.
+  fn do_add_arc(&mut self, node: NodeId, id: ItemId) {
+    let Some(item) = self.items.get(id) else {
+      return;
+    };
+
+    let ItemBody::Arc(arc) = item.body() else {
+      return;
+    };
+
+    let (start, end) = (arc.anchor(0), arc.anchor(1));
+    let layers = item.layers();
+    let net = item.net();
+
+    self.with_joints(node, |joints, root, _| {
+      joints.link_joint(start, layers, net, id, root);
+      joints.link_joint(end, layers, net, id, root);
+    });
+
+    self.index_add(node, id);
+  }
+
   /// Port of `NODE::addHole`, `pcbnew/router/pns_node.cpp:642`.
   fn do_add_hole(&mut self, node: NodeId, id: ItemId) {
     self.index_add(node, id);
@@ -1185,6 +1271,61 @@ impl World {
       && ((a == seg.a && b == seg.b) || (a == seg.b && b == seg.a))
   }
 
+  /// An arc already linked to the joint at the start with the same
+  /// geometry.
+  ///
+  /// Port of `NODE::findRedundantArc`,
+  /// `pcbnew/router/pns_node.cpp:1742`. The endpoints may be the other
+  /// way round and the layer test is on the range's start only, both as
+  /// [`World::find_redundant_segment`]'s are.
+  ///
+  /// # Erratum E8, fixed: the mid point is compared too
+  ///
+  /// KiCad compares the two anchors and nothing else (`:1760`), so an arc
+  /// bulging the other way between the same two endpoints reads as
+  /// redundant and is silently reused in its place. Two arcs that differ
+  /// only in their mid point are two different tracks and a board can
+  /// hold both, so this compares the mid point as well, reversing it with
+  /// the endpoints. `doc/work/012-arcs.md` asks for the fix; the test
+  /// naming it is `find_redundant_arc_compares_the_mid_point_erratum_e8`.
+  fn find_redundant_arc(
+    &self,
+    node: NodeId,
+    arc: ShapeArc,
+    layers: LayerRange,
+    net: Option<NetId>,
+  ) -> Option<ItemId> {
+    let start = self.find_joint(node, arc.start(), layers.start(), net)?;
+    let joint = self.joint(start)?;
+
+    joint
+      .links()
+      .iter()
+      .copied()
+      .find(|id| self.is_same_arc(*id, arc, layers))
+  }
+
+  /// Whether a stored item is an arc with that geometry on that layer.
+  ///
+  /// The body of the loop in `findRedundantArc`,
+  /// `pcbnew/router/pns_node.cpp:1752` to `:1763`, with erratum E8's mid
+  /// point added; see [`World::find_redundant_arc`].
+  fn is_same_arc(&self, id: ItemId, arc: ShapeArc, layers: LayerRange) -> bool {
+    let Some(item) = self.items.get(id) else {
+      return false;
+    };
+
+    let ItemBody::Arc(stored) = item.body() else {
+      return false;
+    };
+
+    let stored = stored.arc();
+
+    item.layers().start() == layers.start()
+      && (same_arc_geometry(arc, stored)
+        || same_arc_geometry(arc, stored.reversed()))
+  }
+
   // -----------------------------------------------------------------
   // Remove
   // -----------------------------------------------------------------
@@ -1221,6 +1362,12 @@ impl World {
       }
       ItemBody::Segment(_) => {
         self.remove_segment_index(node, id);
+        self.do_remove(node, id);
+      }
+      // `:1002`, the `ARC_T` case, which is `removeArcIndex` plus the
+      // common tail (`:991`).
+      ItemBody::Arc(_) => {
+        self.remove_arc_index(node, id);
         self.do_remove(node, id);
       }
       ItemBody::Via(_) => {
@@ -1275,6 +1422,28 @@ impl World {
     self.with_joints(node, |joints, root, _| {
       joints.unlink_joint(seg.a, layers, net, id, root);
       joints.unlink_joint(seg.b, layers, net, id, root);
+    });
+  }
+
+  /// Port of `NODE::removeArcIndex`,
+  /// `pcbnew/router/pns_node.cpp:863`, which is `removeSegmentIndex`
+  /// with the two anchors in place of the two segment ends.
+  fn remove_arc_index(&mut self, node: NodeId, id: ItemId) {
+    let Some(item) = self.items.get(id) else {
+      return;
+    };
+
+    let ItemBody::Arc(arc) = item.body() else {
+      return;
+    };
+
+    let (start, end) = (arc.anchor(0), arc.anchor(1));
+    let layers = item.layers();
+    let net = item.net();
+
+    self.with_joints(node, |joints, root, _| {
+      joints.unlink_joint(start, layers, net, id, root);
+      joints.unlink_joint(end, layers, net, id, root);
     });
   }
 
@@ -2328,6 +2497,23 @@ impl World {
   /// [`World::remove_line`] does take a linked via out (note 02 section
   /// 2.3).
   ///
+  /// # Erratum E22, fixed: one loop in chain order
+  ///
+  /// KiCad runs **two** loops, every arc of `m_arcs` first (`:689`) and
+  /// then every non arc segment in chain order (`:707`), so
+  /// `LINE::m_links` of a line that holds both comes out in arcs first
+  /// order. [`Line::clip_vertex_range`] walks shapes with
+  /// [`LineChain::next_shape`] and counts link indices in lockstep, which
+  /// is only correct for chain order, so a line built here and clipped
+  /// afterwards would map the wrong links. This walks the chain once
+  /// instead and emits each shape, straight or curved, where it sits.
+  /// `doc/work/012-arcs.md` asks for the fix; the test naming it is
+  /// `add_line_links_in_chain_order_erratum_e22`.
+  ///
+  /// The hazard is latent in KiCad because [`World::assemble_line`] does
+  /// link in chain order (`:1188`) and that is the path the shove and the
+  /// dragger clip; the fix makes the two producers agree.
+  ///
   /// Returns the handles that were linked, in chain order.
   ///
   /// # The shared segment
@@ -2365,8 +2551,62 @@ impl World {
     let mut added = Vec::new();
     let layers = line.layers();
     let net = line.net();
+    let width = line.width();
+    // The arc the previous chain segment belonged to, so that the several
+    // approximation segments of one arc emit one item.
+    let mut open_arc: Option<usize> = None;
 
     for index in 0..line.shape().segment_count() {
+      // :689, the arc loop, moved into chain order; see the port note.
+      if line.shape().is_arc_segment(index) {
+        let slot = line.shape().arc_index(index);
+
+        if slot == open_arc {
+          continue;
+        }
+
+        open_arc = slot;
+
+        let Some(mut shape) = slot.and_then(|slot| line.shape().arc(slot))
+        else {
+          continue;
+        };
+
+        // `ARC( const LINE&, const SHAPE_ARC& )`,
+        // `pcbnew/router/pns_arc.h:61`: the three points of the stored
+        // arc with the **line's** width, the chain's copy carrying none
+        // (`shape_line_chain.cpp:1624`).
+        shape.set_width(width);
+
+        // :694
+        let reused = if allow_redundant {
+          None
+        } else {
+          self.find_redundant_arc(node, shape, layers, net)
+        };
+
+        if let Some(existing) = reused {
+          // :697. Unlike the segment loop below, KiCad's arc loop has no
+          // `ContainsLink` guard; reproduced.
+          line.link(existing);
+          added.push(existing);
+
+          continue;
+        }
+
+        let uid = self.next_uid();
+        let item = self.arc_item_for_line(line, shape, uid);
+
+        if let Some(stored) = self.add_arc(node, item, true) {
+          line.link(stored);
+          added.push(stored);
+        }
+
+        continue;
+      }
+
+      open_arc = None;
+
       let seg = line.shape().segment(index);
 
       // :714
@@ -2404,6 +2644,30 @@ impl World {
     }
 
     added
+  }
+
+  /// One arc of a line as a throwaway [`Item`] the node can store.
+  ///
+  /// Port of `ARC( const LINE& aParentLine, const SHAPE_ARC& aArc )`,
+  /// `pcbnew/router/pns_arc.h:61`, which copies the net, the layers, the
+  /// marker and the rank from the line. It lives here rather than beside
+  /// [`Line::segment_item`] because [`crate::line`] is not part of work
+  /// item 012 slice 5; the two build the same properties, and if a third
+  /// body ever needs the same treatment they should be folded together.
+  ///
+  /// The `uid` rule is [`Line::segment_item`]'s: the caller takes one
+  /// from [`World::next_uid`] so that the item carries a world unique
+  /// number even before it is stored.
+  fn arc_item_for_line(&self, line: &Line, arc: ShapeArc, uid: u64) -> Item {
+    let mut item = Item::new(uid, ItemBody::Arc(Arc::new(arc)));
+
+    item.set_layers_and_flash_all(line.layers());
+    item.set_net(line.net());
+    item.mark(line.marker(self));
+    item.set_rank(line.rank(self));
+    item.set_source(line.source());
+
+    item
   }
 
   /// Take a line's stored segments, and its linked via, out of a node.
@@ -2507,11 +2771,30 @@ impl World {
   ///
   /// KiCad allocates three `std::array`s of `1024 * 16 + 1` entries on
   /// the stack, 128 KiB per call, and grows into them from the middle
-  /// (`:1135` to `:1145`). This uses one [`VecDeque`], with the backward
-  /// walk pushing to the front and the forward walk to the back, which
-  /// produces the same order with no fixed limit; the `aLimit` checks at
-  /// `:1118` therefore have no counterpart. The parallel `arcReversed`
-  /// array is gone with the arcs.
+  /// (`:1135` to `:1145`). This uses one [`VecDeque`] of triples, with
+  /// the backward walk pushing to the front and the forward walk to the
+  /// back, which produces the same order with no fixed limit; the
+  /// `aLimit` checks at `:1118` therefore have no counterpart. The third
+  /// member of each triple is KiCad's parallel `arcReversed` array.
+  ///
+  /// # Arcs, and why erratum E4 is moot here
+  ///
+  /// An arc link contributes **no** plain corner point of its own
+  /// (`:1175`): its whole polyline comes from `Append( SHAPE_ARC )` at
+  /// `:1185`, which is why an arc in the middle of a line pushes every
+  /// later point index along by the arc's approximation point count, and
+  /// why `origin_segment_index` needs the clamp below.
+  ///
+  /// KiCad appends `sa->Reversed()` for an arc the walk reached from the
+  /// far end. `Reversed()` rebuilds the arc from the permuted points and
+  /// re runs `CalcArcCenter`, which through erratum E1's round number
+  /// snapping can land on a different centre than `Reverse()` would have
+  /// left in place, so assembling one physical line in the two scan
+  /// directions can produce two arcs with different derived geometry;
+  /// that is erratum E4. It cannot happen here: [`ShapeArc`] caches
+  /// nothing, every derived quantity is computed on demand, and
+  /// [`ShapeArc::reverse`] and [`ShapeArc::reversed`] give the same three
+  /// points. The in place reverse is used because it says what is meant.
   ///
   /// The `aSegments[aPos] = nullptr` a guard hit writes (`:1110`) is not
   /// reproduced: `aPos` has just been stepped past the range the
@@ -2536,17 +2819,19 @@ impl World {
       return line;
     };
 
-    let ItemBody::Segment(body) = seed.body() else {
+    // The seed is a `LINKED_ITEM*` in KiCad, so an arc seeds a line as
+    // readily as a segment; a body with no width is not one.
+    let Some(width) = width_of(seed) else {
       return line;
     };
 
     // :1147 to :1152
-    line.set_width(body.width());
+    line.set_width(width);
     line.set_layers(seed.layers());
     line.set_net(seed.net());
     line.set_source(seed.source());
 
-    let mut corners: VecDeque<(Vec2, ItemId)> = VecDeque::new();
+    let mut corners: VecDeque<(Vec2, ItemId, bool)> = VecDeque::new();
     let options = FollowOptions {
       stop_at_locked_joints,
       follow_locked_segments,
@@ -2566,11 +2851,29 @@ impl World {
     let mut previous: Option<ItemId> = None;
     let mut origin_point: Option<usize> = None;
 
-    for (corner, link) in &corners {
-      // :1175. Without arcs every link contributes its corner.
-      line.chain_mut().append(*corner);
+    for (corner, link, arc_reversed) in &corners {
+      let arc = self.items.get(*link).and_then(|item| match item.body() {
+        ItemBody::Arc(arc) => Some(arc.arc()),
+        _ => None,
+      });
+
+      // :1175. Only a link that is not an arc contributes its corner.
+      if arc.is_none() {
+        line.chain_mut().append(*corner);
+      }
 
       if previous != Some(*link) {
+        // :1180 to :1185
+        if let Some(mut shape) = arc {
+          if *arc_reversed {
+            shape.reverse();
+          }
+
+          line
+            .chain_mut()
+            .append_arc(&shape, LineChain::ARC_POLYGONIZATION_MAX_ERROR);
+        }
+
         line.link(*link);
 
         // :1191, "latter condition to avoid loops".
@@ -2620,12 +2923,18 @@ impl World {
   /// The `prevReversed` flip (`:1127`) is what keeps the walk going when
   /// a segment is stored back to front: the next anchor to look at is
   /// `aScanDirection ^ prevReversed`, not `aScanDirection`.
+  ///
+  /// The third member of each corner is KiCad's `aArcReversed` (`:1092`
+  /// to `:1103`): true when the walk reached an arc from the anchor the
+  /// scan direction does not expect, so that [`World::assemble_line`]
+  /// appends the arc the way the line travels. It is false for every
+  /// other kind, as KiCad's is.
   fn follow_line(
     &self,
     node: NodeId,
     start: ItemId,
     scan_forward: bool,
-    corners: &mut VecDeque<(Vec2, ItemId)>,
+    corners: &mut VecDeque<(Vec2, ItemId, bool)>,
     options: FollowOptions,
   ) -> bool {
     let anchor_index = usize::from(scan_forward);
@@ -2656,11 +2965,17 @@ impl World {
         break;
       };
 
-      // :1092. The arc reversal flag at :1096 has no counterpart.
+      // :1096 to :1103. An arc reached from anchor 0 while scanning
+      // forward, or from anchor 1 while scanning backward, runs against
+      // the direction of travel.
+      let arc_reversed = matches!(item.body(), ItemBody::Arc(_))
+        && joint.pos() == item.anchor(usize::from(!scan_forward));
+
+      // :1092
       if scan_forward {
-        corners.push_back((joint.pos(), current));
+        corners.push_back((joint.pos(), current, arc_reversed));
       } else {
-        corners.push_front((joint.pos(), current));
+        corners.push_front((joint.pos(), current, arc_reversed));
       }
 
       // :1107, the loop detector.
@@ -3666,11 +3981,30 @@ struct FollowOptions {
 fn width_of(item: &Item) -> Option<i32> {
   match item.body() {
     ItemBody::Segment(segment) => Some(segment.width()),
+    ItemBody::Arc(arc) => Some(arc.width()),
     ItemBody::Via(via) => {
       Some(via.diameter(item.layers(), item.layers().start()))
     }
     _ => None,
   }
+}
+
+/// Whether two arcs describe the same curve travelled the same way.
+///
+/// The three point comparison [`World::find_redundant_arc`] needs.
+/// KiCad's `findRedundantArc` compares only the two anchors
+/// (`pcbnew/router/pns_node.cpp:1760`), which is erratum E8. The mid
+/// point is here because two arcs between the same endpoints that bulge
+/// opposite ways are two different tracks.
+///
+/// The width is deliberately **not** compared, because KiCad's endpoint
+/// test does not compare it either: a redundant arc is one that occupies
+/// the same place on the same layer, and the caller that reuses it wants
+/// whatever is already there.
+fn same_arc_geometry(first: ShapeArc, second: ShapeArc) -> bool {
+  first.start() == second.start()
+    && first.arc_mid() == second.arc_mid()
+    && first.end() == second.end()
 }
 
 /// A found point index as KiCad's signed one, with `-1` for not found.
@@ -5048,6 +5382,303 @@ mod tests {
         .find_lines_between_joints(root, first, elsewhere)
         .is_empty()
     );
+  }
+
+  // -----------------------------------------------------------------
+  // Arcs
+  // -----------------------------------------------------------------
+
+  /// A quarter turn from the origin, bulging below the chord.
+  ///
+  /// Centre `(100000, 0)`, radius 100000, so every one of the three
+  /// points is on the circle to within a nanometre and the arc is an
+  /// ordinary track corner rather than a near degenerate one.
+  const QUARTER: ShapeArc = ShapeArc::new(
+    Vec2::new(0, 0),
+    Vec2::new(29289, 70711),
+    Vec2::new(100_000, 100_000),
+    1000,
+  );
+
+  /// The second quarter turn of the arc, straight, arc chain, starting
+  /// where the straight run ends.
+  const SECOND_QUARTER: ShapeArc = ShapeArc::new(
+    Vec2::new(200_000, 100_000),
+    Vec2::new(229_289, 170_711),
+    Vec2::new(300_000, 200_000),
+    1000,
+  );
+
+  /// A width 1000 arc track on layer 0, not yet stored.
+  fn arc_track(world: &mut World, arc: ShapeArc, net: Option<NetId>) -> Item {
+    let mut item = world.make_item(ItemBody::Arc(Arc::new(arc)));
+
+    item.set_layers_and_flash_all(LayerRange::single(0));
+    item.set_net(net);
+
+    item
+  }
+
+  /// Store a width 1000 arc track on layer 0, refusing a redundant one.
+  fn add_arc_track(world: &mut World, node: NodeId, arc: ShapeArc) -> ItemId {
+    let item = arc_track(world, arc, NET);
+
+    world
+      .add_arc(node, item, false)
+      .expect("the arc is not redundant")
+  }
+
+  /// The three points of an arc, for comparing against a literal.
+  ///
+  /// An arc stored in a [`LineChain`] always has width zero
+  /// (`shape_line_chain.cpp:1624`), so the width is left out of every
+  /// comparison against the width 1000 track it came from.
+  fn arc_points(arc: ShapeArc) -> [Vec2; 3] {
+    [arc.start(), arc.arc_mid(), arc.end()]
+  }
+
+  /// The three points of the one arc a line carries.
+  fn arc_of(line: &Line) -> ShapeArc {
+    let arcs: Vec<ShapeArc> =
+      line.shape().live_arcs().map(|(_, arc)| *arc).collect();
+
+    assert_eq!(arcs.len(), 1, "the line carries exactly one arc");
+
+    arcs[0]
+  }
+
+  /// Erratum E8, fixed: two arcs between the same endpoints that bulge
+  /// opposite ways are two tracks, not one.
+  #[test]
+  fn find_redundant_arc_compares_the_mid_point_erratum_e8() {
+    let mut world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let root = world.root();
+
+    let stored = add_arc_track(&mut world, root, QUARTER);
+
+    // The same three points again is redundant, which is the behaviour
+    // the mid point comparison must not break.
+    let duplicate = arc_track(&mut world, QUARTER, NET);
+    assert!(world.add_arc(root, duplicate, false).is_none());
+
+    // So is the same curve travelled the other way, which is what
+    // KiCad's "in either order" endpoint test is for (`:1760`).
+    let backwards = arc_track(&mut world, QUARTER.reversed(), NET);
+    assert!(world.add_arc(root, backwards, false).is_none());
+
+    // The other bulge between the same two endpoints is not. KiCad
+    // reuses the stored arc here and the board loses a track.
+    let mirrored = ShapeArc::new(
+      QUARTER.start(),
+      Vec2::new(70711, 29289),
+      QUARTER.end(),
+      1000,
+    );
+    let other = arc_track(&mut world, mirrored, NET);
+    let other = world
+      .add_arc(root, other, false)
+      .expect("the opposite bulge is a different track");
+
+    assert_ne!(other, stored);
+
+    // Both are linked to the joint at the shared start point.
+    let joint = world
+      .find_joint(root, QUARTER.start(), 0, NET)
+      .expect("the two arcs meet at a joint");
+    let links = world.joint(joint).expect("the joint is live").links();
+
+    assert_eq!(links, [stored, other]);
+  }
+
+  /// Erratum E36, reproduced: `Add( ARC )` has no degenerate check.
+  ///
+  /// `Add( SEGMENT )` refuses a segment whose ends coincide (`:749`) and
+  /// the arc overload has no counterpart, so a degenerate arc goes in.
+  /// What that costs is small and is asserted here: one joint holding the
+  /// arc once, because [`Joint::link`] refuses the second link at the
+  /// same position, and a point sized entry in the index.
+  #[test]
+  fn add_arc_accepts_a_degenerate_arc_erratum_e36() {
+    let mut world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let root = world.root();
+
+    let at = Vec2::new(50000, 50000);
+    let degenerate = ShapeArc::new(at, at, at, 1000);
+    let item = arc_track(&mut world, degenerate, NET);
+    let stored = world
+      .add_arc(root, item, false)
+      .expect("a degenerate arc is accepted where a degenerate segment is not");
+
+    // A degenerate segment at the same place is refused, which is the
+    // asymmetry the erratum names.
+    let flat = track(&mut world, at, at, 0, NET);
+    assert!(world.add_segment(root, flat, false).is_none());
+
+    let joint = world
+      .find_joint(root, at, 0, NET)
+      .expect("the two anchors made one joint");
+
+    assert_eq!(world.joint(joint).expect("live").links(), [stored]);
+    assert_eq!(world.hit_test(root, at), vec![stored]);
+
+    // And it comes out again cleanly, one unlink per anchor against one
+    // link.
+    world.remove(root, stored);
+
+    assert!(world.item(stored).is_none());
+    assert!(world.find_joint(root, at, 0, NET).is_none());
+  }
+
+  /// Erratum E22, fixed: an arc, straight, arc line links in chain order.
+  ///
+  /// KiCad runs the arc loop first and the segment loop second, so the
+  /// links come out arc, arc, segment and `LINE::ClipVertexRange`, which
+  /// counts links in shape order, maps the wrong one.
+  #[test]
+  fn add_line_links_in_chain_order_erratum_e22() {
+    let mut world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let root = world.root();
+
+    let mut chain = LineChain::new();
+    chain.append_arc(&QUARTER, LineChain::ARC_POLYGONIZATION_MAX_ERROR);
+    chain.append(Vec2::new(200_000, 100_000));
+    chain.append_arc(&SECOND_QUARTER, LineChain::ARC_POLYGONIZATION_MAX_ERROR);
+
+    let mut line = loose_line(&[]);
+    line.set_shape(chain);
+
+    let added = world.add_line(root, &mut line, true);
+
+    let kinds: Vec<Kind> = added
+      .iter()
+      .filter_map(|id| world.item(*id).map(Item::kind))
+      .collect();
+
+    assert_eq!(kinds, [Kind::ARC, Kind::SEGMENT, Kind::ARC]);
+    assert_eq!(line.links(), added);
+
+    // Each arc item carries the chain's three points with the line's
+    // width, which the chain's own copy does not hold
+    // (`shape_line_chain.cpp:1624`).
+    let stored: Vec<ShapeArc> = added
+      .iter()
+      .filter_map(|id| match world.item(*id)?.body() {
+        ItemBody::Arc(arc) => Some(arc.arc()),
+        _ => None,
+      })
+      .collect();
+
+    assert_eq!(stored, [QUARTER, SECOND_QUARTER]);
+    assert!(stored.iter().all(|arc| arc.width() == 1000));
+
+    // The straight item is the one segment between the two curves.
+    let segment = added[1];
+    let ItemBody::Segment(body) = world.item(segment).expect("live").body()
+    else {
+      panic!("the middle link is a segment");
+    };
+
+    assert_eq!(body.seg().a, QUARTER.end());
+    assert_eq!(body.seg().b, SECOND_QUARTER.start());
+  }
+
+  /// The fixture `assemble_line` walks over an arc.
+  ///
+  /// A straight run into the arc's start, the arc, a straight run out of
+  /// its end, and a fan out at each far end so that the line stops there.
+  /// `reversed` stores the arc pointing against the direction of travel,
+  /// which is what sets `followLine`'s `aArcReversed` (`:1096`).
+  ///
+  /// The outbound segment is deliberately stored **from** the far fan out
+  /// **to** the arc's end. An assembled line runs in the direction the
+  /// seed's own two anchors point, so a fixture whose segments all point
+  /// the same way is walked the same way whichever of them seeds it; this
+  /// one is walked in one direction from `first` and in the other from
+  /// `last`, which is the only way to reach `aArcReversed` from both
+  /// sides.
+  fn arc_line_fixture(reversed: bool) -> (World, ItemId, ItemId) {
+    let mut world = World::new(World::DEFAULT_MAX_CLEARANCE);
+    let root = world.root();
+
+    let before = Vec2::new(-100_000, 0);
+    let after = Vec2::new(200_000, 100_000);
+
+    let first = add_track(&mut world, root, before, QUARTER.start());
+    let arc = if reversed {
+      QUARTER.reversed()
+    } else {
+      QUARTER
+    };
+
+    add_arc_track(&mut world, root, arc);
+
+    let last = add_track(&mut world, root, after, QUARTER.end());
+
+    // Fan outs, so that neither end is a line corner.
+    add_track(&mut world, root, before, Vec2::new(-100_000, 100_000));
+    add_track(&mut world, root, before, Vec2::new(-100_000, -100_000));
+    add_track(&mut world, root, after, Vec2::new(300_000, 100_000));
+    add_track(&mut world, root, after, Vec2::new(200_000, 200_000));
+
+    (world, first, last)
+  }
+
+  /// An arc stored the way the line travels comes back unchanged.
+  #[test]
+  fn assemble_line_walks_through_an_arc_stored_forwards() {
+    let (world, first, _) = arc_line_fixture(false);
+    let root = world.root();
+
+    let line = world.assemble_line(root, first, None, false, false, true);
+
+    assert_eq!(line.point(0), Vec2::new(-100_000, 0));
+    assert_eq!(line.last_point(), Some(Vec2::new(200_000, 100_000)));
+    assert_eq!(arc_points(arc_of(&line)), arc_points(QUARTER));
+    assert_eq!(line.link_count(), 3);
+  }
+
+  /// An arc stored against the direction of travel is reversed on the
+  /// way in, so the assembled chain still runs start to end.
+  #[test]
+  fn assemble_line_walks_through_an_arc_stored_backwards() {
+    let (world, first, _) = arc_line_fixture(true);
+    let root = world.root();
+
+    let line = world.assemble_line(root, first, None, false, false, true);
+
+    assert_eq!(line.point(0), Vec2::new(-100_000, 0));
+    assert_eq!(line.last_point(), Some(Vec2::new(200_000, 100_000)));
+    assert_eq!(arc_points(arc_of(&line)), arc_points(QUARTER));
+  }
+
+  /// Seeding the walk from the other end gives the same physical line
+  /// the other way round, arc included.
+  ///
+  /// This is where KiCad's erratum E4 lives: it appends `Reversed()`,
+  /// which re runs `CalcArcCenter` on the permuted points and can land on
+  /// a different centre, so the two directions can disagree about the
+  /// same curve. Nothing is cached here, so they cannot.
+  #[test]
+  fn assemble_line_from_the_other_end_reverses_the_arc_and_nothing_else() {
+    let (world, first, last) = arc_line_fixture(false);
+    let root = world.root();
+
+    let forwards = world.assemble_line(root, first, None, false, false, true);
+    let backwards = world.assemble_line(root, last, None, false, false, true);
+
+    assert_eq!(backwards.point(0), Vec2::new(200_000, 100_000));
+    assert_eq!(backwards.last_point(), Some(Vec2::new(-100_000, 0)));
+
+    assert_eq!(
+      arc_points(arc_of(&backwards)),
+      arc_points(QUARTER.reversed())
+    );
+
+    let mut reversed_points = points_of(&backwards);
+    reversed_points.reverse();
+
+    assert_eq!(reversed_points, points_of(&forwards));
+    assert_eq!(backwards.link_count(), forwards.link_count());
   }
 
   #[test]

@@ -757,6 +757,44 @@ pub struct NewItem {
   pub source: Option<HostId>,
 }
 
+/// Why a commit could not describe one item to the host.
+///
+/// [`NewGeometry`] covers what a single track placer emits, and nothing
+/// else; an item of any other shape that reaches the commit is reported
+/// here instead of being dropped. Read it with
+/// [`Router::last_commit_error`].
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum CommitError {
+  /// An arc reached the added or the updated side of a commit.
+  ///
+  /// [`NewGeometry`] gains its arc variant in slice 8 of
+  /// `doc/work/012-arcs.md`, together with the host boundary that can
+  /// apply one. Until then a commit that would have to emit an arc lists
+  /// the **removal** of whatever the arc replaced and leaves the arc
+  /// itself out, so a host that ignores this error applies a diff that is
+  /// short of one track rather than one that is wrong.
+  ///
+  /// It cannot arise before slice 7: nothing in the crate produces an arc
+  /// item except a host snapshot, and a snapshot item that is never
+  /// touched is in neither list.
+  ArcNotRepresentable {
+    /// The world unique number of the item, which is what
+    /// [`crate::item::Item::uid`] answers and what the debug output of a
+    /// failing session names.
+    uid: u64,
+  },
+  /// The commit reached a body no [`NewGeometry`] describes and none ever
+  /// will: a solid or a hole.
+  ///
+  /// The commit's own kind filter drops both before the lists are built,
+  /// so this is the arm that says so rather than one a caller can
+  /// observe.
+  NotCommittable {
+    /// The item's world unique number.
+    uid: u64,
+  },
+}
+
 /// What one routing session changed.
 ///
 /// Port of `ROUTER::CommitRouting( NODE* )`
@@ -1006,6 +1044,17 @@ pub struct Router {
   /// commit is recorded whatever the depth, because it is a result and
   /// not an input.
   recording_depth: u32,
+  /// What the last commit could not describe, if anything.
+  ///
+  /// KiCad has no counterpart: `ROUTER::CommitRouting` hands every non
+  /// virtual item to `ROUTER_IFACE::AddItem`
+  /// (`pcbnew/router/pns_router.cpp:896`), and `createBoardItem`'s
+  /// `default:` answers `nullptr` for a kind it cannot build
+  /// (`pcbnew/router/pns_kicad_iface.cpp:2858`), which drops it in
+  /// silence. Here the drop is reported instead, see [`CommitError`]. Set
+  /// by every commit, including the ones that describe everything, so it
+  /// always names the most recent one.
+  last_commit_error: Option<CommitError>,
 }
 
 impl Router {
@@ -1044,7 +1093,18 @@ impl Router {
       committed: Vec::new(),
       recorder: None,
       recording_depth: 0,
+      last_commit_error: None,
     }
+  }
+
+  /// What the last commit could not describe to the host, if anything.
+  ///
+  /// [`None`] when the last commit described everything it listed, which
+  /// is every commit a board without arc tracks can produce. See
+  /// [`CommitError`] for the one case that is reachable today and for
+  /// what the diff holds when it fires.
+  pub const fn last_commit_error(&self) -> Option<CommitError> {
+    self.last_commit_error
   }
 
   /// Install a trace hook.
@@ -2818,6 +2878,8 @@ impl Router {
   /// end with, once the node they were committing has been folded into
   /// the board.
   fn apply_commit_plan(&mut self, plan: CommitPlan) -> CommitDiff {
+    self.last_commit_error = plan.error;
+
     // The removed items are out of the board now, and each updated one
     // has taken over the identity of the item it replaced.
     for id in plan.removed {
@@ -3008,15 +3070,30 @@ impl Router {
   /// hole rides along with it, so anything else in the delta belongs to
   /// the board and not to the session. Virtual items are never reported
   /// to the host (`pcbnew/router/pns_router.cpp:894`).
+  ///
+  /// `Kind::ARC` is in the mask even though [`NewGeometry`] cannot
+  /// describe an arc yet. KiCad filters the three lists on
+  /// `IsVirtual()` and on nothing else (`pcbnew/router/pns_router.cpp:891`,
+  /// `:897`), and a shove that pushes an existing arc track aside removes
+  /// it from slice 7 of `doc/work/012-arcs.md` on; leaving the arc out of
+  /// the mask would make that removal vanish silently instead of reaching
+  /// the host. What an arc cannot do is come back on the added side, and
+  /// [`Router::new_item`] says so with [`CommitError`].
   fn is_committable(&self, id: ItemId) -> bool {
     self.world.item(id).is_some_and(|item| {
-      item.of_kind(Kind::SEGMENT | Kind::VIA) && !item.is_virtual()
+      item.of_kind(Kind::SEGMENT | Kind::ARC | Kind::VIA) && !item.is_virtual()
     })
   }
 
   /// One item of a commit, as a host has to build it.
-  fn new_item(&self, id: ItemId) -> Option<NewItem> {
-    let item = self.world.item(id)?;
+  ///
+  /// The error arm is the whole of the crate's answer to "what does the
+  /// commit do with an arc", see [`CommitError::ArcNotRepresentable`].
+  fn new_item(&self, id: ItemId) -> Result<NewItem, CommitError> {
+    let Some(item) = self.world.item(id) else {
+      return Err(CommitError::NotCommittable { uid: 0 });
+    };
+
     let geometry = match item.body() {
       ItemBody::Segment(body) => NewGeometry::Segment {
         seg: body.seg(),
@@ -3028,10 +3105,15 @@ impl Router {
         drill: body.drill(),
         via_type: body.via_type(),
       },
-      ItemBody::Solid(_) | ItemBody::Hole(_) => return None,
+      ItemBody::Arc(_) => {
+        return Err(CommitError::ArcNotRepresentable { uid: item.uid() });
+      }
+      ItemBody::Solid(_) | ItemBody::Hole(_) => {
+        return Err(CommitError::NotCommittable { uid: item.uid() });
+      }
     };
 
-    Some(NewItem {
+    Ok(NewItem {
       geometry,
       net: item.net(),
       layers: item.layers(),
@@ -3112,11 +3194,18 @@ impl Router {
       {
         let replacement = pool.remove(position);
 
-        if let Some(new_item) = self.new_item(replacement) {
-          plan.diff.updated.push((source, new_item));
-          plan.updated.push(replacement);
+        match self.new_item(replacement) {
+          Ok(new_item) => {
+            plan.diff.updated.push((source, new_item));
+            plan.updated.push(replacement);
 
-          continue;
+            continue;
+          }
+          // The update could not be described, so the host is told to
+          // delete the old object and the error says what it is missing.
+          Err(error) => {
+            plan.error.get_or_insert(error);
+          }
         }
       }
 
@@ -3129,9 +3218,14 @@ impl Router {
 
     // :895
     for id in pool {
-      if let Some(new_item) = self.new_item(id) {
-        plan.diff.added.push(new_item);
-        plan.added.push(id);
+      match self.new_item(id) {
+        Ok(new_item) => {
+          plan.diff.added.push(new_item);
+          plan.added.push(id);
+        }
+        Err(error) => {
+          plan.error.get_or_insert(error);
+        }
       }
     }
 
@@ -3338,6 +3432,13 @@ struct CommitPlan {
   /// and this has one per solid, because a pad on several padstack
   /// layers is several solids that all move together.
   moved: Vec<(HostId, MovedSolid)>,
+  /// The first item the commit could not describe, if there was one.
+  ///
+  /// It travels on the plan rather than on [`CommitDiff`] so that the
+  /// recorded text format, and therefore every stored session fixture,
+  /// is untouched; [`Router::last_commit_error`] is where a host reads
+  /// it.
+  error: Option<CommitError>,
 }
 
 /// Build the frame a host draws after one event.
@@ -3530,6 +3631,25 @@ fn append_node_delta(
         style: PreviewStyle::Tail,
         clearance,
       }),
+      // An arc draws as the one arc chain it is. `PreviewItem::chain`
+      // carries a [`LineChain`], which has held arcs since work item 012
+      // slice 3, so a host that flattens the chain draws the
+      // approximation and a host that reads its arcs draws the curve;
+      // KiCad's preview reads them (`router_preview_item.cpp:278`).
+      ItemBody::Arc(body) => {
+        let mut chain = LineChain::new();
+
+        chain.append_arc(&body.arc(), LineChain::ARC_POLYGONIZATION_MAX_ERROR);
+
+        frame.items.push(PreviewItem {
+          chain,
+          width: body.width(),
+          layer: item.layer(),
+          net: item.net(),
+          style: PreviewStyle::Tail,
+          clearance,
+        });
+      }
       ItemBody::Solid(_) | ItemBody::Hole(_) => {}
     }
   }

@@ -23,9 +23,10 @@
 //! 05 section 7.6 maps LibrePCB's board objects onto them. The rules that
 //! matter for the snapshot's semantics:
 //!
-//! - **Tracks** become [`WorldGeometry::Segment`], added with the allow
-//!   duplicate flag (`pcbnew/router/pns_kicad_iface.cpp:2432`), so a
-//!   board with two coincident tracks keeps both.
+//! - **Tracks** become [`WorldGeometry::Segment`], or
+//!   [`WorldGeometry::Arc`] for a curved one, added with the allow
+//!   duplicate flag (`pcbnew/router/pns_kicad_iface.cpp:2432`, `:2437`),
+//!   so a board with two coincident tracks keeps both.
 //! - **Vias** become [`WorldGeometry::Via`] plus a hole drilled from the
 //!   via's drill diameter (`:1863`). The hole is a first class item and
 //!   not an attribute, because the collision ladder recurses into hole
@@ -77,11 +78,12 @@
 
 use std::collections::BTreeMap;
 
+use crate::geometry::arc::ShapeArc;
 use crate::geometry::seg::Seg;
 use crate::geometry::shape::Shape;
 use crate::geometry::vec2::Vec2;
 use crate::item::{
-  Hole, HostId, ItemBody, ItemFlags, ItemId, LayerMask, LayerRange,
+  Arc, Hole, HostId, ItemBody, ItemFlags, ItemId, LayerMask, LayerRange,
   MarkerFlags, NetId, Provenance, Segment, Solid, Via, ViaType,
 };
 use crate::node::World;
@@ -241,9 +243,8 @@ impl WorldItem {
 
 /// The geometry of one snapshot item, which fixes its kind.
 ///
-/// The four bodies of [`ItemBody`] a host can supply. There is no line
-/// variant because a line is never stored (`DESIGN.md` section 4.2), and
-/// no arc variant because there is no arc body yet.
+/// The five bodies of [`ItemBody`] a host can supply. There is no line
+/// variant because a line is never stored (`DESIGN.md` section 4.2).
 #[derive(Clone, PartialEq, Debug)]
 pub enum WorldGeometry {
   /// A straight track. Port of `syncTrack`,
@@ -251,6 +252,31 @@ pub enum WorldGeometry {
   Segment {
     /// The centre line.
     seg: Seg,
+    /// The full track width in nanometres.
+    width: i32,
+  },
+
+  /// A curved track. Port of `syncArc`,
+  /// `pcbnew/router/pns_kicad_iface.cpp:1770`.
+  ///
+  /// The three point form is KiCad's own, and a `PCB_ARC` stores exactly
+  /// these three points, so the sync is lossless in both directions: no
+  /// centre, no angle, no rounding (note 09 sections 7.1 and 7.4). A host
+  /// that stores a centre (Horizon) or an angle (LibrePCB) converts at
+  /// this boundary and must not rewrite an arc the commit diff did not
+  /// list, because the conversion back is not exact.
+  ///
+  /// The mid point is any point of the curve strictly between the two
+  /// ends; it is what says which way round the arc runs. Three coincident
+  /// points make a degenerate arc, which the world accepts, see
+  /// [`World::add_arc`](crate::node::World::add_arc).
+  Arc {
+    /// One end.
+    start: Vec2,
+    /// A point on the curve between the ends.
+    mid: Vec2,
+    /// The other end.
+    end: Vec2,
     /// The full track width in nanometres.
     width: i32,
   },
@@ -473,12 +499,13 @@ impl World {
   /// plain data. See the module documentation for what a host must put in
   /// and what it must leave out.
   ///
-  /// Everything lands in the root node. Segments are added with the allow
-  /// duplicate flag, as KiCad's sync does (`:2432`), so two coincident
-  /// tracks both survive; a segment whose two ends are the same point is
-  /// still refused by [`World::add_segment`]
+  /// Everything lands in the root node. Segments and arcs are added with
+  /// the allow duplicate flag, as KiCad's sync does (`:2432`, `:2437`),
+  /// so two coincident tracks both survive; a segment whose two ends are
+  /// the same point is still refused by [`World::add_segment`]
   /// (`pcbnew/router/pns_node.cpp:749`) and is then absent from the
-  /// returned [`HostIndex`].
+  /// returned [`HostIndex`]. An arc has no such refusal, which is
+  /// erratum E36, reproduced at [`World::add_arc`].
   ///
   /// `FixupVirtualVias` (`pcbnew/router/pns_node.cpp:1697`), the last
   /// step of KiCad's sync, is not ported: it exists to give the length
@@ -514,6 +541,12 @@ impl World {
       WorldGeometry::Segment { seg, width } => {
         ItemBody::Segment(Segment::new(*seg, *width))
       }
+      WorldGeometry::Arc {
+        start,
+        mid,
+        end,
+        width,
+      } => ItemBody::Arc(Arc::new(ShapeArc::new(*start, *mid, *end, *width))),
       WorldGeometry::Via {
         pos,
         diameter,
@@ -569,6 +602,8 @@ impl World {
     Some(match &entry.geometry {
       // :2432, the trailing "allow duplicate" flag.
       WorldGeometry::Segment { .. } => self.add_segment(root, item, true)?,
+      // :2437, the same flag on `syncArc`'s call.
+      WorldGeometry::Arc { .. } => self.add_arc(root, item, true)?,
       WorldGeometry::Via { .. } => self.add_via(root, item),
       WorldGeometry::Solid { .. } => {
         let hole = entry.hole.clone().map(Hole::new);

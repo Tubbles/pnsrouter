@@ -1011,7 +1011,7 @@ Neither `Simplify` (`shape_line_chain.cpp:2782`) nor `Simplify2` (`:2906`) nor `
 
 ### E27. `shoveIteration`'s reverse `ARC_T` case diverges from `SEGMENT_T`
 
-`pcbnew/router/pns_shove.cpp:1793` to `:1808` versus `:1751` to `:1791`. The arc case omits `unwindLineStack`, omits `patchTadpoleVia`, omits the "current line ends with a colliding via" handling, and passes `revLine.Rank() - 1` where the segment case passes `revLine.Rank() + 1`. The sign is the anti ping pong rank convention (note 04 section 1.4): `+ 1` on a reverse collision, `- 1` on a forward one. The `//TODO(snh): Handle Arc shove separate from track` at `:1795` suggests the branch was never finished.
+`pcbnew/router/pns_shove.cpp:1793` to `:1808` versus `:1751` to `:1791`. The arc case omits `unwindLineStack`, omits `patchTadpoleVia`, omits the "current line ends with a colliding via" handling, and passes `revLine.Rank() - 1` where the segment case passes `revLine.Rank() + 1`. The sign is the anti ping pong rank convention (note 04 section 1.4): `+ 1` on a reverse collision, `- 1` on a forward one. The `//TODO(snh): Handle Arc shove separate from track` at `:1795` suggests the branch was never finished. How the branch is reached at all is a second question: `shoveIteration`'s obstacle search iterates `{ SOLID_T, VIA_T, SEGMENT_T, HOLE_T }` and sets the search kind mask to one of them per pass (`:1650`), so `ARC_T` is never asked for, and the arc cases can only be entered through an obstacle the filter let through under another kind. Slice 7 has to establish which before rewriting them (found in slice 5, 2026-09-12).
 
 ### E28. `mergeStep`'s arc guard is unreachable
 

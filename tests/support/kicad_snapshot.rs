@@ -19,7 +19,7 @@
 //! | via | [`WorldGeometry::Via`] plus the hole it drills |
 //! | pad | one [`WorldGeometry::Solid`] per distinct padstack layer |
 //! | `Edge.Cuts` graphic | zero width solids on every copper layer |
-//! | arc track | skipped, counted in [`HostMap::skipped_arcs`] |
+//! | arc track | [`WorldGeometry::Arc`] on its copper layer |
 //! | rule area | skipped, counted in [`HostMap::skipped_keepouts`] |
 //! | filled zone | never synced, as in KiCad (`:1894`) |
 //!
@@ -94,8 +94,8 @@ use pnsrouter::snapshot::{
 use super::json::{self, JsonValue};
 use super::kicad_dru::{ConstraintKind, DesignRules, ItemType, RuleItem};
 use super::kicad_pcb::{
-  KicadBoard, KicadGraphic, KicadPad, KicadSegment, KicadVia, PadDrill,
-  PadKind, PadShape, Point, rotate_point,
+  KicadArc, KicadBoard, KicadGraphic, KicadPad, KicadSegment, KicadVia,
+  PadDrill, PadKind, PadShape, Point, rotate_point,
 };
 use super::pns_log::LogError;
 
@@ -153,6 +153,8 @@ pub const MAX_ERROR_NANOMETRES: i32 = 5_000;
 pub enum HostKind {
   /// A track segment.
   Segment,
+  /// A curved track segment.
+  Arc,
   /// A via.
   Via,
   /// A footprint pad.
@@ -184,8 +186,13 @@ pub struct HostEntry {
 pub struct HostMap {
   /// Every object, in the order the snapshot listed it.
   entries: Vec<HostEntry>,
-  /// Arc tracks the conversion had to drop, because the crate has no arc
-  /// body yet (`DESIGN.md` section 3).
+  /// Arc tracks the conversion had to drop.
+  ///
+  /// Zero for every board since work item 012 slice 5 gave the crate an
+  /// arc body: an arc track becomes a [`WorldGeometry::Arc`] like any
+  /// other obstacle. The counter is kept so that a future conversion that
+  /// has to drop one has somewhere to say so, and so that the assertion
+  /// in `tests/kicad_replay.rs` keeps watching.
   pub skipped_arcs: usize,
   /// Rule areas the conversion had to drop; see
   /// [`snapshot_from_board`].
@@ -1005,8 +1012,7 @@ fn matches_pattern(pattern: &str, name: &str) -> bool {
 /// (`pcbnew/router/pns_kicad_iface.cpp:2292`), object by object; see the
 /// module documentation for the table and for the three approximations.
 ///
-/// What is dropped, each counted on the returned [`HostMap`]: arc tracks,
-/// because the crate has no arc body (`DESIGN.md` section 3); rule areas,
+/// What is dropped, each counted on the returned [`HostMap`]: rule areas,
 /// because [`RuleResolver::is_keepout`] needs the resolver to recognise
 /// the obstacle and nothing on [`pnsrouter::item::Item`] carries that
 /// mark, so a keepout could only be added as an unconditional obstacle,
@@ -1022,10 +1028,7 @@ pub fn snapshot_from_board(
     u8::try_from(layer_count).unwrap_or(u8::MAX),
     rules.max_clearance(),
   );
-  let mut map = HostMap {
-    skipped_arcs: board.arcs.len(),
-    ..HostMap::default()
-  };
+  let mut map = HostMap::default();
   let whole_stack = LayerRange::new(0, layer_count as i32 - 1);
 
   for pad in &board.pads {
@@ -1034,6 +1037,10 @@ pub fn snapshot_from_board(
 
   for segment in &board.segments {
     add_segment(&mut snapshot, &mut map, segment);
+  }
+
+  for arc in &board.arcs {
+    add_arc(&mut snapshot, &mut map, arc);
   }
 
   for via in &board.vias {
@@ -1088,6 +1095,31 @@ fn add_segment(
     WorldGeometry::Segment {
       seg: Seg::new(to_vec2(segment.start), to_vec2(segment.end)),
       width: clamp_i32(segment.width),
+    },
+  ));
+}
+
+/// Add one arc track. `syncArc`,
+/// `pcbnew/router/pns_kicad_iface.cpp:1770`, which is four lines of
+/// substance: a `SHAPE_ARC` of the `PCB_ARC`'s own start, mid, end and
+/// width, the net, the layer and the parent. `PCB_ARC` stores the same
+/// three points, so nothing is converted and nothing is rounded.
+///
+/// The lock marker of `:1779` is not read here for the same reason
+/// [`add_segment`] does not read a segment's: the corpus reader carries no
+/// lock flag.
+fn add_arc(snapshot: &mut WorldSnapshot, map: &mut HostMap, arc: &KicadArc) {
+  let host = map.allocate(&arc.uuid, HostKind::Arc);
+
+  snapshot.items.push(WorldItem::new(
+    host,
+    copper_net(arc.net),
+    LayerRange::single(arc.copper_layer as i32),
+    WorldGeometry::Arc {
+      start: to_vec2(arc.start),
+      mid: to_vec2(arc.mid),
+      end: to_vec2(arc.end),
+      width: clamp_i32(arc.width),
     },
   ));
 }

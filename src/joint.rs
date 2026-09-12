@@ -350,9 +350,9 @@ impl Joint {
   ///   every locked segment, so a joint between two locked segments
   ///   carries several of them.
   ///
-  /// A link that is not a segment answers "no width" and therefore never
-  /// matches, which is how arcs behave until the arc body arrives; KiCad
-  /// compares `LINKED_ITEM::Width` there.
+  /// A link with no width answers "no width" and therefore never matches;
+  /// KiCad compares `LINKED_ITEM::Width` there, which a segment and an
+  /// arc both have and a via and a pad do not.
   pub fn is_line_corner(
     &self,
     arena: &Arena<Item>,
@@ -591,15 +591,20 @@ impl Joint {
 /// The `seg1->Width() == seg2->Width()` of `IsLineCorner`
 /// (`pcbnew/router/pns_joint.h:112`) and the `!=` of
 /// `IsTraceWidthChange` (`:211`), which read `LINKED_ITEM::Width`
-/// (`pcbnew/router/pns_linked_item.h:39`). Only a segment has a width in
-/// this crate; an arc will join it with the arc body, and until then two
-/// arcs never report the same width, which keeps a predicate from
-/// answering yes about geometry that does not exist yet.
+/// (`pcbnew/router/pns_linked_item.h:39`). A segment and an arc both
+/// have one, and a joint where the two meet at the same width is an
+/// ordinary line corner: there is no joint level notion of tangency
+/// anywhere in KiCad (note 09 section 4.4). Every other body answers
+/// false, which is how a via or a pad fails the test.
 fn same_width(first: &Item, second: &Item) -> bool {
-  match (first.body(), second.body()) {
-    (ItemBody::Segment(first), ItemBody::Segment(second)) => {
-      first.width() == second.width()
-    }
+  let width = |item: &Item| match item.body() {
+    ItemBody::Segment(segment) => Some(segment.width()),
+    ItemBody::Arc(arc) => Some(arc.width()),
+    _ => None,
+  };
+
+  match (width(first), width(second)) {
+    (Some(first), Some(second)) => first == second,
     _ => false,
   }
 }

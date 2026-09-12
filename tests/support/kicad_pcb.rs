@@ -502,9 +502,13 @@ pub struct KicadBoard {
 }
 
 impl KicadBoard {
-  /// Whether the board holds items no `WorldSnapshot` conversion can
-  /// represent yet.
-  pub fn has_unsupported_items(&self) -> bool {
+  /// Whether the board holds arc tracks.
+  ///
+  /// Until work item 012 slice 5 these were the one item kind the
+  /// `WorldSnapshot` conversion could not represent; they are synced as
+  /// [`pnsrouter::snapshot::WorldGeometry::Arc`] now and the predicate
+  /// only reports their presence.
+  pub fn has_arcs(&self) -> bool {
     !self.arcs.is_empty()
   }
 

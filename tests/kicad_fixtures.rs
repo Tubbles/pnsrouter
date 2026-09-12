@@ -24,8 +24,15 @@
 /// The readers under test.
 mod support;
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+use pnsrouter::collide::CollisionSearchOptions;
+use pnsrouter::geometry::line_chain::LineChain;
+use pnsrouter::geometry::vec2::Vec2;
+use pnsrouter::item::{ItemBody, Kind, LayerRange, NetId};
+use pnsrouter::line::Line;
+use pnsrouter::node::World;
 use support::kicad_pcb::{
   self, KicadBoard, PadKind, PadShape, Point, read_board,
 };
@@ -632,9 +639,9 @@ fn every_board_parses_with_the_expected_counts() {
     );
 
     assert_eq!(
-      board.has_unsupported_items(),
+      board.has_arcs(),
       expected.arcs > 0,
-      "{name} unsupported item flag follows the arc count"
+      "{name} arc flag follows the arc count"
     );
   }
 }
@@ -1157,4 +1164,119 @@ fn the_board_bounding_box_helper_behaves() {
   assert!(bounds.contains(Point { x: 0, y: 0 }));
   assert!(!bounds.contains(Point { x: 11, y: 0 }));
   assert!(bounds.grown(1).contains(Point { x: 11, y: 41 }));
+}
+
+/// The one board in the corpus with arc tracks reaches the world as arc
+/// items.
+///
+/// `boards/stickhub-extra-via.kicad_pcb` holds 180 of them and is the
+/// only board anywhere in KiCad's regression pool that does (note 09
+/// section 8.3), so it is the only fixture that can say whether
+/// `WorldGeometry::Arc` survives a real file. No case replays it, so this
+/// is a conversion test and not a routing one.
+#[test]
+fn the_arc_tracks_of_the_corpus_board_become_arc_items() {
+  let path = corpus_root().join("boards/stickhub-extra-via.kicad_pcb");
+  let board = read_board("stickhub-extra-via.kicad_pcb", &read_fixture(&path))
+    .expect("the board parses");
+  let rules = support::kicad_snapshot::KicadRules::from_project(None, &board)
+    .expect("the fallback rules resolve");
+  let (snapshot, host_map) =
+    support::kicad_snapshot::snapshot_from_board(&board, &rules);
+
+  // Nothing is dropped any more; the counter stays as the guard.
+  assert_eq!(host_map.skipped_arcs, 0);
+  assert_eq!(board.arcs.len(), 180);
+
+  let (mut world, index) = World::from_snapshot(&snapshot);
+  let root = world.root();
+
+  // Every arc of the file is one host object and one stored item, and it
+  // kept the layer, the net and the width the file gave it.
+  let mut found = 0;
+  let mut per_layer = [0_usize; 2];
+
+  for arc in &board.arcs {
+    let host = host_map
+      .host_of_uuid(&arc.uuid)
+      .expect("every arc got a handle");
+    let items = index.items_of(host);
+
+    assert_eq!(items.len(), 1, "an arc is one item");
+
+    let item = world.item(items[0]).expect("the item is live");
+
+    assert_eq!(item.kind(), Kind::ARC);
+    assert_eq!(item.layers(), LayerRange::single(arc.copper_layer as i32));
+    assert_eq!(item.net(), Some(NetId(arc.net.unwrap_or(0) as u32)));
+
+    let ItemBody::Arc(body) = item.body() else {
+      panic!("an ARC kind item has an arc body");
+    };
+
+    assert_eq!(body.width() as i64, arc.width);
+    assert_eq!(body.anchor(0).x as i64, arc.start.x);
+    assert_eq!(body.anchor(1).x as i64, arc.end.x);
+    assert_eq!(body.arc().arc_mid().y as i64, arc.mid.y);
+
+    found += 1;
+    per_layer[arc.copper_layer] += 1;
+  }
+
+  assert_eq!(found, 180);
+  // 82 on the front and 98 on the back, which is what the file holds.
+  assert_eq!(per_layer, [82, 98]);
+
+  // The 180 arcs sit on 39 distinct nets, and every one of them is
+  // reachable through the net index rather than only through the host
+  // map.
+  let nets: BTreeSet<Option<usize>> =
+    board.arcs.iter().map(|arc| arc.net).collect();
+  let indexed: usize = nets
+    .iter()
+    .map(|net| {
+      world
+        .all_items_in_net(root, Some(NetId(net.unwrap_or(0) as u32)), Kind::ARC)
+        .len()
+    })
+    .sum();
+
+  assert_eq!(nets.len(), 39);
+  assert_eq!(indexed, 180);
+
+  // And an arc answers an obstacle query like any other track. The probe
+  // is a line through the middle of arc 15, crossing it at right angles,
+  // on that arc's own layer and on a net of its own so that nothing
+  // exempts it. Arc 15 rather than arc 0 because the board is dense and
+  // most of its arcs have a closer neighbour than themselves along a
+  // probe this long; 52 others answer the same way, so the choice pins a
+  // behaviour and not a coincidence.
+  let target = &board.arcs[15];
+  let target_host = host_map
+    .host_of_uuid(&target.uuid)
+    .expect("the probed arc got a handle");
+  let target_item = index.items_of(target_host)[0];
+
+  let mid = Vec2::new(target.mid.x as i32, target.mid.y as i32);
+  let mut probe = Line::new();
+
+  probe.set_width(100_000);
+  probe.set_layer(target.copper_layer as i32);
+  probe.set_net(Some(NetId(999)));
+  probe.set_shape(LineChain::from_slice(
+    &[mid - Vec2::new(0, 400_000), mid + Vec2::new(0, 400_000)],
+    false,
+  ));
+
+  let found = world
+    .nearest_obstacle(
+      root,
+      &probe,
+      &rules,
+      &CollisionSearchOptions::default(),
+      pnsrouter::geometry::direction45::CornerMode::Mitered45,
+    )
+    .expect("the probe crosses the arc");
+
+  assert_eq!(found.item, Some(target_item));
 }

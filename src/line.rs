@@ -526,12 +526,15 @@ impl Line {
   /// The number of straight segments plus whole arcs.
   ///
   /// Port of `ShapeCount`, `pcbnew/router/pns_line.h:147`, the count that
-  /// is meant to match [`Line::link_count`] (note 02 section 2.4). With
-  /// no arcs in the crate it equals [`Line::segment_count`]; it exists
-  /// under its own name so that the invariant reads the way KiCad states
-  /// it and so that the arc work has one place to change.
+  /// is meant to match [`Line::link_count`] (note 02 section 2.4). It
+  /// forwards to [`LineChain::shape_count`], as KiCad's does, so a line
+  /// that carries an arc counts the arc once rather than counting its
+  /// approximation segments; an arc free open chain answers exactly
+  /// [`Line::segment_count`], which is what it answered before
+  /// `doc/work/012-arcs.md` slice 5 made an arc reachable from
+  /// [`crate::node::World::assemble_line`].
   pub fn shape_count(&self) -> usize {
-    self.chain.segment_count()
+    self.chain.shape_count()
   }
 
   /// One vertex. Port of `CPoint`, `pcbnew/router/pns_line.h:150`.
