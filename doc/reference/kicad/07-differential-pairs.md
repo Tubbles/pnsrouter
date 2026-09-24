@@ -476,7 +476,7 @@ buildDpContinuation(pair, isDiagonal):
 
 The first gateway is the identity: leave the pair exactly where the existing tracks end. Priority 100 makes it beat everything `BuildGeneric` produces, which is why continuing an existing pair goes straight on by default.
 
-The four angled gateways exist so the pair can turn 45 degrees without the inner track having to double back. Stepping **one** anchor forward by `gap * sin(22.5)` rotates the anchor line by 22.5 degrees, which is exactly half of a 45 degree turn, so the pair enters the turn already half rotated. The second call with `sin(23.5)` and priority 5 is an admitted fudge, with the comment at `:642` and a link to KiCad issue 12459: "sin(22.5) doesn't always work, so we also add some lower priority ones with a bit of wiggle room".
+The four angled gateways exist so the pair can turn 45 degrees without the inner track having to double back. Stepping **one** anchor forward by `gap * sin(22.5)` is meant to rotate the anchor line by 22.5 degrees, which is exactly half of a 45 degree turn, so the pair enters the turn already half rotated. It does not: the step that rotates the anchor line by 22.5 degrees at a full pitch across is `gap * tan(22.5)`, and with the sine no angled gateway ever passes `checkGap`. Erratum E19. The second call with `sin(23.5)` and priority 5 is an admitted fudge, with the comment at `:642` and a link to KiCad issue 12459: "sin(22.5) doesn't always work, so we also add some lower priority ones with a bit of wiggle room".
 
 The guard at `:638` accepts only pairs whose anchor line is horizontal, vertical or at 45 degrees (`|delta.x - delta.y| < EPSILON` catches the `+45` diagonal but **not** the `-45` one, where `delta.x + delta.y` is near zero). Section 13 erratum E6.
 
@@ -1933,6 +1933,8 @@ Note that `UpdateSizes` (`:797`) rewrites the gap to the edge to edge value when
 
 Reproduce, with the `Option` return of section 12.3 making the sticky path explicit at the call site rather than implicit in a member.
 
+**Decision, 2026-09-24: transcribed within a leg, cut across a fix.** `FixRoute` (`:808` to `:877`) and `initPlacement` (`:656`) reset neither `m_currentTraceOk` nor `m_currentTrace`, only `Start` does (`:645` to `:647`). So the first failed move of the leg after a fix answers success with the leg just fixed, and the next fix writes it into the node again, on top of the segment `SimplifyLine` (`:853`) merged it into; `NODE::Add( LINE& )` only skips a segment with the same two ends (`pns_node.cpp:718`). That duplicated copper on both lanes of a user's pair. The crate's `fix_route` now resets both for the next leg as `Start` does; see `doc/log/2026-09-24.md`.
+
 ### E13. `m_orthoMode` is written three times and never read
 
 `pcbnew/router/pns_diff_pair_placer.cpp:56`, `:86`, `:659`; declared `pns_diff_pair_placer.h:271`. `SetOrthoMode` is a `PLACEMENT_ALGO` virtual the host calls on the shift key, and for pairs it does nothing except trigger a redundant `Move`. Related to E1: `BuildOrthoProjections` is the machinery it would have driven.
@@ -1986,6 +1988,12 @@ The previous `m_primP` / `m_primN` are never deleted, so every assignment over a
 | The `else` branch of `rhShoveOnly` | `:397` to `:401` | Restores values that were never changed. |
 
 ---
+
+### E19. `buildDpContinuation` steps by the sine where the tangent is needed
+
+`pcbnew/router/pns_diff_pair.cpp:613`, `:614`, `:640`, `:644`. The angled gateways step one anchor forward by `m_gap * SIN_22_5` and `m_gap * SIN_23_5`, `m_gap` being the pitch. For the two lanes to stay a pitch apart through the 45 degree corner the pair then makes, the leading lane has to be `pitch * tan(22.5)` ahead. With the sine the two diagonal runs come out `pitch * (1 + sin(22.5)) / sqrt(2)` apart, 0.978 of a pitch (0.989 at 23.5 degrees), and `checkGap` (`:182`, called from `BuildInitial` at `:251`) refuses anything more than 100 nm under the pitch, so for any real pitch none of the four gateways ever fits. The comment at `:642` and `:643` pointing at issue 12459 ("sin(22.5) doesn't always work") is this defect seen from the outside. The effect: a pair continued from existing tracks, which includes every leg after a fix, only follows a cursor inside 45 degrees of straight ahead, since only the identity gateway can fit.
+
+**Decision, 2026-09-24: fixed as a deviation.** The crate steps by `pitch * tan(22.5)` and `pitch * tan(23.5)`, with KiCad's two rounds and priorities kept; see `doc/log/2026-09-24.md`.
 
 ## 14. Proposed order of implementation
 

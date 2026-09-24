@@ -2301,13 +2301,27 @@ impl DpGateways {
   ///
   /// The four angled gateways after it let the pair turn 45 degrees
   /// without the inner lane doubling back: stepping **one** anchor
-  /// forward by `pitch * sin(22.5)` rotates the anchor line by 22.5
-  /// degrees, half of the turn, so the pair enters it already half
-  /// rotated. Each of them sets an entry line on one lane and an empty
-  /// chain on the other, which [`check_connection_angle`] passes for the
-  /// empty side. The second round at `sin(23.5)` and priority 5 is an
-  /// admitted fudge, with KiCad's comment at `:642` pointing at issue
-  /// 12459.
+  /// forward rotates the anchor line by 22.5 degrees, half of the turn,
+  /// so the pair enters it already half rotated. Each of them sets an
+  /// entry line on one lane and an empty chain on the other, which
+  /// [`check_connection_angle`] passes for the empty side. The second
+  /// round at 23.5 degrees and priority 5 is an admitted fudge, with
+  /// KiCad's comment at `:642` pointing at issue 12459.
+  ///
+  /// # Deviation: the step is `pitch * tan(angle)`, not `pitch * sin`
+  ///
+  /// KiCad steps by `m_gap * SIN_22_5` and `m_gap * SIN_23_5` (`:613`,
+  /// `:614`, `:640`, `:644`), with `m_gap` the pitch. Rotating the anchor
+  /// line by 22.5 degrees while the lanes stay a pitch apart across it
+  /// needs a step of `pitch * tan(22.5)`; with the sine, the two diagonal
+  /// runs of the turn come out `pitch * (1 + sin(22.5)) / sqrt(2)`, about
+  /// 0.978 of a pitch, apart (0.989 at 23.5 degrees), and `checkGap`
+  /// (`:182`) refuses anything more than 100 nm under the pitch. So none
+  /// of the four gateways ever fits, and a pair continued from existing
+  /// tracks, which is every leg after a fix, can only follow a cursor
+  /// that stays inside 45 degrees of straight ahead. The tangents of the
+  /// same two angles are used here. Note 07 erratum E19;
+  /// `doc/log/2026-09-24.md` has the decision.
   ///
   /// The guard at `:638` accepts a vertical anchor line, a horizontal one
   /// and the `+45` diagonal, but not the `-45` one, where
@@ -2324,11 +2338,13 @@ impl DpGateways {
     /// KiCad's `EPSILON`, 5 nanometres, `pns_diff_pair.cpp:612`.
     const EPSILON: i32 = 5;
 
-    /// KiCad's `SIN_22_5`, `pns_diff_pair.cpp:613`.
-    const SIN_22_5: f64 = 0.38268;
+    /// `tan(22.5)`, where KiCad has `SIN_22_5 = 0.38268`
+    /// (`pns_diff_pair.cpp:613`); see the deviation above.
+    const TAN_22_5: f64 = 0.414_21;
 
-    /// KiCad's `SIN_23_5`, `pns_diff_pair.cpp:614`.
-    const SIN_23_5: f64 = 0.39875;
+    /// `tan(23.5)`, where KiCad has `SIN_23_5 = 0.39875`
+    /// (`pns_diff_pair.cpp:614`).
+    const TAN_23_5: f64 = 0.434_81;
 
     // :601 to :603
     let mut identity =
@@ -2353,8 +2369,8 @@ impl DpGateways {
     }
 
     // :640, :644
-    for (sine, priority) in [(SIN_22_5, 20), (SIN_23_5, 5)] {
-      let length = kiround(f64::from(self.pitch) * sine);
+    for (tangent, priority) in [(TAN_22_5, 20), (TAN_23_5, 5)] {
+      let length = kiround(f64::from(self.pitch) * tangent);
 
       self.add_angled_gateways(world, pair, is_diagonal, length, priority);
     }

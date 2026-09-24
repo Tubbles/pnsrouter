@@ -6,7 +6,9 @@ The decision behind any entry is in [doc/log/](doc/log/), one file per day, and 
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+
+- **Differential pairs routed with intermediate clicks**: the leg after a fix can now turn by 45 degrees straight away, so a pair no longer stops following the cursor after each click, and a click after a move that could not be routed no longer commits the previous leg a second time. Pairs routed with several clicks commit each lane once, continuous from pad to pad, and tune normally afterwards. Both are deviations from KiCad, whose pair placer has the same two failures (`doc/log/2026-09-24.md`).
 
 ## [0.1.0] - 2026-09-24
 

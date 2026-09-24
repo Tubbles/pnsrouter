@@ -31,7 +31,9 @@
 //!    `BuildFromPrimitivePair` was written for. They are deliberately not
 //!    square, so that the diagonal fan distance `w - h` is not zero.
 //! 4. Two existing tracks arriving from the west, which takes the
-//!    `buildDpContinuation` branch.
+//!    `buildDpContinuation` branch. Its four angled gateways are the one
+//!    deliberate departure from KiCad's values; see
+//!    `gateways_from_a_segment_continuation`.
 //! 5. A bare cursor, which is `BuildForCursor` with via fitting off.
 
 #![forbid(unsafe_code)]
@@ -300,16 +302,20 @@ fn gateways_from_rectangular_pads() {
   );
 }
 
+/// The one list here that is not KiCad's: the four angled gateways step
+/// one anchor by `pitch * tan(22.5)` and `pitch * tan(23.5)`, 165684 and
+/// 173924 nm, where KiCad's sines give 153072 and 159500 and never pass
+/// `checkGap` (`doc/log/2026-09-24.md`).
 #[test]
 fn gateways_from_a_segment_continuation() {
   assert_gateways(
     &entry_set("segment continuation"),
     &[
       "p=(0, -200000) n=(0, 200000) diag=false allowed=0x01 prio=100 entries=false",
-      "p=(153072, -200000) n=(0, 200000) diag=false allowed=0x01 prio=20 entries=true",
-      "p=(0, -200000) n=(153072, 200000) diag=false allowed=0x01 prio=20 entries=true",
-      "p=(159500, -200000) n=(0, 200000) diag=false allowed=0x01 prio=5 entries=true",
-      "p=(0, -200000) n=(159500, 200000) diag=false allowed=0x01 prio=5 entries=true",
+      "p=(165684, -200000) n=(0, 200000) diag=false allowed=0x01 prio=20 entries=true",
+      "p=(0, -200000) n=(165684, 200000) diag=false allowed=0x01 prio=20 entries=true",
+      "p=(173924, -200000) n=(0, 200000) diag=false allowed=0x01 prio=5 entries=true",
+      "p=(0, -200000) n=(173924, 200000) diag=false allowed=0x01 prio=5 entries=true",
     ],
   );
 }

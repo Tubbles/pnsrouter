@@ -45,7 +45,14 @@
 //!   halves the work.
 //! - Erratum E8: the coupled item search tie breaks on `(distance, uid)`
 //!   rather than on allocation order.
-//! - Errata E9, E11, E12: transcribed as they stand.
+//! - Errata E9 and E11: transcribed as they stand. Erratum E12 is
+//!   transcribed within a leg, but a fixed leg resets the trace and the
+//!   sticky success, so a failed first move of the next leg can no longer
+//!   answer with the leg just fixed and a fix can no longer write it
+//!   twice. See [`DiffPairPlacer::fix_route`].
+//! - Erratum E19: the angled continuation gateways step by
+//!   `pitch * tan`, not `pitch * sin`, so a leg after a fix can turn at
+//!   once; see [`crate::diff_pair`]'s `build_dp_continuation`.
 //! - Errata E2 and E13: `setInitialDirection` is declared and never
 //!   defined, and `m_orthoMode` is written and never read; neither is
 //!   ported, so [`DiffPairPlacer`] has no ortho mode command.
@@ -243,7 +250,8 @@ pub struct DpPlacing {
   current_trace: DiffPair,
   /// Whether any fit has succeeded during this leg. Port of
   /// `m_currentTraceOk` (`:276`); see erratum E12 on
-  /// [`DpPlacing::route_head`].
+  /// [`DpPlacing::route_head`]. Unlike KiCad's, it is reset when a leg is
+  /// fixed.
   current_trace_ok: bool,
   /// What the cursor is over. Port of `m_currentEndItem` (`:278`).
   current_end_item: Option<ItemId>,
@@ -499,7 +507,7 @@ impl DpPlacing {
   /// builds that target's gateways at the trace pitch and never expands
   /// them for the vias. The vias are appended anyway (`:745`).
   ///
-  /// # Erratum E12, transcribed
+  /// # Erratum E12, transcribed within a leg
   ///
   /// The failure return is `m_currentTraceOk` (`:756`): once any fit has
   /// succeeded during this leg, a later failed fit still reports success
@@ -507,6 +515,10 @@ impl DpPlacing {
   /// routines then collision test, walk or shove. The visible effect is
   /// that the preview freezes at the last routable position instead of
   /// disappearing.
+  ///
+  /// KiCad never resets the flag or the trace after a fix, so there the
+  /// "previous shape" can be the leg just fixed. That half is not
+  /// transcribed: [`DiffPairPlacer::fix_route`] clears both.
   ///
   /// The other half of E12 comes with it: `set_gap(pitch)` at `:731` runs
   /// unconditionally and `set_gap(edge to edge)` at `:741` only on
@@ -1680,6 +1692,19 @@ impl DiffPairPlacer {
   /// geometry a session produces is the same; what differs is when the
   /// host sees it.
   ///
+  /// # Deviation: the next leg starts with an empty trace
+  ///
+  /// KiCad leaves `m_currentTrace` and `m_currentTraceOk` as the fixed
+  /// leg left them (`:867` to `:875`, `initPlacement` at `:656` touches
+  /// neither). A first move of the next leg whose fit fails then answers
+  /// success with that leg (erratum E12), and the next fix writes it into
+  /// the node again. `NODE::Add( LINE& )` skips only a segment with the
+  /// same two ends (`pcbnew/router/pns_node.cpp:718`), and `SimplifyLine`
+  /// (`:853`) has by then merged the leg into the segment before it, so
+  /// the copy lands on top of it. Here both are reset as `Start` resets
+  /// them (`:645` to `:647`), which makes such a move answer false with
+  /// no head and such a fix refuse. Logged in `doc/log/2026-09-24.md`.
+  ///
   /// The shove is thrown away and rebuilt over the placement world
   /// (`:861`) rather than rewound, with a comment there admitting the
   /// memory management is the reason. Since the pair placer never locks a
@@ -1779,10 +1804,10 @@ impl DiffPairPlacer {
     // :864
     placing.placing_via = false;
 
-    // :867 to :875. Note what neither branch touches: `m_currentStart`
-    // keeps the point the session started at for the whole session, and
-    // `m_currentTraceOk` keeps whatever the last fit left it at, so
-    // erratum E12's sticky success survives a fixed leg.
+    // :867 to :875. Note what neither branch touches in KiCad:
+    // `m_currentStart` keeps the point the session started at for the
+    // whole session, and `m_currentTraceOk` and `m_currentTrace` keep the
+    // leg just fixed.
     if snap_on_target || force_finish {
       self.state = DpPlacerState::Finished {
         placed_anything: true,
@@ -1793,6 +1818,16 @@ impl DiffPairPlacer {
     }
 
     placing.has_fixed_anything = true;
+
+    // Deviation, erratum E12: the next leg starts with no trace and no
+    // sticky success, as `Start` begins the first one (`:645` to `:647`).
+    // KiCad carries both over, so a first move of the new leg whose fit
+    // fails answers success with the leg just fixed as its head, and the
+    // next fix writes that leg into the node a second time, overlapping
+    // the segment `SimplifyLine` has already merged it into.
+    placing.current_trace_ok = false;
+    placing.current_trace = DiffPair::new();
+    placing.current_trace.set_nets(placing.net_p, placing.net_n);
 
     // :861 and :874. The shove is rebuilt by `init_placement`, over the
     // node the leg was written into rather than over the root.

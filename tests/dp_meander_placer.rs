@@ -1000,3 +1000,147 @@ fn a_round_style_pair_reaches_a_longer_target_and_commits_arcs() {
     assert!(arcs > 0, "lane {net:?} commits its corners as arcs");
   }
 }
+
+// ---------------------------------------------------------------------
+// A pair the pair placer routed
+// ---------------------------------------------------------------------
+
+/// Route a pair with the pair placer, with intermediate fixes, and hand
+/// back the board as a host would reload it: the four pads plus every
+/// committed segment, each with a host id of its own from 100 on.
+///
+/// The target pair sits north east of the start pair, so the leg after
+/// the last fix has to turn at once. Before the fix to the pair placer
+/// that move failed, erratum E12 answered it with the leg just fixed and
+/// the final fix wrote that leg a second time and ended the session
+/// there, so the reloaded lanes overlapped at the joint and line assembly
+/// stopped at it (`doc/log/2026-09-24.md`).
+fn routed_pair_board() -> WorldSnapshot {
+  let target_p = Vec2::new(7_500_000, 4_000_000 - PITCH / 2);
+  let target_n = Vec2::new(7_500_000, 4_000_000 + PITCH / 2);
+  let mut snapshot = WorldSnapshot::new(1, World::DEFAULT_MAX_CLEARANCE);
+
+  snapshot
+    .items
+    .push(pad(PAD_A_P, Vec2::new(WEST, P_Y), NET_P));
+  snapshot
+    .items
+    .push(pad(PAD_A_N, Vec2::new(WEST, N_Y), NET_N));
+  snapshot.items.push(pad(PAD_B_P, target_p, NET_P));
+  snapshot.items.push(pad(PAD_B_N, target_n, NET_N));
+
+  let mut router = Router::new(
+    &snapshot,
+    Box::new(PairTuningRules::new(CLEARANCE)),
+    RoutingSettings::default(),
+    sizes(),
+  );
+
+  router
+    .start_routing_diff_pair(Vec2::new(WEST, P_Y), Some(PAD_A_P), 0)
+    .expect("the start pad pair is routable");
+
+  for waypoint in [Vec2::new(1_500_000, 0), Vec2::new(3_000_000, 0)] {
+    router.move_to(waypoint, None);
+    router.fix_route(waypoint, None, false);
+  }
+
+  router.move_to(target_p, Some(PAD_B_P));
+
+  let FixOutcome::Finished(diff) =
+    router.fix_route(target_p, Some(PAD_B_P), false)
+  else {
+    panic!("the fix on the target pair finishes");
+  };
+
+  for (index, item) in diff.added.iter().enumerate() {
+    let NewGeometry::Segment { seg, width } = item.geometry else {
+      continue;
+    };
+
+    snapshot.items.push(WorldItem::new(
+      HostId(100 + index as u64),
+      item.net,
+      item.layers,
+      WorldGeometry::Segment { seg, width },
+    ));
+  }
+
+  snapshot
+}
+
+/// A pair tuned on a pair the pair placer routed with intermediate fixes
+/// runs from pad to pad, grows meanders on both lanes and the readout
+/// follows the cursor.
+#[test]
+fn a_pair_routed_with_intermediate_fixes_tunes() {
+  let snapshot = routed_pair_board();
+  let from = Vec2::new(500_000, P_Y);
+  let to = Vec2::new(2_800_000, P_Y);
+  let segments = |net: NetId| {
+    snapshot
+      .items
+      .iter()
+      .filter(|item| item.net == Some(net))
+      .filter(|item| matches!(item.geometry, WorldGeometry::Segment { .. }))
+      .count()
+  };
+  let host = snapshot
+    .items
+    .iter()
+    .find(|item| match &item.geometry {
+      WorldGeometry::Segment { seg, .. } => {
+        item.net == Some(NET_P) && seg.a == Vec2::new(WEST, P_Y)
+      }
+      _ => false,
+    })
+    .map(|item| item.id)
+    .expect("the P lane runs straight out of its pad");
+  let mut router = Router::new(
+    &snapshot,
+    Box::new(PairTuningRules::new(CLEARANCE)),
+    RoutingSettings::default(),
+    sizes(),
+  );
+  let start = router
+    .start_tuning_diff_pair(from, host, settings_for(30_000_000))
+    .expect("the routed lanes are a differential pair");
+  let before = start
+    .tuning
+    .as_deref()
+    .expect("a readout at the start")
+    .result;
+  let frame = router.move_to(to, None);
+  let tuned = lanes(&frame);
+  let after = frame
+    .tuning
+    .as_deref()
+    .expect("a readout after a move")
+    .result;
+
+  assert_eq!(tuned.len(), 2, "both lanes are drawn: {frame:?}");
+
+  let pads = [
+    (
+      NET_P,
+      Vec2::new(WEST, P_Y),
+      Vec2::new(7_500_000, 4_000_000 + P_Y),
+    ),
+    (
+      NET_N,
+      Vec2::new(WEST, N_Y),
+      Vec2::new(7_500_000, 4_000_000 + N_Y),
+    ),
+  ];
+
+  for (lane, (net, first, last)) in tuned.iter().zip(pads) {
+    assert_eq!(lane.point(0), first, "{net:?}: {lane:?}");
+    assert_eq!(lane.last_point(), Some(last), "{net:?}: {lane:?}");
+    assert!(
+      lane.point_count() > segments(net) + 1 + 4,
+      "{net:?} has no meanders: {lane:?}"
+    );
+  }
+
+  assert!(after > before, "the readout stayed at {before}");
+}

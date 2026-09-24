@@ -25,3 +25,8 @@ Ideas noticed during work, for the user to pick up or discard.
 ## After arcs slice 7 (2026-09-12)
 
 - **KiCad's shove is blind to arc tracks** (note 09 erratum E40): its obstacle search never asks for the arc kind, so a line shoved across an arc track is committed overlapping it and only the host's DRC notices. The crate reproduces that. The deviation that would make the shove push arc tracks aside is one entry in `OBSTACLE_SEARCH_ORDER` in `src/shove.rs`, since `on_colliding_arc` and both shove arms are ported and tested; it would matter to Horizon, which has arc tracks, and to any KiCad board with rounded traces. A KiCad issue is worth filing either way, since the two `ARC_T` arms in `shoveIteration` are dead code upstream.
+
+## After the pair placer fix (2026-09-24)
+
+- **KiCad issue 12459 has an answer.** `DP_GATEWAYS::buildDpContinuation` (`pcbnew/router/pns_diff_pair.cpp:613`) steps the angled continuation gateways by `pitch * sin(22.5)` where a 45 degree turn that keeps the lanes a pitch apart needs `pitch * tan(22.5)`; the sine leaves the diagonal runs 2 percent under the pitch, `checkGap`'s 100 nm slack rejects them, and only the straight ahead gateway survives, which is the "cannot continue a pair after a fix" symptom KiCad's own `fixme` at `:642` describes. The crate fixed it as a deviation (note 07 erratum E19, `doc/log/2026-09-24.md`). Worth a comment on that issue, in your words.
+- The companion defect, `FixRoute` not resetting `m_currentTraceOk` so a failed move recommits the fixed leg (note 07 erratum E12), is not on KiCad's tracker as far as a search found; a separate issue.

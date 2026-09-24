@@ -670,3 +670,360 @@ fn a_dangling_arc_answers_with_its_free_end() {
 
   assert_eq!(DiffPairPlacer::dangling_anchor(&world, root, arc), None);
 }
+
+// ---------------------------------------------------------------------
+// Legs after a fix
+// ---------------------------------------------------------------------
+
+/// The lane width of the board a user reported duplicated legs on
+/// (`TODO.md`, 2026-09-24).
+const REPORTED_WIDTH: i32 = 125_000;
+
+/// The copper gap of that board.
+const REPORTED_GAP: i32 = 180_000;
+
+/// The clearance of that board.
+const REPORTED_CLEARANCE: i32 = 150_000;
+
+/// The copper radius of that board's pads, wider than half a pitch, so
+/// the first leg has to fan out of them.
+const REPORTED_PAD_RADIUS: i32 = 250_000;
+
+/// The four pad centres of that board: the start pair, then the target
+/// pair four millimetres further south and twelve east.
+const REPORTED_PADS: [Vec2; 4] = [
+  Vec2::new(0, -600_000),
+  Vec2::new(0, 600_000),
+  Vec2::new(12_000_000, 4_400_000),
+  Vec2::new(12_000_000, 5_600_000),
+];
+
+/// A router over the reported board, in one routing mode.
+fn reported_router(mode: RouterMode) -> Router {
+  let mut snapshot = WorldSnapshot::new(2, World::DEFAULT_MAX_CLEARANCE);
+  let hosts = [START_P, START_N, TARGET_P, TARGET_N];
+  let nets = [NET_P, NET_N, NET_P, NET_N];
+
+  for index in 0..4 {
+    let at = REPORTED_PADS[index];
+
+    snapshot.items.push(WorldItem::new(
+      hosts[index],
+      Some(nets[index]),
+      LayerRange::single(0),
+      WorldGeometry::Solid {
+        shape: Shape::circle(at, REPORTED_PAD_RADIUS),
+        pos: at,
+        offset: Vec2::new(0, 0),
+        orientation_degrees: 0.0,
+        anchors: Vec::new(),
+      },
+    ));
+  }
+
+  let mut sizes = Sizes {
+    track_width: REPORTED_WIDTH,
+    board_min_track_width: 100_000,
+    min_clearance: REPORTED_CLEARANCE,
+    diff_pair_width: REPORTED_WIDTH,
+    diff_pair_gap: REPORTED_GAP,
+    diff_pair_via_gap: REPORTED_GAP,
+    via_diameter: VIA_DIAMETER,
+    via_drill: VIA_DRILL,
+    ..Sizes::default()
+  };
+
+  sizes.add_layer_pair(0, 1);
+
+  let settings = RoutingSettings {
+    mode,
+    ..RoutingSettings::default()
+  };
+  let rules =
+    CoupledNets::new(FixedClearance::uniform(REPORTED_CLEARANCE), NET_P, NET_N);
+
+  Router::new(&snapshot, Box::new(rules), settings, sizes)
+}
+
+/// Every segment a diff creates on one net.
+fn added_segs(diff: &CommitDiff, net: NetId) -> Vec<Seg> {
+  diff
+    .added
+    .iter()
+    .filter(|item| item.net == Some(net))
+    .filter_map(|item| match item.geometry {
+      NewGeometry::Segment { seg, .. } => Some(seg),
+      NewGeometry::Arc { .. } | NewGeometry::Via { .. } => None,
+    })
+    .collect()
+}
+
+/// Whether two segments lie on one line and share a stretch of it.
+fn overlap(first: Seg, second: Seg) -> bool {
+  let direction = first.b - first.a;
+  let cross = |point: Vec2| {
+    let offset = point - first.a;
+
+    i64::from(direction.x) * i64::from(offset.y)
+      - i64::from(direction.y) * i64::from(offset.x)
+  };
+
+  if cross(second.a) != 0 || cross(second.b) != 0 {
+    return false;
+  }
+
+  let along = |point: Vec2| {
+    let offset = point - first.a;
+
+    i64::from(direction.x) * i64::from(offset.x)
+      + i64::from(direction.y) * i64::from(offset.y)
+  };
+  let length = along(first.b);
+  let (low, high) = (
+    along(second.a).min(along(second.b)),
+    along(second.a).max(along(second.b)),
+  );
+
+  low.max(0) < high.min(length)
+}
+
+/// Assert that one lane of a commit is one continuous chain from pad to
+/// pad, with every segment used once and no two segments overlapping.
+fn assert_lane_once(diff: &CommitDiff, net: NetId, from: Vec2, to: Vec2) {
+  let segs = added_segs(diff, net);
+
+  for (index, first) in segs.iter().enumerate() {
+    for second in &segs[index + 1..] {
+      assert!(
+        !overlap(*first, *second),
+        "{net:?} holds {first:?} and {second:?}, which overlap"
+      );
+    }
+  }
+
+  let chain = lane(diff, net, from);
+
+  assert_eq!(
+    chain.point_count(),
+    segs.len() + 1,
+    "{net:?} does not chain from {from:?}: {segs:?}"
+  );
+  assert_eq!(chain.last_point(), Some(to), "{net:?} ends elsewhere");
+}
+
+/// A router over the fixture's pads and sizes with the target pair moved
+/// to the side, facing the start pair across a diagonal.
+///
+/// The pad pairs are the fixture's, so their lanes leave and arrive
+/// horizontally, and the target pair sits so that a pair fixed on the
+/// straight line out of the start has to turn by 45 degrees at once.
+fn offset_router(mode: RouterMode) -> Router {
+  let mut snapshot = WorldSnapshot::new(2, World::DEFAULT_MAX_CLEARANCE);
+
+  snapshot.items.push(pad(START_P, START_P_AT, 0, NET_P));
+  snapshot.items.push(pad(START_N, START_N_AT, 0, NET_N));
+  snapshot.items.push(pad(TARGET_P, OFFSET_PADS[2], 0, NET_P));
+  snapshot.items.push(pad(TARGET_N, OFFSET_PADS[3], 0, NET_N));
+
+  let settings = RoutingSettings {
+    mode,
+    ..RoutingSettings::default()
+  };
+
+  Router::new(&snapshot, Box::new(rules()), settings, sizes())
+}
+
+/// The pad centres of [`offset_router`]'s board, start pair first.
+const OFFSET_PADS: [Vec2; 4] = [
+  START_P_AT,
+  START_N_AT,
+  Vec2::new(7_500_000, 4_000_000 - PITCH / 2),
+  Vec2::new(7_500_000, 4_000_000 + PITCH / 2),
+];
+
+/// Start on the first pad, fix at every waypoint, then fix on the target
+/// pair.
+fn route_through(
+  mut router: Router,
+  pads: [Vec2; 4],
+  waypoints: &[Vec2],
+) -> CommitDiff {
+  router
+    .start_routing_diff_pair(pads[0], Some(START_P), 0)
+    .expect("the start pad pair is routable");
+
+  for waypoint in waypoints {
+    router.move_to(*waypoint, None);
+
+    assert!(
+      matches!(
+        router.fix_route(*waypoint, None, false),
+        FixOutcome::Continue(_)
+      ),
+      "a fix at {waypoint:?} carries on"
+    );
+  }
+
+  router.move_to(pads[2], Some(TARGET_P));
+
+  match router.fix_route(pads[2], Some(TARGET_P), false) {
+    FixOutcome::Finished(diff) => diff,
+    FixOutcome::Continue(_) => {
+      panic!("the fix on the target pair did not finish")
+    }
+  }
+}
+
+/// The reported session, with intermediate fixes on the straight run out
+/// of the start pair and one more where the pair turns by more than 45
+/// degrees. Before the fix the move after that turn failed, erratum E12
+/// answered it with the leg just fixed, and the next fix wrote that leg a
+/// second time, on top of the segment it had been merged into; the
+/// target leg then started from the stale end. See
+/// `doc/log/2026-09-24.md`.
+#[test]
+fn a_pair_with_intermediate_fixes_commits_each_lane_once() {
+  let waypoints = [
+    Vec2::new(2_000_000, 0),
+    Vec2::new(4_000_000, 0),
+    Vec2::new(6_000_000, 2_500_000),
+  ];
+
+  for mode in [
+    RouterMode::MarkObstacles,
+    RouterMode::Walkaround,
+    RouterMode::Shove,
+  ] {
+    let diff = route_through(reported_router(mode), REPORTED_PADS, &waypoints);
+
+    assert_lane_once(&diff, NET_P, REPORTED_PADS[0], REPORTED_PADS[2]);
+    assert_lane_once(&diff, NET_N, REPORTED_PADS[1], REPORTED_PADS[3]);
+  }
+}
+
+/// A pair that runs straight out of its pads, is fixed once and then has
+/// to turn by 45 degrees at once to reach its target pair, in all three
+/// modes. The turn needs the angled continuation gateways, which
+/// KiCad's sine step never lets fit, so before the fix the target leg
+/// failed and its fix committed the straight leg a second time instead.
+#[test]
+fn a_straight_pair_with_one_intermediate_fix_commits_each_lane_once() {
+  for mode in [
+    RouterMode::MarkObstacles,
+    RouterMode::Walkaround,
+    RouterMode::Shove,
+  ] {
+    let diff = route_through(
+      offset_router(mode),
+      OFFSET_PADS,
+      &[Vec2::new(3_000_000, 0)],
+    );
+
+    assert_lane_once(&diff, NET_P, OFFSET_PADS[0], OFFSET_PADS[2]);
+    assert_lane_once(&diff, NET_N, OFFSET_PADS[1], OFFSET_PADS[3]);
+  }
+}
+
+/// The first move after a fix routes from where the fixed leg ends, even
+/// when it has to turn at once, rather than answering with the leg just
+/// fixed.
+#[test]
+fn the_move_after_a_fix_continues_from_the_fixed_leg() {
+  let mut router = reported_router(RouterMode::Walkaround);
+  let fixed_at = Vec2::new(4_000_000, 0);
+  let cursor = Vec2::new(6_000_000, 2_500_000);
+
+  router
+    .start_routing_diff_pair(REPORTED_PADS[0], Some(START_P), 0)
+    .expect("the start pad pair is routable");
+  router.move_to(fixed_at, None);
+
+  assert!(matches!(
+    router.fix_route(fixed_at, None, false),
+    FixOutcome::Continue(_)
+  ));
+
+  let frame = router.move_to(cursor, None);
+  let head = |net: NetId| {
+    frame
+      .items
+      .iter()
+      .find(|item| {
+        item.net == Some(net)
+          && item.style == pnsrouter::router::PreviewStyle::Head
+      })
+      .map(|item| item.chain.clone())
+      .unwrap_or_else(|| panic!("no {net:?} head: {frame:?}"))
+  };
+  let half_pitch = (REPORTED_WIDTH + REPORTED_GAP) / 2;
+
+  for (net, start) in [
+    (NET_P, Vec2::new(4_000_000, -half_pitch)),
+    (NET_N, Vec2::new(4_000_000, half_pitch)),
+  ] {
+    let chain = head(net);
+    let end = chain.last_point().expect("a head has points");
+
+    assert_eq!(chain.point(0), start, "{net:?} head: {chain:?}");
+    assert!(
+      (end - cursor).euclidean_norm() <= half_pitch * 2,
+      "{net:?} head ends at {end:?}, away from the cursor"
+    );
+  }
+}
+
+/// A move after a fix that no gateway can fit answers no head rather
+/// than the leg just fixed, and a fix there writes nothing, where
+/// erratum E12's sticky success carried across the fix used to write
+/// the fixed leg a second time, on top of the segment it had been merged
+/// into.
+#[test]
+fn a_fix_after_a_move_that_cannot_fit_writes_nothing() {
+  for mode in [
+    RouterMode::MarkObstacles,
+    RouterMode::Walkaround,
+    RouterMode::Shove,
+  ] {
+    let mut router = reported_router(mode);
+
+    router
+      .start_routing_diff_pair(REPORTED_PADS[0], Some(START_P), 0)
+      .expect("the start pad pair is routable");
+
+    for waypoint in [Vec2::new(2_000_000, 0), Vec2::new(4_000_000, 0)] {
+      router.move_to(waypoint, None);
+
+      assert!(matches!(
+        router.fix_route(waypoint, None, false),
+        FixOutcome::Continue(_)
+      ));
+    }
+
+    // Behind the fixed end: a pair cannot turn back on itself.
+    let behind = Vec2::new(1_000_000, 3_000_000);
+    let frame = router.move_to(behind, None);
+
+    assert!(
+      frame.items.iter().all(|item| {
+        item.style != pnsrouter::router::PreviewStyle::Head
+          || item.chain.segment_count() == 0
+      }),
+      "{mode:?}: a stale head {frame:?}"
+    );
+    assert!(matches!(
+      router.fix_route(behind, None, false),
+      FixOutcome::Continue(_)
+    ));
+
+    router.move_to(REPORTED_PADS[2], Some(TARGET_P));
+
+    let FixOutcome::Finished(diff) =
+      router.fix_route(REPORTED_PADS[2], Some(TARGET_P), false)
+    else {
+      panic!("{mode:?}: the fix on the target pair did not finish");
+    };
+
+    assert_lane_once(&diff, NET_P, REPORTED_PADS[0], REPORTED_PADS[2]);
+    assert_lane_once(&diff, NET_N, REPORTED_PADS[1], REPORTED_PADS[3]);
+  }
+}
