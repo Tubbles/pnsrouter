@@ -94,7 +94,7 @@ Deferred during the LibrePCB keepout zones and the milestone 9 to 11 hosts (2026
 
 Deferred during the arcs milestone (2026-09-12):
 
-- `LineChain` grew from 40 to 88 bytes with the `shapes` vector parallel to the points, so every non empty chain carries a second heap allocation whether or not it holds an arc (slice 3 log entry). A lazily allocated `shapes` (empty means all plain) would remove it for the arc free case at the cost of relaxing the `shapes.len() == points.len()` invariant. Measure with `examples/latency.rs` before deciding; the walkaround builds many short chains per move.
+- `LineChain` grew from 40 to 88 bytes with the `shapes` vector parallel to the points, so every non empty chain carries a second heap allocation whether or not it holds an arc (slice 3 log entry). A lazily allocated `shapes` (empty means all plain) would remove it for the arc free case at the cost of relaxing the `shapes.len() == points.len()` invariant. Measured 2026-09-24 (`doc/performance.md`, the cost of arcs): up to 10% on the walkaround median move, 1 to 4% on the shove, no change in the number of moves over the frame budget. Not taken before 0.1.0.
 
 Deferred during the arcs milestone, host side (2026-09-12):
 

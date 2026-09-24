@@ -234,7 +234,40 @@ Per query thread creation does not pay on this hardware or on these boards, so t
 
 The two ways to make this actually pay are both larger than this work item. One is a persistent worker pool, which the crate cannot have without either a dependency or `'static` bounds it does not want in a `World` full of `Rc`. The other is to stop the tail of shove mode from being made of discarded iterations, which is the budget section above.
 
+## The cost of arcs
+
+Measured on 2026-09-24, after the arcs milestone (`doc/work/012-arcs.md`) had landed. Every `LineChain` grew from 40 to 88 bytes with the `shapes` vector parallel to its points, and every non empty chain carries a second heap allocation whether or not it holds an arc, so the question was what that costs a board without arcs. The two states compared are the last pre arc code state, `e329680`, and the milestone's tip, `40f00cf`; same machine and container as above, `cargo build --release --example latency` in a detached worktree of each, four runs each, interleaved A B A B so that a drift of the machine over the session lands on both sides alike. The cells are the medians of the four runs, the spread across them is in `work/latency-arcs-ab.txt` (not committed).
+
+The routes are identical: `segs` and `drawn` match in every cell, so the after side did exactly the work the before side did.
+
+Board of 2000 target segments, all times in milliseconds:
+
+| mode | p50 before | p50 after | p95 before | p95 after | max before | max after | >16 ms |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| mark obstacles | 0.092 | 0.089 | 0.266 | 0.251 | 0.281 | 0.263 | 0, 0 |
+| walkaround | 0.752 | 0.792 | 20.401 | 21.110 | 50.626 | 52.191 | 5, 5 |
+| shove | 7.960 | 8.138 | 72.680 | 73.925 | 217.175 | 225.498 | 31, 31 |
+
+Board of 20 000 target segments:
+
+| mode | p50 before | p50 after | p95 before | p95 after | max before | max after | >16 ms |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| mark obstacles | 0.096 | 0.091 | 0.268 | 0.251 | 0.290 | 0.265 | 0, 0 |
+| walkaround | 2.832 | 3.105 | 58.110 | 60.242 | 90.811 | 95.720 | 19, 19 |
+| shove | 45.758 | 46.399 | 461.355 | 465.377 | 758.688 | 786.827 | 80, 80 |
+
+`Router::new` moved by 1 to 5% (51.0 to 53.4 ms on the large board in shove mode), `fix_route` and `stop_routing` by less than their run to run spread.
+
+What the table says:
+
+- The cost is real and small: 1 to 4% on the shove figures, 3 to 10% on the walkaround figures, with the largest at the walkaround p50 of the large board (2.8 to 3.1 ms, and the four run spreads of the two sides do not overlap). The walkaround is where it shows because `Line::walkaround` builds many short chains per move, and each of them now allocates twice.
+- Mark obstacles mode moved the other way by 4 to 9%, which is inside what a different binary layout does to a 0.1 ms figure and not a gain to claim.
+- Nothing the user sees changed. The count of moves over the 16 ms frame is the same in every cell, and the walkaround p50 that moved most sits five times under the frame on the large board.
+
+The lazily allocated `shapes` vector that `TODO.md` proposed (empty meaning all plain) would buy back at most that 10% on the walkaround median at the cost of relaxing the `shapes.len() == points.len()` invariant that every arc aware mutator in `src/geometry/line_chain.rs` leans on. Not taken before 0.1.0; it stays in the list below in case a real board fixture ever puts the walkaround near the frame budget.
+
 ## What is left
 
 - Shove mode on a large board is not interactive and no local fix changes that. The cost is the cascade length, which is the algorithm. The realistic answers are the budget (see above) or an early bail out when the cascade is clearly not converging. It is not the threads: see the section above.
+- The `shapes` vector of `LineChain` costs an arc free walkaround up to 10% of its median move (the cost of arcs section above). A lazily allocated vector removes it; only worth the invariant it relaxes if a real board puts the walkaround near the frame budget.
 - `Line::walkaround` allocates one `Vec` per graph vertex for its neighbour list, at most three entries each, which is about 3% of `move_to`. An inline three element list would remove it. It needs a hand rolled type, since the crate takes no new dependencies, and a proof that no vertex can ever exceed three neighbours.
