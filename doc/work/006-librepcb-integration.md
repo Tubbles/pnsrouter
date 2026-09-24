@@ -1,6 +1,6 @@
 # 006 LibrePCB integration
 
-Status: done (2026-09-09, steps 1 to 9 of doc/librepcb-integration.md on the fork's pns-router branch; the crate is the submodule libs/pnsrouter there)
+Status: done (2026-09-09, steps 1 to 9 of doc/librepcb-integration.md on the fork's pns-router branch; the crate was the git submodule libs/pnsrouter there until 0.1.0 was published on 2026-09-24 and is the crates.io dependency since)
 
 ## Goal
 

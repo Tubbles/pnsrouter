@@ -1,6 +1,6 @@
 # 007 Hardening and release
 
-Status: todo
+Status: done (0.1.0 published 2026-09-24)
 
 ## Goal
 
@@ -12,7 +12,7 @@ Confidence and a first crates.io release.
 - [x] Property tests for geometry invariants: `tests/geometry_props.rs` covers segment distance and intersection, chain simplification, slicing, point in polygon against an even odd reference, chain intersection symmetry, collision symmetry and the gap bound, the translation vector, and hull closure, orientation, containment and growth. cargo-fuzz is deferred: it needs a nightly toolchain, which the container image does not carry (TODO.md).
 - [x] Performance profiling on a large board, budget tuning. See [../performance.md](../performance.md): the `examples/latency.rs` harness, the numbers, the profile and what the shove budget buys.
 - [x] `cargo doc` clean, README examples, CHANGELOG. The crate level documentation in `src/lib.rs` is a compiling doctest of a whole session plus a map of the modules, `README.md` carries the same example trimmed, and [../../CHANGELOG.md](../../CHANGELOG.md) says what 0.1.0 contains and what it deliberately leaves out.
-- [ ] 0.1.0 on crates.io. Packaging is ready: `Cargo.toml` has the metadata crates.io asks for and an `exclude` that keeps the 12 MB KiCad corpus, the reference notes and the repository only directories out, which brings the package down to roughly 0.65 MB compressed. `documentation` is left unset on purpose, since crates.io links to docs.rs by itself. The two integration tests that read the corpus (`tests/kicad_fixtures.rs`, `tests/kicad_replay.rs`) and the readers under `tests/support/` are excluded with it; `cargo test` inside `target/package/pnsrouter-0.1.0` passes on what is left. The runbook is below.
+- [x] 0.1.0 on crates.io (2026-09-24, from `176a5ee`, tag `v0.1.0`; docs.rs built it within minutes). The upload was refused once for a missing verified email on the crates.io account, which only the account owner can set. Packaging was ready: `Cargo.toml` has the metadata crates.io asks for and an `exclude` that keeps the 12 MB KiCad corpus, the reference notes and the repository only directories out, which brings the package down to roughly 0.65 MB compressed. `documentation` is left unset on purpose, since crates.io links to docs.rs by itself. The two integration tests that read the corpus (`tests/kicad_fixtures.rs`, `tests/kicad_replay.rs`) and the readers under `tests/support/` are excluded with it; `cargo test` inside `target/package/pnsrouter-0.1.0` passes on what is left. The runbook is below.
 
 ## Publishing 0.1.0
 
@@ -34,11 +34,13 @@ Everything runs in the container, from the repository root. `cargo publish` refu
 
 4. Rehearse the upload. This one reaches the crates.io index but needs no token, since it stops before the upload:
 
-        dev/in-container.sh cargo publish --dry-run
+        dev/publish.sh dry
 
-5. Upload. `dev/in-container.sh` forwards no environment and the container's `CARGO_HOME` is not a mounted volume, so a `cargo login` would not survive the run and the token has to go on the command line. Substitute wherever the crates.io token is kept:
+5. Upload. `dev/in-container.sh` forwards no environment and the container's cargo home is not a mounted volume, so a `cargo login` inside it would not survive the run. `dev/publish.sh` mirrors the wrapper and bind mounts the host's `~/.cargo/credentials.toml`, written by `cargo login` on the host, read only into the container's cargo home, so the token never appears on a command line. Step 4 is `dev/publish.sh dry` and this one is:
 
-        dev/in-container.sh cargo publish --token "$(cat <path to the token>)"
+        dev/publish.sh upload
+
+   crates.io refuses the upload until the account has a verified email address; that is the account owner's to set at https://crates.io/settings/profile.
 
 6. Tag the commit that was published and push both:
 

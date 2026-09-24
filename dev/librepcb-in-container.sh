@@ -9,10 +9,10 @@
 # host and the container runs with the host user id, so files written by
 # the build are owned by the host user. The working directory is the
 # LibrePCB checkout, because that is where the build happens. LibrePCB
-# builds the crate from its git submodule libs/pnsrouter, not from this
-# checkout, so a crate change reaches the build only after a push and a
-# submodule bump; this checkout is mounted for cargo runs on the crate
-# itself from the LibrePCB side.
+# takes the crate from crates.io, not from this checkout, so a crate
+# change reaches the build only through a published release; this
+# checkout is mounted for cargo runs on the crate itself from the
+# LibrePCB side.
 #
 # The cargo registry and the ccache directory live in named podman volumes
 # so they survive between runs. The image is dev/Containerfile, which is

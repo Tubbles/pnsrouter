@@ -37,7 +37,7 @@ Nothing is installed on the host. Every cargo invocation goes through the podman
     dev/in-container.sh cargo fmt --all --check
     dev/in-container.sh cargo doc --no-deps --document-private-items
 
-LibrePCB builds against this crate through `dev/librepcb-in-container.sh` (mounts `~/dev/librepcb` too, working directory there); the integration lives on the fork's `pns-router` branch, design in `doc/librepcb-integration.md`. LibrePCB takes the crate as the git submodule `libs/pnsrouter` pinned to a commit, so after every push of this repository that the LibrePCB side needs, bump the submodule in the LibrePCB checkout (`git -C libs/pnsrouter fetch origin`, `git -C libs/pnsrouter checkout <sha>`, then commit the gitlink) and rebuild; the build never sees uncommitted or unpushed crate changes.
+LibrePCB builds against this crate through `dev/librepcb-in-container.sh` (mounts `~/dev/librepcb` too, working directory there); the integration lives on the fork's `pns-router` branch, design in `doc/librepcb-integration.md`. LibrePCB takes the crate from crates.io (`pnsrouter = "0.1"` in `libs/librepcb/rust-core/Cargo.toml`, since 2026-09-24), so a crate change reaches the LibrePCB build only through a published release: bump the version here, publish with `dev/publish.sh` (runbook in `doc/work/007-hardening-and-release.md`, the user approves every release), then raise the requirement in rust-core's `Cargo.toml` if the version is not semver compatible and run `cargo update -p pnsrouter` on its lock file. To try an unpublished crate change from LibrePCB, point rust-core at a path dependency on this checkout locally and never commit that.
 
 The LibrePCB side checks, all from this repository (the build directory is already configured with Ninja and tests on):
 
