@@ -96,6 +96,12 @@ Deferred during the arcs milestone, host side (2026-09-12):
 
 - The `PnsMeanderSettings` doc and `to_meander_request` on the fork's `pns-router-pairs` branch still give "arcs are on hold" as the reason for forcing `MeanderStyle::Chamfer`. The behaviour is right (LibrePCB cannot store an arc trace, and the crate's default is `Round` now), the stated reason is stale; fix the comment when `pns-router` is next merged into that branch.
 
+Found during the manual test round (2026-09-24), reproduced headlessly, not yet fixed:
+
+- **A pair route with intermediate clicks commits duplicate copper.** Pads P (0, -0.6) and N (0, 0.6), targets (12, 4.4) and (12, 5.6) mm, width 125000, gap 180000, clearance 150000; fixes at (2, 0) and (4, 0), a move to (9, 5), a fix, then finish. The commit holds P 447500 to 4000000 **and** P 2000000 to 4000000, and the same on N, in all three modes. The move after the second fix fails and note 07 erratum E12 (`m_currentTraceOk` sticky across a fixed leg, `src/placer/diff_pair_placer.rs:613`, `:1785`) makes the next fix commit the stale leg again. Once rebuilt, the duplicate breaks line assembly at the 4 mm joint, so a pair tune started before it draws no meanders and reports a constant length up to the joint. Decide whether E12 is fixed as a deviation; the scratch harness is `tmp/dp_meander_placed_pair.rs` (ignored directory, copy into `tests/` to rerun).
+- **The pair tuning readout runs ahead of the drawn lanes at the lane's end.** With the cursor at the lane's end corner or gateway, the readout delta grows 0.2 to 1 mm more than the preview lanes do (delta 17292862 against 16549380 of drawn growth on a pads offset pair with the cursor 300000 nm off the lane). Same harness.
+- **The pair placer refuses LibrePCB's default clearance.** With the host's default pair gap of 180000 nm and LibrePCB's default clearance of 200000 nm, `start_routing_diff_pair` answers `PairGapBelowMinClearance` (`src/router.rs:1499`), so a pair routes only after the user widens the gap or narrows the clearance. Faithful to KiCad, but the host's default gap should not be below its default clearance; a host side default change.
+
 Deferred during the LibrePCB tuning UI (2026-09-11):
 
 - `MeanderSettings::new` can refuse a request (zero step, round corners), which is not a `StartError`, so the LibrePCB FFI invents its own refusal value; a `StartError::MeanderSettings(..)` variant would remove that seam.
