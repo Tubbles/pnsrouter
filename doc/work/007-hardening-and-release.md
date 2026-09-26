@@ -30,7 +30,7 @@ Everything runs in the container, from the repository root. `cargo publish` refu
 
         dev/in-container.sh cargo package --list
 
-3. Replace `0.1.0 - unreleased` in `CHANGELOG.md` with the release date and commit that on its own.
+3. Replace `0.1.0 - unreleased` in `CHANGELOG.md` with the release date and commit that on its own. For a later release: bump `version` in `Cargo.toml`, move the `Unreleased` bullets into a dated section with its compare link, and run `dev/in-container.sh cargo update -p pnsrouter --offline` so the tracked `Cargo.lock` carries the new version, all in the one release commit; `cargo package` refuses a tree the lock update would dirty.
 
 4. Rehearse the upload. This one reaches the crates.io index but needs no token, since it stops before the upload:
 
