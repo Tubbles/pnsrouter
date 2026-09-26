@@ -6,6 +6,10 @@ The decision behind any entry is in [doc/log/](doc/log/), one file per day, and 
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.1.1] - 2026-09-26
+
 ### Fixed
 
 - **Differential pairs routed with intermediate clicks**: the leg after a fix can now turn by 45 degrees straight away, so a pair no longer stops following the cursor after each click, and a click after a move that could not be routed no longer commits the previous leg a second time. Pairs routed with several clicks commit each lane once, continuous from pad to pad, and tune normally afterwards. Both are deviations from KiCad, whose pair placer has the same two failures (`doc/log/2026-09-24.md`).
@@ -74,5 +78,6 @@ Deliberately out of scope, and no code exists for any of them:
 - No `unsafe` code (`#![forbid(unsafe_code)]`).
 - KiCad's regression corpus and the KiCad reference notes are in the git repository but not in the published package, along with the two integration tests that read the corpus. `cargo test` on the published package runs everything that is left.
 
-[Unreleased]: https://github.com/Tubbles/pnsrouter/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/Tubbles/pnsrouter/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/Tubbles/pnsrouter/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/Tubbles/pnsrouter/releases/tag/v0.1.0
